@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 dx-types = { version = "0.1.0", path = "../types" }
+sha2 = "0.10"
 
 [dev-dependencies]
 criterion = "0.8.2"
