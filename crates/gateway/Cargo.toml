@@ -1,0 +1,10 @@
+[package]
+name = "dx-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+dx-core = { version = "0.1.0", path = "../core" }
+dx-types = { version = "0.1.0", path = "../types" }
+tokio = { version = "1.54.0", features = ["full"] }

@@ -1,0 +1,9 @@
+[package]
+name = "dx-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dx-engine = { version = "0.1.0", path = "../engine" }
+dx-ledger = { version = "0.1.0", path = "../ledger" }
+dx-types = { version = "0.1.0", path = "../types" }
