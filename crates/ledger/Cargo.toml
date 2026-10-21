@@ -5,3 +5,6 @@ edition = "2024"
 
 [dependencies]
 dx-types = { version = "0.1.0", path = "../types" }
+
+[dev-dependencies]
+proptest = "1.12.0"

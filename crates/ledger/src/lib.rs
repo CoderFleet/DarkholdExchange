@@ -1,14 +1,11 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Atomic double-entry ledger with reservations.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod account;
+mod error;
+mod journal;
+mod ledger;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use account::*;
+pub use error::*;
+pub use journal::*;
+pub use ledger::*;
