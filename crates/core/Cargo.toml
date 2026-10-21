@@ -7,3 +7,7 @@ edition = "2024"
 dx-engine = { version = "0.1.0", path = "../engine" }
 dx-ledger = { version = "0.1.0", path = "../ledger" }
 dx-types = { version = "0.1.0", path = "../types" }
+sha2 = "0.10"
+
+[dev-dependencies]
+proptest = "1.12.0"

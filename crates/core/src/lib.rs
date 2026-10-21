@@ -1,14 +1,5 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Single-writer core: matching engine + ledger + reservations + idempotency.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+mod core;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use core::Core;
