@@ -9,7 +9,7 @@ fn fixture(name: &str) -> Value {
 #[test]
 fn place_limit_matches_fixture() {
     let m = ClientMessage::PlaceLimit(PlaceLimit {
-        user_id: 1,
+        client_order_id: 1,
         market_id: 1,
         side: Side::Buy,
         price_ticks: 100,
@@ -35,7 +35,7 @@ fn accepted_matches_fixture() {
 #[test]
 fn rejected_matches_fixture() {
     let m = ServerMessage::Rejected {
-        reason: "outside price collar".into(),
+        code: ReasonCode::OutsideCollar,
     };
     assert_eq!(serde_json::to_value(&m).unwrap(), fixture("rejected.json"));
 }

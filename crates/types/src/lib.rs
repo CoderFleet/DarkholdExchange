@@ -1,31 +1,39 @@
-//! Shared wire contract. The JSON shapes are pinned by ../../contracts/*.json,
-//! which both the Rust tests and the web tests check against.
+//! Shared wire contract and domain types.
+//!
+//! Message shapes are pinned by `../../contracts/*.json`, which both the Rust tests
+//! and the web tests check against. Keep this crate free of I/O and business logic.
+
+mod asset;
+mod book;
+mod command;
+mod error;
+mod event;
+mod ids;
+mod market;
+mod order;
+mod result;
+mod wire;
+
+pub use asset::*;
+pub use book::*;
+pub use command::*;
+pub use error::*;
+pub use event::*;
+pub use ids::*;
+pub use market::*;
+pub use order::*;
+pub use result::*;
+pub use wire::*;
+
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Side {
-    Buy,
-    Sell,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaceLimit {
-    pub user_id: u64,
-    pub market_id: u32,
-    pub side: Side,
-    pub price_ticks: u64,
-    pub qty: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum ClientMessage {
-    PlaceLimit(PlaceLimit),
-}
+/// Client -> server command. `Command` is the canonical name; `ClientMessage` is
+/// kept as an alias for the existing contract tests.
+pub type ClientMessage = Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ServerMessage {
-    Accepted { seq: u64, order_id: u64 },
-    Rejected { reason: String },
+    Accepted { seq: Seq, order_id: OrderId },
+    Rejected { code: ReasonCode },
 }
