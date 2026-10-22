@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use dx_types::{
-    BookLevel, BookSeq, BookSnapshot, MarketConfig, MarketStatus, OrderId, OrderStatus, Qty,
-    ReasonCode, Side, Ticks, TradeId, UserId,
+    BookDelta, BookLevel, BookSeq, BookSnapshot, LevelChange, MarketConfig, MarketId, MarketStatus,
+    OrderId, OrderStatus, Qty, ReasonCode, Side, Ticks, TradeId, UserId,
 };
 use sha2::{Digest, Sha256};
 
@@ -59,12 +59,16 @@ pub struct PlaceOutcome {
     pub fills: Vec<MatchFill>,
     /// Resting orders cancelled by self-trade prevention.
     pub cancelled_self_trade_orders: Vec<CancelledOrder>,
+    /// Absolute level changes caused by this command. `None` when the book did
+    /// not change (for example, an unfilled market order with no liquidity).
+    pub delta: Option<BookDelta>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CancelOutcome {
     pub order_id: OrderId,
     pub cancelled_qty: Qty,
+    pub delta: BookDelta,
 }
 
 /// One side of the book, indexed by `price_ticks - floor`.
@@ -100,6 +104,14 @@ impl BookSide {
 
     fn price_at(&self, idx: usize) -> Ticks {
         self.floor + idx as Ticks
+    }
+
+    fn level_change(&self, idx: usize) -> LevelChange {
+        LevelChange {
+            side: self.side,
+            price_ticks: self.price_at(idx),
+            qty: self.levels[idx].qty,
+        }
     }
 
     fn set_bit(&mut self, idx: usize) {
@@ -370,6 +382,7 @@ impl OrderBook {
         next_trade_id: &mut TradeId,
     ) -> Result<PlaceOutcome, ReasonCode> {
         self.validate_limit(price_ticks, qty)?;
+        let market_id = self.config.id;
 
         let Self {
             bids,
@@ -390,6 +403,7 @@ impl OrderBook {
         let mut remaining = qty;
         let mut fills = Vec::new();
         let mut cancelled_self_trade_orders = Vec::new();
+        let mut changes = Vec::new();
 
         while remaining > 0 {
             let Some(level_idx) = opposite.best_index() else {
@@ -404,6 +418,7 @@ impl OrderBook {
                 break;
             }
 
+            let mut level_touched = false;
             while remaining > 0 {
                 let Some(head_slot) = opposite.levels[level_idx].head else {
                     break;
@@ -423,6 +438,7 @@ impl OrderBook {
                         price_ticks: removed.price_ticks,
                         remaining: removed.remaining,
                     });
+                    level_touched = true;
                     continue;
                 }
 
@@ -440,6 +456,7 @@ impl OrderBook {
                     qty: fill_qty,
                 });
                 remaining -= fill_qty;
+                level_touched = true;
 
                 if fill_qty == maker_remaining {
                     // `unlink` subtracts the maker's remaining quantity from the level.
@@ -451,6 +468,10 @@ impl OrderBook {
                         .remaining -= fill_qty;
                     opposite.levels[level_idx].qty -= fill_qty;
                 }
+            }
+
+            if level_touched {
+                changes.push(opposite.level_change(level_idx));
             }
         }
 
@@ -477,6 +498,8 @@ impl OrderBook {
             let slot = alloc_slot(orders, free, order);
             index.insert(order_id, slot);
             own.append(slot, orders);
+            let own_idx = own.index_of(price_ticks).expect("price inside collar");
+            changes.push(own.level_change(own_idx));
         } else {
             status = OrderStatus::Filled;
         }
@@ -484,7 +507,7 @@ impl OrderBook {
         if let Some(fill) = fills.last() {
             *last_trade_price = Some(fill.price_ticks);
         }
-        *book_seq += 1;
+        let delta = book_delta(market_id, book_seq, changes);
 
         Ok(PlaceOutcome {
             order_id,
@@ -493,6 +516,7 @@ impl OrderBook {
             remaining_qty: remaining,
             fills,
             cancelled_self_trade_orders,
+            delta,
         })
     }
 
@@ -506,6 +530,7 @@ impl OrderBook {
         next_trade_id: &mut TradeId,
     ) -> Result<PlaceOutcome, ReasonCode> {
         self.validate_market(protect_price_ticks, qty)?;
+        let market_id = self.config.id;
 
         let Self {
             bids,
@@ -526,6 +551,7 @@ impl OrderBook {
         let mut remaining = qty;
         let mut fills = Vec::new();
         let mut cancelled_self_trade_orders = Vec::new();
+        let mut changes = Vec::new();
 
         while remaining > 0 {
             let Some(level_idx) = opposite.best_index() else {
@@ -540,6 +566,7 @@ impl OrderBook {
                 break;
             }
 
+            let mut level_touched = false;
             while remaining > 0 {
                 let Some(head_slot) = opposite.levels[level_idx].head else {
                     break;
@@ -558,6 +585,7 @@ impl OrderBook {
                         price_ticks: removed.price_ticks,
                         remaining: removed.remaining,
                     });
+                    level_touched = true;
                     continue;
                 }
 
@@ -575,6 +603,7 @@ impl OrderBook {
                     qty: fill_qty,
                 });
                 remaining -= fill_qty;
+                level_touched = true;
 
                 if fill_qty == maker_remaining {
                     remove_order(orders, free, index, opposite, head_slot);
@@ -586,12 +615,16 @@ impl OrderBook {
                     opposite.levels[level_idx].qty -= fill_qty;
                 }
             }
+
+            if level_touched {
+                changes.push(opposite.level_change(level_idx));
+            }
         }
 
         if let Some(fill) = fills.last() {
             *last_trade_price = Some(fill.price_ticks);
         }
-        *book_seq += 1;
+        let delta = book_delta(market_id, book_seq, changes);
 
         let filled_qty = qty - remaining;
         Ok(PlaceOutcome {
@@ -605,6 +638,7 @@ impl OrderBook {
             remaining_qty: remaining,
             fills,
             cancelled_self_trade_orders,
+            delta,
         })
     }
 
@@ -616,11 +650,16 @@ impl OrderBook {
         let Some(slot) = self.index.get(&order_id).copied() else {
             return Err(ReasonCode::OrderNotFound);
         };
-        let (owner, side, remaining) = {
+        let (owner, side, price_ticks, remaining) = {
             let order = self.orders[slot as usize]
                 .as_ref()
                 .ok_or(ReasonCode::OrderNotFound)?;
-            (order.user_id, order.side, order.remaining)
+            (
+                order.user_id,
+                order.side,
+                order.price_ticks,
+                order.remaining,
+            )
         };
         if owner != user_id {
             return Err(ReasonCode::NotOrderOwner);
@@ -631,14 +670,24 @@ impl OrderBook {
             Side::Sell => &mut self.asks,
         };
         book_side.unlink(slot, &mut self.orders);
+        let level_idx = book_side
+            .index_of(price_ticks)
+            .expect("cancelled order price inside collar");
+        let change = book_side.level_change(level_idx);
         self.index.remove(&order_id);
         self.orders[slot as usize] = None;
         self.free.push(slot);
         self.book_seq += 1;
+        let delta = BookDelta {
+            market_id: self.config.id,
+            book_seq: self.book_seq,
+            changes: vec![change],
+        };
 
         Ok(CancelOutcome {
             order_id,
             cancelled_qty: remaining,
+            delta,
         })
     }
 
@@ -660,6 +709,22 @@ impl OrderBook {
         self.bids.hash_into(hasher, &self.orders);
         self.asks.hash_into(hasher, &self.orders);
     }
+}
+
+fn book_delta(
+    market_id: MarketId,
+    book_seq: &mut BookSeq,
+    changes: Vec<LevelChange>,
+) -> Option<BookDelta> {
+    if changes.is_empty() {
+        return None;
+    }
+    *book_seq += 1;
+    Some(BookDelta {
+        market_id,
+        book_seq: *book_seq,
+        changes,
+    })
 }
 
 fn alloc_slot(orders: &mut Vec<Option<Order>>, free: &mut Vec<u32>, order: Order) -> u32 {

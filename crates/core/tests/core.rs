@@ -1,7 +1,7 @@
-use dx_core::Core;
+use dx_core::{CommandOutcome, Core};
 use dx_types::{
-    Asset, Balance, BookLevel, Cancel, Command, OrderStatus, PlaceLimit, PlaceMarket, Qty,
-    ReasonCode, Side, Ticks, seed_markets,
+    Asset, Balance, BookDelta, BookLevel, BookSnapshot, Cancel, Command, LevelChange, OrderStatus,
+    PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, seed_markets,
 };
 
 const MARKET: u32 = 1;
@@ -9,6 +9,59 @@ const PRICE: Ticks = 5_000;
 
 fn core() -> Core {
     Core::new(seed_markets()).unwrap()
+}
+
+fn apply_delta(snapshot: &mut BookSnapshot, delta: &BookDelta) {
+    assert_eq!(snapshot.market_id, delta.market_id);
+    assert_eq!(
+        delta.book_seq,
+        snapshot.book_seq + 1,
+        "delta must be the next book sequence"
+    );
+
+    for change in &delta.changes {
+        let levels = match change.side {
+            Side::Buy => &mut snapshot.bids,
+            Side::Sell => &mut snapshot.asks,
+        };
+        if let Some(level) = levels
+            .iter_mut()
+            .find(|level| level.price_ticks == change.price_ticks)
+        {
+            level.qty = change.qty;
+        } else if change.qty > 0 {
+            levels.push(BookLevel {
+                price_ticks: change.price_ticks,
+                qty: change.qty,
+            });
+        }
+        levels.retain(|level| level.qty > 0);
+        match change.side {
+            Side::Buy => levels.sort_unstable_by_key(|level| std::cmp::Reverse(level.price_ticks)),
+            Side::Sell => levels.sort_unstable_by_key(|level| level.price_ticks),
+        }
+    }
+
+    snapshot.book_seq = delta.book_seq;
+}
+
+fn reconstruct_without_tape(before: &BookSnapshot, deltas: &[BookDelta], after: &BookSnapshot) {
+    let mut reconstructed = before.clone();
+    for delta in deltas {
+        apply_delta(&mut reconstructed, delta);
+    }
+    assert_eq!(&reconstructed, after);
+}
+
+fn reconstruct_with_tape(outcome: &CommandOutcome, before: &BookSnapshot, after: &BookSnapshot) {
+    let mut reconstructed = before.clone();
+    for delta in &outcome.deltas {
+        apply_delta(&mut reconstructed, delta);
+    }
+    if let Some(fill) = outcome.response.fills.last() {
+        reconstructed.last_trade_price = Some(fill.price_ticks);
+    }
+    assert_eq!(&reconstructed, after);
 }
 
 fn limit(client_order_id: u64, side: Side, price_ticks: Ticks, qty: Qty) -> Command {
@@ -349,4 +402,180 @@ fn unknown_cancel_and_wrong_owner_are_rejected() {
     let wrong_owner = core.process(2, cancel(3, bid.order_id.unwrap()));
     assert_rejected(&wrong_owner, ReasonCode::NotOrderOwner);
     core.check_invariants().unwrap();
+}
+
+#[test]
+fn deltas_reconstruct_snapshots_for_rests_and_cancels() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+
+    let before = core.snapshot(MARKET, 10).unwrap();
+    let first = core.process_with_deltas(1, limit(1, Side::Buy, 4_900, 2));
+    let after = core.snapshot(MARKET, 10).unwrap();
+    assert_eq!(first.deltas.len(), 1);
+    assert_eq!(
+        first.deltas[0].changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 4_900,
+            qty: 2,
+        }]
+    );
+    reconstruct_without_tape(&before, &first.deltas, &after);
+
+    let before = after;
+    let second = core.process_with_deltas(1, limit(2, Side::Buy, 4_800, 1));
+    let after = core.snapshot(MARKET, 10).unwrap();
+    assert_eq!(second.deltas.len(), 1);
+    assert_eq!(
+        second.deltas[0].changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 4_800,
+            qty: 1,
+        }]
+    );
+    reconstruct_without_tape(&before, &second.deltas, &after);
+
+    let cancelled_id = second.response.order_id.unwrap();
+    let before = after;
+    let cancelled = core.process_with_deltas(1, cancel(3, cancelled_id));
+    let after = core.snapshot(MARKET, 10).unwrap();
+    assert_eq!(
+        cancelled.deltas[0].changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 4_800,
+            qty: 0,
+        }]
+    );
+    reconstruct_without_tape(&before, &cancelled.deltas, &after);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn trade_delta_and_fills_reconstruct_the_next_snapshot() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 2, 1).unwrap();
+    core.process(2, limit(1, Side::Sell, PRICE, 2));
+
+    let before = core.snapshot(MARKET, 10).unwrap();
+    let outcome = core.process_with_deltas(1, limit(2, Side::Buy, PRICE, 3));
+    let after = core.snapshot(MARKET, 10).unwrap();
+
+    assert_eq!(outcome.response.status, OrderStatus::PartiallyFilled);
+    assert_eq!(outcome.fills().len(), 1);
+    assert_eq!(outcome.deltas.len(), 1);
+    assert_eq!(outcome.deltas[0].book_seq, before.book_seq + 1);
+    assert_eq!(
+        outcome.deltas[0].changes,
+        vec![
+            LevelChange {
+                side: Side::Sell,
+                price_ticks: PRICE,
+                qty: 0,
+            },
+            LevelChange {
+                side: Side::Buy,
+                price_ticks: PRICE,
+                qty: 1,
+            },
+        ]
+    );
+    assert_eq!(after.book_seq, outcome.deltas[0].book_seq);
+    assert_eq!(after.last_trade_price, Some(PRICE));
+    reconstruct_with_tape(&outcome, &before, &after);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn book_seq_only_advances_on_real_book_changes() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+
+    let before = core.snapshot(MARKET, 10).unwrap();
+    let outcome = core.process_with_deltas(1, market_order(1, Side::Buy, 2, PRICE));
+    let after = core.snapshot(MARKET, 10).unwrap();
+
+    assert_eq!(outcome.response.status, OrderStatus::Cancelled);
+    assert!(outcome.response.fills.is_empty());
+    assert!(outcome.deltas.is_empty());
+    assert_eq!(before.book_seq, 0);
+    assert_eq!(after, before);
+    assert_eq!(core.engine().book(MARKET).unwrap().book_seq(), 0);
+
+    // The empty market order did not create a gap in the per-market sequence.
+    let rested = core.process_with_deltas(1, limit(2, Side::Buy, 4_900, 1));
+    assert_eq!(rested.deltas.len(), 1);
+    assert_eq!(rested.deltas[0].book_seq, 1);
+    assert_eq!(core.snapshot(MARKET, 10).unwrap().book_seq, 1);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn duplicate_and_rejected_commands_emit_no_deltas() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+
+    let command = limit(1, Side::Buy, PRICE, 1);
+    let first = core.process_with_deltas(1, command.clone());
+    assert_eq!(first.deltas.len(), 1);
+    let after_first = core.snapshot(MARKET, 10).unwrap();
+    assert_eq!(after_first.book_seq, 1);
+
+    let duplicate = core.process_with_deltas(1, command);
+    assert_eq!(duplicate.response, first.response);
+    assert!(duplicate.deltas.is_empty());
+    assert_eq!(core.snapshot(MARKET, 10).unwrap(), after_first);
+
+    let rejected = core.process_with_deltas(1, limit(2, Side::Buy, 2_499, 1));
+    assert_rejected(&rejected.response, ReasonCode::OutsideCollar);
+    assert!(rejected.deltas.is_empty());
+    assert_eq!(core.snapshot(MARKET, 10).unwrap(), after_first);
+
+    let conflicting_kind = core.process_with_deltas(1, cancel(1, first.response.order_id.unwrap()));
+    assert_rejected(
+        &conflicting_kind.response,
+        ReasonCode::DuplicateClientOrderId,
+    );
+    assert!(conflicting_kind.deltas.is_empty());
+    assert_eq!(core.snapshot(MARKET, 10).unwrap(), after_first);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn replay_produces_identical_responses_and_deltas() {
+    fn seeded() -> Core {
+        let mut core = core();
+        core.deposit_cash(1, 10_000_000, 1).unwrap();
+        core.issue_passes(2, MARKET, 2, 1).unwrap();
+        core
+    }
+
+    fn run(core: &mut Core) -> Vec<CommandOutcome> {
+        let mut outcomes = vec![
+            core.process_with_deltas(2, limit(1, Side::Sell, PRICE, 2)),
+            core.process_with_deltas(1, limit(2, Side::Buy, 4_900, 2)),
+            core.process_with_deltas(1, limit(2, Side::Buy, 4_900, 2)),
+            core.process_with_deltas(1, limit(3, Side::Buy, 2_499, 1)),
+        ];
+        let bid_id = outcomes[1].response.order_id.unwrap();
+        outcomes.push(core.process_with_deltas(1, cancel(4, bid_id)));
+        outcomes.push(core.process_with_deltas(1, market_order(5, Side::Buy, 1, PRICE)));
+        outcomes
+    }
+
+    let mut a = seeded();
+    let mut b = seeded();
+    let a_outcomes = run(&mut a);
+    let b_outcomes = run(&mut b);
+
+    assert_eq!(a_outcomes, b_outcomes);
+    assert!(a_outcomes.iter().any(|outcome| !outcome.deltas.is_empty()));
+    assert!(a_outcomes[2].deltas.is_empty(), "duplicate must be silent");
+    assert!(a_outcomes[3].deltas.is_empty(), "reject must be silent");
+    assert_eq!(a.state_hash(), b.state_hash());
+    a.check_invariants().unwrap();
+    b.check_invariants().unwrap();
 }

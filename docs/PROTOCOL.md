@@ -396,9 +396,14 @@ Frozen now:
 - Explicit `ResyncRequired` on a lagged WebSocket
 - `/ws/market/{id}` fixed-market feed
 
+Core command processing now returns ordered per-market `BookDelta` values through
+`Core::process_with_deltas`; `Core::process` remains the response-only wrapper while the gateway
+still broadcasts snapshots.
+
 Still pending in the T1 runtime:
 
-- Emitting deterministic `Delta` frames instead of full snapshots after every command
+- Publishing deterministic `Delta` frames from the gateway instead of full snapshots after every
+  command
 - Bounded single-writer command queue
 - Batched publisher and cached resync snapshots
 - Real queue/latency histograms (the two p99 fields remain zero)

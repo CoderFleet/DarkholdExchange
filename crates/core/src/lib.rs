@@ -2,4 +2,4 @@
 
 mod core;
 
-pub use core::Core;
+pub use core::{CommandOutcome, Core};

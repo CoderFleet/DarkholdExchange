@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use dx_engine::{Engine, PlaceOutcome};
 use dx_ledger::{Ledger, LedgerError, Owner, TradeSettlement};
 use dx_types::{
-    Asset, Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, Fill,
+    Asset, Balance, BookDelta, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, Fill,
     MarketConfig, MarketId, MarketStatus, Minor, OrderStatus, PlaceLimit, PlaceMarket, Qty,
     ReasonCode, Seq, Side, Ticks, UserId,
 };
@@ -44,6 +44,32 @@ pub struct Core {
     poisoned: bool,
 }
 
+/// The response to a command plus the absolute book changes it produced.
+///
+/// Successful trades keep their fills in [`CommandOutcome::response`]. Cached
+/// idempotent responses, rejected commands, and calls on a poisoned core carry
+/// no deltas because they do not change the book.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandOutcome {
+    pub response: CommandResponse,
+    pub deltas: Vec<BookDelta>,
+}
+
+impl CommandOutcome {
+    fn without_deltas(response: CommandResponse) -> Self {
+        Self {
+            response,
+            deltas: Vec::new(),
+        }
+    }
+
+    /// Fills produced by the command. They remain part of the response contract;
+    /// this is a convenience accessor for event publishers.
+    pub fn fills(&self) -> &[Fill] {
+        &self.response.fills
+    }
+}
+
 impl Core {
     pub fn new(markets: Vec<MarketConfig>) -> Result<Self, String> {
         let engine = Engine::new(markets.clone())?;
@@ -64,28 +90,48 @@ impl Core {
 
     /// Process one authenticated command. The caller supplies identity; the wire
     /// command never carries a user id.
+    ///
+    /// This response-only wrapper is kept for the current snapshot-based
+    /// gateway. Event publishers should use [`Core::process_with_deltas`].
     pub fn process(&mut self, user_id: UserId, command: Command) -> CommandResponse {
+        self.process_with_deltas(user_id, command).response
+    }
+
+    /// Process one command and return the client response together with the
+    /// absolute book changes caused by it.
+    ///
+    /// Delta sequencing is per market. A delta is emitted only when at least
+    /// one level actually changes; cached idempotent responses, rejects, and
+    /// poisoned-core responses emit nothing.
+    pub fn process_with_deltas(&mut self, user_id: UserId, command: Command) -> CommandOutcome {
         let (kind, client_order_id) = command_identity(&command);
         let cache_key = (user_id, client_order_id);
 
         if let Some(cached) = self.idempotency.get(&cache_key) {
             if cached.kind == kind {
-                return cached.response.clone();
+                return CommandOutcome::without_deltas(cached.response.clone());
             }
             let seq = self.alloc_seq();
-            return CommandResponse::rejected(seq, ReasonCode::DuplicateClientOrderId);
+            return CommandOutcome::without_deltas(CommandResponse::rejected(
+                seq,
+                ReasonCode::DuplicateClientOrderId,
+            ));
         }
 
         if self.poisoned {
             let seq = self.alloc_seq();
-            return CommandResponse::rejected(seq, ReasonCode::InternalError);
+            return CommandOutcome::without_deltas(CommandResponse::rejected(
+                seq,
+                ReasonCode::InternalError,
+            ));
         }
 
         let seq = self.alloc_seq();
+        let mut deltas = Vec::new();
         let response = match command {
-            Command::PlaceLimit(place) => self.place_limit(seq, user_id, place),
-            Command::PlaceMarket(place) => self.place_market(seq, user_id, place),
-            Command::Cancel(cancel) => self.cancel(seq, user_id, cancel),
+            Command::PlaceLimit(place) => self.place_limit(seq, user_id, place, &mut deltas),
+            Command::PlaceMarket(place) => self.place_market(seq, user_id, place, &mut deltas),
+            Command::Cancel(cancel) => self.cancel(seq, user_id, cancel, &mut deltas),
         };
         self.idempotency.insert(
             cache_key,
@@ -94,7 +140,7 @@ impl Core {
                 response: response.clone(),
             },
         );
-        response
+        CommandOutcome { response, deltas }
     }
 
     fn alloc_seq(&mut self) -> Seq {
@@ -103,7 +149,13 @@ impl Core {
         seq
     }
 
-    fn place_limit(&mut self, seq: Seq, user_id: UserId, place: PlaceLimit) -> CommandResponse {
+    fn place_limit(
+        &mut self,
+        seq: Seq,
+        user_id: UserId,
+        place: PlaceLimit,
+        deltas: &mut Vec<BookDelta>,
+    ) -> CommandResponse {
         let Some(market) = self.markets.get(&place.market_id).cloned() else {
             return CommandResponse::rejected(seq, ReasonCode::UnknownMarket);
         };
@@ -217,6 +269,9 @@ impl Core {
             }
         }
 
+        if let Some(delta) = outcome.delta {
+            deltas.push(delta);
+        }
         CommandResponse {
             seq,
             status: outcome.status,
@@ -228,7 +283,13 @@ impl Core {
         }
     }
 
-    fn place_market(&mut self, seq: Seq, user_id: UserId, place: PlaceMarket) -> CommandResponse {
+    fn place_market(
+        &mut self,
+        seq: Seq,
+        user_id: UserId,
+        place: PlaceMarket,
+        deltas: &mut Vec<BookDelta>,
+    ) -> CommandResponse {
         let Some(market) = self.markets.get(&place.market_id).cloned() else {
             return CommandResponse::rejected(seq, ReasonCode::UnknownMarket);
         };
@@ -335,6 +396,9 @@ impl Core {
             }
         }
 
+        if let Some(delta) = outcome.delta {
+            deltas.push(delta);
+        }
         CommandResponse {
             seq,
             status: outcome.status,
@@ -346,7 +410,13 @@ impl Core {
         }
     }
 
-    fn cancel(&mut self, seq: Seq, user_id: UserId, cancel: Cancel) -> CommandResponse {
+    fn cancel(
+        &mut self,
+        seq: Seq,
+        user_id: UserId,
+        cancel: Cancel,
+        deltas: &mut Vec<BookDelta>,
+    ) -> CommandResponse {
         let mut found = None;
         for market_id in self.engine.market_ids() {
             if let Some(order) = self
@@ -404,6 +474,7 @@ impl Core {
             }
         }
 
+        deltas.push(outcome.delta);
         CommandResponse {
             seq,
             status: OrderStatus::Cancelled,

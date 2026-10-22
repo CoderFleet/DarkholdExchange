@@ -1,5 +1,7 @@
 use dx_engine::Engine;
-use dx_types::{BookLevel, OrderStatus, ReasonCode, Side, seed_markets};
+use dx_types::{
+    BookDelta, BookLevel, BookSnapshot, LevelChange, OrderStatus, ReasonCode, Side, seed_markets,
+};
 
 const MARKET: u32 = 1;
 const FLOOR: u64 = 2_500;
@@ -7,6 +9,40 @@ const CAP: u64 = 6_000;
 
 fn engine() -> Engine {
     Engine::new(seed_markets()).unwrap()
+}
+
+fn apply_delta(snapshot: &mut BookSnapshot, delta: &BookDelta) {
+    assert_eq!(snapshot.market_id, delta.market_id);
+    assert_eq!(
+        delta.book_seq,
+        snapshot.book_seq + 1,
+        "delta must be the next book sequence"
+    );
+
+    for change in &delta.changes {
+        let levels = match change.side {
+            Side::Buy => &mut snapshot.bids,
+            Side::Sell => &mut snapshot.asks,
+        };
+        if let Some(level) = levels
+            .iter_mut()
+            .find(|level| level.price_ticks == change.price_ticks)
+        {
+            level.qty = change.qty;
+        } else if change.qty > 0 {
+            levels.push(BookLevel {
+                price_ticks: change.price_ticks,
+                qty: change.qty,
+            });
+        }
+        levels.retain(|level| level.qty > 0);
+        match change.side {
+            Side::Buy => levels.sort_unstable_by_key(|level| std::cmp::Reverse(level.price_ticks)),
+            Side::Sell => levels.sort_unstable_by_key(|level| level.price_ticks),
+        }
+    }
+
+    snapshot.book_seq = delta.book_seq;
 }
 
 #[test]
@@ -202,4 +238,131 @@ fn state_hash_is_deterministic_for_the_same_sequence() {
 
     b.place_limit(2, MARKET, Side::Sell, 5_200, 1).unwrap();
     assert_ne!(a.state_hash(), b.state_hash());
+}
+
+#[test]
+fn emitted_deltas_are_absolute_and_reconstruct_the_next_snapshot() {
+    let mut engine = engine();
+
+    let mut before = engine.snapshot(MARKET, 10).unwrap();
+    let first = engine.place_limit(1, MARKET, Side::Buy, 5_000, 3).unwrap();
+    let first_delta = first.delta.clone().expect("rest changes the book");
+    assert_eq!(
+        first_delta.changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 5_000,
+            qty: 3,
+        }]
+    );
+    apply_delta(&mut before, &first_delta);
+    assert_eq!(before, engine.snapshot(MARKET, 10).unwrap());
+
+    let mut before = engine.snapshot(MARKET, 10).unwrap();
+    let second = engine.place_limit(2, MARKET, Side::Buy, 5_000, 2).unwrap();
+    let second_delta = second.delta.clone().expect("rest changes the book");
+    assert_eq!(second_delta.book_seq, first_delta.book_seq + 1);
+    assert_eq!(
+        second_delta.changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 5_000,
+            qty: 5,
+        }]
+    );
+    apply_delta(&mut before, &second_delta);
+    assert_eq!(before, engine.snapshot(MARKET, 10).unwrap());
+
+    let mut before = engine.snapshot(MARKET, 10).unwrap();
+    let cancelled = engine.cancel(1, first.order_id).unwrap();
+    assert_eq!(cancelled.delta.book_seq, second_delta.book_seq + 1);
+    assert_eq!(
+        cancelled.delta.changes,
+        vec![LevelChange {
+            side: Side::Buy,
+            price_ticks: 5_000,
+            qty: 2,
+        }]
+    );
+    apply_delta(&mut before, &cancelled.delta);
+    assert_eq!(before, engine.snapshot(MARKET, 10).unwrap());
+}
+
+#[test]
+fn market_order_without_liquidity_does_not_advance_book_seq_or_emit_a_delta() {
+    let mut engine = engine();
+    let before = engine.snapshot(MARKET, 10).unwrap();
+
+    let outcome = engine
+        .place_market(1, MARKET, Side::Buy, 2, 5_000)
+        .expect("valid market order");
+
+    assert_eq!(outcome.status, OrderStatus::Cancelled);
+    assert_eq!(outcome.filled_qty, 0);
+    assert!(outcome.fills.is_empty());
+    assert!(outcome.delta.is_none());
+    assert_eq!(engine.book(MARKET).unwrap().book_seq(), 0);
+    assert_eq!(engine.snapshot(MARKET, 10).unwrap(), before);
+}
+
+#[test]
+fn self_trade_cancellation_emits_both_level_changes() {
+    let mut engine = engine();
+    engine.place_limit(1, MARKET, Side::Buy, 5_000, 2).unwrap();
+
+    let mut before = engine.snapshot(MARKET, 10).unwrap();
+    let outcome = engine.place_limit(1, MARKET, Side::Sell, 5_000, 2).unwrap();
+    let delta = outcome.delta.clone().expect("self-trade changes the book");
+
+    assert!(outcome.fills.is_empty());
+    assert_eq!(
+        delta.changes,
+        vec![
+            LevelChange {
+                side: Side::Buy,
+                price_ticks: 5_000,
+                qty: 0,
+            },
+            LevelChange {
+                side: Side::Sell,
+                price_ticks: 5_000,
+                qty: 2,
+            },
+        ]
+    );
+    apply_delta(&mut before, &delta);
+    assert_eq!(before, engine.snapshot(MARKET, 10).unwrap());
+}
+
+#[test]
+fn multi_level_sweep_emits_one_delta_with_absolute_level_changes() {
+    let mut engine = engine();
+    engine.place_limit(2, MARKET, Side::Sell, 5_000, 2).unwrap();
+    engine.place_limit(2, MARKET, Side::Sell, 5_100, 2).unwrap();
+    assert_eq!(engine.book(MARKET).unwrap().book_seq(), 2);
+
+    let mut before = engine.snapshot(MARKET, 10).unwrap();
+    let outcome = engine.place_market(1, MARKET, Side::Buy, 3, 5_100).unwrap();
+    let delta = outcome.delta.clone().expect("sweep changes the book");
+
+    assert_eq!(delta.book_seq, 3);
+    assert_eq!(
+        delta.changes,
+        vec![
+            LevelChange {
+                side: Side::Sell,
+                price_ticks: 5_000,
+                qty: 0,
+            },
+            LevelChange {
+                side: Side::Sell,
+                price_ticks: 5_100,
+                qty: 1,
+            },
+        ]
+    );
+    apply_delta(&mut before, &delta);
+    before.last_trade_price = outcome.fills.last().map(|fill| fill.price_ticks);
+    assert_eq!(before, engine.snapshot(MARKET, 10).unwrap());
+    assert_eq!(engine.book(MARKET).unwrap().book_seq(), 3);
 }
