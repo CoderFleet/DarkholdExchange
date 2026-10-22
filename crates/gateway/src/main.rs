@@ -1,7 +1,8 @@
 //! HTTP command gateway and MessagePack market-data WebSocket.
 //!
-//! REST is command-in / response-out. The WebSocket carries snapshots and trades.
-//! Identity is simulated for the demo via `x-dev-user` (default user 1).
+//! REST is command-in / response-out. The WebSocket streams ordered deltas and
+//! trades; snapshots are only baselines and lag-recovery checkpoints. Identity
+//! is simulated for the demo via `x-dev-user` (default user 1).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,8 +17,8 @@ use axum::{Json, Router};
 use dx_core::Core;
 use dx_types::{
     Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody, Fill,
-    JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
-    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
+    JournalResponse, MarketConfig, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView,
+    OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
     WsServerMessage, seed_markets,
 };
 use serde::Deserialize;
@@ -208,43 +209,44 @@ async fn trades(
     Ok(Json(result))
 }
 
+/// Process a command and publish its market-data events in core commit order.
+///
+/// The core mutex is held through publication so concurrent commands cannot
+/// reorder their deltas/trades. `broadcast::Sender::send` is non-blocking.
 fn execute_command(state: &AppState, user_id: UserId, command: Command) -> CommandResponse {
-    let (response, snapshots, fills) = {
+    let (response, rejected) = {
         let mut core = state.core.lock().expect("core mutex");
-        let response = core.process(user_id, command);
-        let changed = response.status != OrderStatus::Rejected;
-        let snapshots = if changed {
-            core.engine()
-                .market_ids()
-                .into_iter()
-                .filter_map(|market_id| core.snapshot(market_id, 50))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let fills = response.fills.clone();
-        (response, snapshots, fills)
+        let outcome = core.process_with_deltas(user_id, command);
+        let publish = !outcome.cached && outcome.response.status != OrderStatus::Rejected;
+
+        if publish {
+            for delta in &outcome.deltas {
+                let _ = state.tx.send(WsServerMessage::Delta {
+                    delta: delta.clone(),
+                });
+            }
+
+            if !outcome.response.fills.is_empty() {
+                let mut recent = state.recent_trades.lock().expect("trade mutex");
+                recent.extend(outcome.response.fills.iter().cloned());
+                if recent.len() > 200 {
+                    let excess = recent.len() - 200;
+                    recent.drain(0..excess);
+                }
+            }
+
+            for fill in &outcome.response.fills {
+                let _ = state.tx.send(WsServerMessage::Trade { fill: fill.clone() });
+            }
+        }
+
+        let rejected = outcome.response.status == OrderStatus::Rejected;
+        (outcome.response, rejected)
     };
 
     state.metrics.commands_total.fetch_add(1, Ordering::Relaxed);
-    if response.status == OrderStatus::Rejected {
+    if rejected {
         state.metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    if !fills.is_empty() {
-        let mut recent = state.recent_trades.lock().expect("trade mutex");
-        recent.extend(fills.iter().cloned());
-        if recent.len() > 200 {
-            let excess = recent.len() - 200;
-            recent.drain(0..excess);
-        }
-    }
-
-    for snapshot in snapshots {
-        let _ = state.tx.send(WsServerMessage::Snapshot { snapshot });
-    }
-    for fill in fills {
-        let _ = state.tx.send(WsServerMessage::Trade { fill });
     }
 
     response
@@ -445,13 +447,67 @@ impl Drop for WsClientGuard {
     }
 }
 
+/// A snapshot baseline paired with a subscription positioned at the same commit.
+///
+/// The core lock is held while subscribing, taking snapshots, and reading the
+/// recent tape. Commands publish while holding that same lock, so no delta can
+/// slip between the snapshot and the subscription. Events committed after the
+/// baseline are queued for the receiver.
+struct StreamBaseline {
+    rx: broadcast::Receiver<WsServerMessage>,
+    markets: Vec<MarketConfig>,
+    snapshots: Vec<BookSnapshot>,
+    recent_trades: Vec<Fill>,
+}
+
+fn stream_baseline(
+    state: &AppState,
+    market_filter: Option<&[MarketId]>,
+    depth: usize,
+) -> StreamBaseline {
+    let core = state.core.lock().expect("core mutex");
+    let rx = state.tx.subscribe();
+
+    let market_ids = match market_filter {
+        Some(ids) => ids.to_vec(),
+        None => core.engine().market_ids(),
+    };
+    let markets = market_ids
+        .iter()
+        .filter_map(|market_id| core.config(*market_id).cloned())
+        .collect();
+    let snapshots = market_ids
+        .iter()
+        .filter_map(|market_id| core.snapshot(*market_id, depth))
+        .collect();
+
+    let recent_trades = {
+        let trades = state.recent_trades.lock().expect("trade mutex");
+        let mut recent = trades
+            .iter()
+            .rev()
+            .filter(|fill| market_filter.is_none_or(|ids| ids.contains(&fill.market_id)))
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>();
+        recent.reverse();
+        recent
+    };
+
+    StreamBaseline {
+        rx,
+        markets,
+        snapshots,
+        recent_trades,
+    }
+}
+
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
     user_id: Option<UserId>,
     fixed_market: Option<MarketId>,
 ) {
-    let mut rx = state.tx.subscribe();
     state.metrics.ws_clients.fetch_add(1, Ordering::Relaxed);
     let _client_guard = WsClientGuard {
         metrics: state.metrics.clone(),
@@ -459,20 +515,13 @@ async fn handle_socket(
 
     let mut market_filter = fixed_market.map(|market_id| vec![market_id]);
     let mut depth = 20usize;
-    let markets = {
-        let core = state.core.lock().expect("core mutex");
-        core.engine()
-            .market_ids()
-            .into_iter()
-            .filter(|market_id| fixed_market.is_none_or(|fixed| *market_id == fixed))
-            .filter_map(|market_id| core.config(market_id).cloned())
-            .collect::<Vec<_>>()
-    };
+    let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+    let mut rx = baseline.rx;
 
     if !send_msg(
         &mut socket,
         &WsServerMessage::Hello {
-            markets: markets.clone(),
+            markets: baseline.markets,
             user_id,
         },
     )
@@ -481,31 +530,12 @@ async fn handle_socket(
         return;
     }
 
-    let (snapshots, recent_trades) = {
-        let core = state.core.lock().expect("core mutex");
-        let snapshots = markets
-            .iter()
-            .filter_map(|market| core.snapshot(market.id, depth))
-            .collect::<Vec<_>>();
-        drop(core);
-        let trades = state.recent_trades.lock().expect("trade mutex");
-        let mut recent = trades
-            .iter()
-            .rev()
-            .filter(|fill| fixed_market.is_none_or(|market_id| fill.market_id == market_id))
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        recent.reverse();
-        (snapshots, recent)
-    };
-
-    for snapshot in snapshots {
+    for snapshot in baseline.snapshots {
         if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
             return;
         }
     }
-    for fill in recent_trades {
+    for fill in baseline.recent_trades {
         if !send_msg(&mut socket, &WsServerMessage::Trade { fill }).await {
             return;
         }
@@ -532,16 +562,9 @@ async fn handle_socket(
                                     market_filter = if market_ids.is_empty() { None } else { Some(market_ids) };
                                 }
                                 depth = (requested_depth as usize).clamp(1, 200);
-                                let snapshots = {
-                                    let core = state.core.lock().expect("core mutex");
-                                    let ids = market_filter
-                                        .clone()
-                                        .unwrap_or_else(|| core.engine().market_ids());
-                                    ids.into_iter()
-                                        .filter_map(|market_id| core.snapshot(market_id, depth))
-                                        .collect::<Vec<_>>()
-                                };
-                                for snapshot in snapshots {
+                                let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+                                rx = baseline.rx;
+                                for snapshot in baseline.snapshots {
                                     if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
                                         return;
                                     }
@@ -580,29 +603,19 @@ async fn handle_socket(
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         eprintln!("ws client lagged by {skipped} messages; resyncing");
                         state.metrics.slow_consumers.fetch_add(1, Ordering::Relaxed);
-                        let ids = {
-                            let core = state.core.lock().expect("core mutex");
-                            market_filter
-                                .clone()
-                                .unwrap_or_else(|| core.engine().market_ids())
-                        };
-                        for market_id in &ids {
+                        let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+                        rx = baseline.rx;
+                        for market in &baseline.markets {
                             if !send_msg(
                                 &mut socket,
-                                &WsServerMessage::ResyncRequired { market_id: *market_id },
+                                &WsServerMessage::ResyncRequired { market_id: market.id },
                             )
                             .await
                             {
                                 return;
                             }
                         }
-                        let snapshots = {
-                            let core = state.core.lock().expect("core mutex");
-                            ids.into_iter()
-                                .filter_map(|market_id| core.snapshot(market_id, depth))
-                                .collect::<Vec<_>>()
-                        };
-                        for snapshot in snapshots {
+                        for snapshot in baseline.snapshots {
                             if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
                                 return;
                             }
@@ -743,7 +756,238 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dx_types::{BookDelta, LevelChange};
+    use dx_types::{BookDelta, BookLevel, LevelChange, Ticks};
+
+    const MARKET: MarketId = 1;
+    const PRICE: Ticks = 5_000;
+
+    fn test_state() -> (AppState, broadcast::Receiver<WsServerMessage>) {
+        let mut core = Core::new(seed_markets()).unwrap();
+        core.deposit_cash(1, 10_000_000, 1).unwrap();
+        core.deposit_cash(2, 10_000_000, 2).unwrap();
+        core.issue_passes(2, MARKET, 5, 1).unwrap();
+
+        let (tx, rx) = broadcast::channel(64);
+        let state = AppState {
+            core: Arc::new(Mutex::new(core)),
+            tx,
+            recent_trades: Arc::new(Mutex::new(Vec::new())),
+            metrics: Arc::new(MetricsState::default()),
+        };
+        (state, rx)
+    }
+
+    fn limit(client_order_id: ClientOrderId, side: Side, price_ticks: Ticks, qty: Qty) -> Command {
+        Command::PlaceLimit(PlaceLimit {
+            client_order_id,
+            market_id: MARKET,
+            side,
+            price_ticks,
+            qty,
+        })
+    }
+
+    fn market_order(client_order_id: ClientOrderId, side: Side, qty: Qty) -> Command {
+        Command::PlaceMarket(PlaceMarket {
+            client_order_id,
+            market_id: MARKET,
+            side,
+            qty,
+            protect_price_ticks: PRICE,
+        })
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<WsServerMessage>) -> Vec<WsServerMessage> {
+        let mut messages = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            messages.push(message);
+        }
+        messages
+    }
+
+    fn apply_delta(snapshot: &mut BookSnapshot, delta: &BookDelta) {
+        assert_eq!(snapshot.market_id, delta.market_id);
+        assert_eq!(delta.book_seq, snapshot.book_seq + 1);
+
+        for change in &delta.changes {
+            let levels = match change.side {
+                Side::Buy => &mut snapshot.bids,
+                Side::Sell => &mut snapshot.asks,
+            };
+            if let Some(level) = levels
+                .iter_mut()
+                .find(|level| level.price_ticks == change.price_ticks)
+            {
+                level.qty = change.qty;
+            } else if change.qty > 0 {
+                levels.push(BookLevel {
+                    price_ticks: change.price_ticks,
+                    qty: change.qty,
+                });
+            }
+            levels.retain(|level| level.qty > 0);
+            match change.side {
+                Side::Buy => {
+                    levels.sort_unstable_by_key(|level| std::cmp::Reverse(level.price_ticks));
+                }
+                Side::Sell => levels.sort_unstable_by_key(|level| level.price_ticks),
+            }
+        }
+        snapshot.book_seq = delta.book_seq;
+    }
+
+    #[test]
+    fn commands_publish_delta_without_snapshot() {
+        let (state, mut rx) = test_state();
+
+        let response = execute_command(&state, 1, limit(1, Side::Buy, 4_900, 2));
+
+        assert_eq!(response.status, OrderStatus::Rested);
+        let messages = drain(&mut rx);
+        assert_eq!(messages.len(), 1);
+        let WsServerMessage::Delta { delta } = &messages[0] else {
+            panic!("expected delta, got {:?}", messages[0]);
+        };
+        assert_eq!(delta.market_id, MARKET);
+        assert_eq!(delta.book_seq, 1);
+        assert_eq!(
+            delta.changes,
+            vec![LevelChange {
+                side: Side::Buy,
+                price_ticks: 4_900,
+                qty: 2,
+            }]
+        );
+        assert_eq!(state.metrics.commands_total.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn fills_publish_delta_then_trade() {
+        let (state, mut rx) = test_state();
+        execute_command(&state, 2, limit(1, Side::Sell, PRICE, 2));
+        drain(&mut rx);
+
+        let command = market_order(1, Side::Buy, 2);
+        let response = execute_command(&state, 1, command.clone());
+
+        assert_eq!(response.status, OrderStatus::Filled);
+        let messages = drain(&mut rx);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+
+        let WsServerMessage::Delta { delta } = &messages[0] else {
+            panic!("expected delta first, got {:?}", messages[0]);
+        };
+        assert_eq!(delta.book_seq, 2);
+        assert_eq!(
+            delta.changes,
+            vec![LevelChange {
+                side: Side::Sell,
+                price_ticks: PRICE,
+                qty: 0,
+            }]
+        );
+
+        let WsServerMessage::Trade { fill } = &messages[1] else {
+            panic!("expected trade second, got {:?}", messages[1]);
+        };
+        assert_eq!(fill.qty, 2);
+        assert_eq!(fill.price_ticks, PRICE);
+        assert_eq!(state.recent_trades.lock().expect("trade mutex").len(), 1);
+
+        let duplicate = execute_command(&state, 1, command);
+        assert_eq!(duplicate, response);
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(state.recent_trades.lock().expect("trade mutex").len(), 1);
+    }
+
+    #[test]
+    fn cached_and_rejected_commands_publish_nothing() {
+        let (state, mut rx) = test_state();
+        let command = limit(1, Side::Buy, 4_900, 2);
+        let first = execute_command(&state, 1, command.clone());
+        assert_eq!(first.status, OrderStatus::Rested);
+        drain(&mut rx);
+
+        let duplicate = execute_command(&state, 1, command);
+        assert_eq!(duplicate, first);
+        assert!(drain(&mut rx).is_empty());
+
+        let rejected = execute_command(&state, 1, limit(2, Side::Buy, 2_499, 1));
+        assert_eq!(rejected.status, OrderStatus::Rejected);
+        assert!(drain(&mut rx).is_empty());
+
+        let conflicting = execute_command(
+            &state,
+            1,
+            Command::Cancel(Cancel {
+                client_order_id: 1,
+                order_id: first.order_id.unwrap(),
+            }),
+        );
+        assert_eq!(conflicting.status, OrderStatus::Rejected);
+        assert_eq!(conflicting.reason, Some(ReasonCode::DuplicateClientOrderId));
+        assert!(drain(&mut rx).is_empty());
+
+        assert_eq!(state.metrics.commands_total.load(Ordering::Relaxed), 4);
+        assert_eq!(state.metrics.rejected_total.load(Ordering::Relaxed), 2);
+        let core = state.core.lock().expect("core mutex");
+        assert_eq!(core.snapshot(MARKET, 10).unwrap().book_seq, 1);
+    }
+
+    #[test]
+    fn baseline_snapshot_and_stream_are_joined_without_a_gap() {
+        let (state, _old_rx) = test_state();
+        execute_command(&state, 2, limit(1, Side::Sell, PRICE, 2));
+
+        let baseline = stream_baseline(&state, Some(&[MARKET]), 10);
+        assert_eq!(baseline.markets.len(), 1);
+        assert_eq!(baseline.snapshots.len(), 1);
+        let mut snapshot = baseline.snapshots.into_iter().next().unwrap();
+        assert_eq!(snapshot.book_seq, 1);
+        let mut rx = baseline.rx;
+
+        let response = execute_command(&state, 1, market_order(1, Side::Buy, 1));
+        assert_eq!(response.status, OrderStatus::Filled);
+
+        let messages = drain(&mut rx);
+        assert_eq!(messages.len(), 2, "{messages:?}");
+        let WsServerMessage::Delta { delta } = &messages[0] else {
+            panic!("expected delta first, got {:?}", messages[0]);
+        };
+        apply_delta(&mut snapshot, delta);
+        let WsServerMessage::Trade { fill } = &messages[1] else {
+            panic!("expected trade second, got {:?}", messages[1]);
+        };
+        snapshot.last_trade_price = Some(fill.price_ticks);
+
+        let expected = state.core.lock().expect("core mutex").snapshot(MARKET, 10);
+        assert_eq!(Some(snapshot), expected);
+    }
+
+    #[test]
+    fn concurrent_commands_publish_monotonic_book_sequences() {
+        let (state, mut rx) = test_state();
+        let mut threads = Vec::new();
+        for (client_order_id, price_ticks) in [(10, 4_900), (11, 4_800)] {
+            let state = state.clone();
+            threads.push(std::thread::spawn(move || {
+                execute_command(&state, 1, limit(client_order_id, Side::Buy, price_ticks, 1))
+            }));
+        }
+        for thread in threads {
+            assert_eq!(thread.join().unwrap().status, OrderStatus::Rested);
+        }
+
+        let messages = drain(&mut rx);
+        let sequences = messages
+            .iter()
+            .filter_map(|message| match message {
+                WsServerMessage::Delta { delta } => Some(delta.book_seq),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, vec![1, 2]);
+    }
 
     #[test]
     fn maps_business_rejections_to_http_statuses() {

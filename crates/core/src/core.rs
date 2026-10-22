@@ -53,6 +53,9 @@ pub struct Core {
 pub struct CommandOutcome {
     pub response: CommandResponse,
     pub deltas: Vec<BookDelta>,
+    /// True when this response came from the idempotency cache. Publishers must
+    /// not treat the cached response's fills as new trades.
+    pub cached: bool,
 }
 
 impl CommandOutcome {
@@ -60,6 +63,15 @@ impl CommandOutcome {
         Self {
             response,
             deltas: Vec::new(),
+            cached: false,
+        }
+    }
+
+    fn cached(response: CommandResponse) -> Self {
+        Self {
+            response,
+            deltas: Vec::new(),
+            cached: true,
         }
     }
 
@@ -91,8 +103,8 @@ impl Core {
     /// Process one authenticated command. The caller supplies identity; the wire
     /// command never carries a user id.
     ///
-    /// This response-only wrapper is kept for the current snapshot-based
-    /// gateway. Event publishers should use [`Core::process_with_deltas`].
+    /// This response-only wrapper is kept for callers that do not publish market
+    /// data. Event publishers should use [`Core::process_with_deltas`].
     pub fn process(&mut self, user_id: UserId, command: Command) -> CommandResponse {
         self.process_with_deltas(user_id, command).response
     }
@@ -109,7 +121,7 @@ impl Core {
 
         if let Some(cached) = self.idempotency.get(&cache_key) {
             if cached.kind == kind {
-                return CommandOutcome::without_deltas(cached.response.clone());
+                return CommandOutcome::cached(cached.response.clone());
             }
             let seq = self.alloc_seq();
             return CommandOutcome::without_deltas(CommandResponse::rejected(
@@ -140,7 +152,11 @@ impl Core {
                 response: response.clone(),
             },
         );
-        CommandOutcome { response, deltas }
+        CommandOutcome {
+            response,
+            deltas,
+            cached: false,
+        }
     }
 
     fn alloc_seq(&mut self) -> Seq {

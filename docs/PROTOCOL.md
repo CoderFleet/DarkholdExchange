@@ -231,7 +231,9 @@ Metrics
 ```
 
 Then it streams `Delta`, `Trade`, `Metrics`, and control messages. A client must store the snapshot
-before applying any delta.
+before applying any delta. Normal command traffic publishes only `Delta` and `Trade`; a `Snapshot`
+is sent on initial connection, after a `Subscribe` changes the selection or depth, and during lag
+recovery.
 
 ### 4.2 Client → server
 
@@ -241,7 +243,9 @@ before applying any delta.
 ```
 
 On `/ws/market/{id}`, the fixed market cannot be changed by `Subscribe`; only `depth` is applied.
-On `/ws`, an empty `market_ids` means all markets. `depth` is clamped to `1..=200`.
+On `/ws`, an empty `market_ids` means all markets. `depth` is clamped to `1..=200`. A successful
+`Subscribe` sends fresh snapshots for the new selection; discard the previous baseline before
+applying subsequent deltas.
 
 ### 4.3 Server → client messages
 
@@ -275,7 +279,8 @@ All frames are MessagePack on the wire. JSON below is the readable contract.
 ```
 
 A snapshot is the full book state at `book_seq`. The first snapshot for a market establishes the
-client's baseline. A later snapshot replaces the baseline.
+client's baseline. A later snapshot replaces the baseline; the server sends one only for initial
+connection, subscription changes, and lag recovery.
 
 #### Delta
 
@@ -396,14 +401,14 @@ Frozen now:
 - Explicit `ResyncRequired` on a lagged WebSocket
 - `/ws/market/{id}` fixed-market feed
 
-Core command processing now returns ordered per-market `BookDelta` values through
-`Core::process_with_deltas`; `Core::process` remains the response-only wrapper while the gateway
-still broadcasts snapshots.
+Core command processing returns ordered per-market `BookDelta` values through
+`Core::process_with_deltas`; `Core::process` remains the response-only wrapper. The gateway streams
+deltas and trades in core commit order, suppresses cached and rejected commands, and reserves
+snapshots for initial baselines, subscription changes, and lag recovery. The core mutex is the
+current publication boundary; the bounded single-writer queue will replace it.
 
 Still pending in the T1 runtime:
 
-- Publishing deterministic `Delta` frames from the gateway instead of full snapshots after every
-  command
 - Bounded single-writer command queue
 - Batched publisher and cached resync snapshots
 - Real queue/latency histograms (the two p99 fields remain zero)

@@ -521,11 +521,13 @@ fn duplicate_and_rejected_commands_emit_no_deltas() {
     let command = limit(1, Side::Buy, PRICE, 1);
     let first = core.process_with_deltas(1, command.clone());
     assert_eq!(first.deltas.len(), 1);
+    assert!(!first.cached);
     let after_first = core.snapshot(MARKET, 10).unwrap();
     assert_eq!(after_first.book_seq, 1);
 
     let duplicate = core.process_with_deltas(1, command);
     assert_eq!(duplicate.response, first.response);
+    assert!(duplicate.cached);
     assert!(duplicate.deltas.is_empty());
     assert_eq!(core.snapshot(MARKET, 10).unwrap(), after_first);
 
