@@ -24,10 +24,15 @@ api:
 web:
     npm --prefix web run dev
 
+# regenerate the TypeScript declarations from the Rust wire types
+types:
+    cargo test -p dx-types export_bindings
+
 check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
     npm --prefix web run lint
+    npm --prefix web run typecheck
 
 test:
     cargo nextest run --workspace

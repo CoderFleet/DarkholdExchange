@@ -268,7 +268,7 @@ not the engine.
 2. Every message has a JSON fixture in `contracts/` (reviewable, canonical).
 3. A Rust test/xtask writes the golden msgpack bytes to `contracts/msgpack/`.
 4. JS tests decode the golden bytes and compare with the JSON fixture.
-5. `ts-rs` exports `web/src/protocol/generated.d.ts`; JS uses JSDoc imports and `// @ts-check`.
+5. `ts-rs` exports one declaration per type under `web/src/protocol/generated/`; JS uses JSDoc imports and `// @ts-check`.
 6. A contract change requires the fixture + Rust + JS in the same PR (existing README rule).
 
 ### 4.7 Reason codes
@@ -459,7 +459,7 @@ Each block ends with a demoable result. Dependencies are explicit; parallel trac
 - Add JSON fixtures for every message + a manifest; Rust round-trip tests.
 - Add `rmp-serde`; generate golden msgpack bytes; JS decode tests.
 - Add `ts-rs` export + `jsconfig.json` (`checkJs`) + `// @ts-check` + `npm run typecheck`.
-- Add the single runtime codec `web/src/protocol/codec.js`.
+- Add the single runtime codec `web/src/protocol/index.js`.
 - Add CI (Rust + web + contract generation check).
 - Seed 3 demo markets (different face values/collars).
 
@@ -574,14 +574,14 @@ Ordered; the **first code change is `dx-types`**.
    - [ ] Rust round-trip tests for every fixture
    - [ ] Golden `.msgpack` generator + JS decode tests
 4. **JS safety rails**
-   - [ ] `ts-rs` export to `web/src/protocol/generated.d.ts`
-   - [ ] `web/jsconfig.json` with `checkJs`/`strict`/`noEmit`
-   - [ ] `// @ts-check` in protocol/store/worker files
-   - [ ] `npm run typecheck` + CI step
-   - [ ] `web/src/protocol/codec.js` (encode/decode/validate) + tests
+   - [x] `ts-rs` export to `web/src/protocol/generated/`
+   - [x] `web/jsconfig.json` with `checkJs`/`strict`/`noEmit`
+   - [x] `// @ts-check` in protocol/API files
+   - [x] `npm run typecheck` + CI step
+   - [x] `web/src/protocol/index.js` (encode/decode) + tests
 5. **CI**
-   - [ ] `.github/workflows/ci.yml`: rust fmt/clippy/nextest; web lint/typecheck/test/build;
-         contract-generation check
+   - [x] `.github/workflows/ci.yml`: rust fmt/clippy/tests; web lint/typecheck/test/build;
+         generated-bindings drift check
 6. **Engine start (first slice)**
    - [ ] `OrderBook`, `BookSide`, `PriceLevel`, `OrderSlab` skeletons
    - [ ] `add_limit` rests an order and updates best bid/ask

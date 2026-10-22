@@ -1,16 +1,23 @@
+// @ts-check
 import { decode, encode } from '@msgpack/msgpack'
 
+/** @typedef {import('./generated/Side').Side} SideValue */
+/** @typedef {import('./generated/Command').Command} Command */
+/** @typedef {import('./generated/WsClientMessage').WsClientMessage} WsClientMessage */
+/** @typedef {import('./generated/WsServerMessage').WsServerMessage} WsServerMessage */
+/** @typedef {Extract<Command, { type: 'PlaceLimit' }>} PlaceLimitCommand */
+/** @typedef {Extract<Command, { type: 'PlaceMarket' }>} PlaceMarketCommand */
+/** @typedef {Extract<Command, { type: 'Cancel' }>} CancelCommand */
+/** @typedef {Extract<WsClientMessage, { type: 'Subscribe' }>} SubscribeCommand */
+
+/** @type {{ Buy: SideValue, Sell: SideValue }} */
 export const Side = Object.freeze({ Buy: 'Buy', Sell: 'Sell' })
 
 /**
- * @typedef {{ type: 'PlaceLimit', client_order_id: number, market_id: number,
- *   side: 'Buy' | 'Sell', price_ticks: number, qty: number }} PlaceLimit
- * @typedef {{ type: 'PlaceMarket', client_order_id: number, market_id: number,
- *   side: 'Buy' | 'Sell', qty: number, protect_price_ticks: number }} PlaceMarket
- * @typedef {{ type: 'Cancel', client_order_id: number, order_id: number }} Cancel
+ * @param {{ clientOrderId: number, marketId: number, side: SideValue,
+ *   priceTicks: number, qty: number }} input
+ * @returns {PlaceLimitCommand}
  */
-
-/** @returns {PlaceLimit} */
 export const placeLimit = ({ clientOrderId, marketId, side, priceTicks, qty }) => ({
   type: 'PlaceLimit',
   client_order_id: clientOrderId,
@@ -20,7 +27,11 @@ export const placeLimit = ({ clientOrderId, marketId, side, priceTicks, qty }) =
   qty,
 })
 
-/** @returns {PlaceMarket} */
+/**
+ * @param {{ clientOrderId: number, marketId: number, side: SideValue,
+ *   qty: number, protectPriceTicks: number }} input
+ * @returns {PlaceMarketCommand}
+ */
 export const placeMarket = ({ clientOrderId, marketId, side, qty, protectPriceTicks }) => ({
   type: 'PlaceMarket',
   client_order_id: clientOrderId,
@@ -30,15 +41,21 @@ export const placeMarket = ({ clientOrderId, marketId, side, qty, protectPriceTi
   protect_price_ticks: protectPriceTicks,
 })
 
-/** @returns {Cancel} */
+/**
+ * @param {{ clientOrderId: number, orderId: number }} input
+ * @returns {CancelCommand}
+ */
 export const cancelOrder = ({ clientOrderId, orderId }) => ({
   type: 'Cancel',
   client_order_id: clientOrderId,
   order_id: orderId,
 })
 
-/** @returns {{ type: 'Subscribe', market_ids: number[], depth: number }} */
-export const subscribe = ({ marketIds = [], depth = 20 }) => ({
+/**
+ * @param {{ marketIds?: number[], depth?: number }} [input]
+ * @returns {SubscribeCommand}
+ */
+export const subscribe = ({ marketIds = [], depth = 20 } = {}) => ({
   type: 'Subscribe',
   market_ids: marketIds,
   depth,
@@ -49,6 +66,15 @@ let commandSequence = 0
 /** Client idempotency keys stay below Number.MAX_SAFE_INTEGER. */
 export const nextClientOrderId = () => Date.now() * 100 + (commandSequence++ % 100)
 
+/**
+ * @param {Command | WsClientMessage} message
+ * @returns {Uint8Array}
+ */
 export const encodeClientMessage = (message) => encode(message)
 
-export const decodeServerMessage = (data) => decode(new Uint8Array(data))
+/**
+ * @param {ArrayBuffer | Uint8Array} data
+ * @returns {WsServerMessage}
+ */
+export const decodeServerMessage = (data) =>
+  /** @type {WsServerMessage} */ (decode(new Uint8Array(data)))

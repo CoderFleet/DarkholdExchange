@@ -10,7 +10,7 @@ Status: **locked for Sprint 0** unless explicitly superseded. Each decision shou
 | 1 | Scope | Build the **full spec in phases**; cut from the bottom if time runs out | The spec is the grading/demo contract; a thin slice is not enough | After the first end-to-end demo |
 | 2 | Schedule | Fixed deadline, overtime allowed. Plan uses six working blocks; map them onto the real calendar | Keeps ordering stable even if the date moves | When the exact deadline is known |
 | 3 | Frontend | **Stay JavaScript.** No TypeScript migration | Avoid a rewrite and extra build complexity | Only if the UI grows beyond ~15k lines |
-| 4 | Frontend safety | Rust types are the source of truth; generate `.d.ts`; `// @ts-check` + `tsc --noEmit` in CI; golden msgpack fixtures; one runtime codec | Gets most of the type-safety benefit without authoring `.ts` files | If `checkJs` becomes noisy |
+| 4 | Frontend safety | Rust types are the source of truth; `ts-rs` generates one declaration per type in `web/src/protocol/generated/`; `// @ts-check` + `tsc --noEmit` in CI; golden msgpack fixtures; one runtime codec | Gets most of the type-safety benefit without authoring `.ts` files | If `checkJs` becomes noisy |
 | 5 | Wire format | **WS frames are msgpack; REST control plane defaults to JSON (msgpack accepted); JSON fixtures are the canonical, reviewable schema** | Compact/fast market data, but commands and fixtures stay debuggable | Never for this project |
 | 6 | Asset model | **Fungible quantity per market.** No unique seat/serial numbers | Matches qty-based orders, ledger, and escrow; simplest correct model | If the product requires seat assignment |
 | 7 | Transport | **REST for commands, WebSocket for market data and private events** | Clean `429`/`Retry-After`, idempotency, easy k6 tests; WS for streaming | If latency demands WS commands |
@@ -31,19 +31,21 @@ The risk is client/server drift: a field renamed in Rust silently breaks the UI.
 five layers, cheapest first:
 
 1. **One source of truth.** All message shapes live in `dx-types`. No hand-written duplicate schema.
-2. **Generated declarations.** `ts-rs` exports `web/src/protocol/generated.d.ts` from the Rust types.
-   JS files import them with JSDoc:
-   `/** @typedef {import('./generated').PlaceLimit} PlaceLimit */`
+2. **Generated declarations.** `ts-rs` exports one declaration per exported Rust type into
+   `web/src/protocol/generated/`. JS files import them with JSDoc:
+   `/** @typedef {import('./generated/PlaceLimit').PlaceLimit} PlaceLimit */`.
+   `TS_RS_LARGE_INT=number` keeps JavaScript's safe-integer contract; all wire IDs and money values
+   must stay within `Number.MAX_SAFE_INTEGER`.
 3. **Checked JS, not authored TS.** `jsconfig.json` with `checkJs`, `strict`, `noEmit`; `// @ts-check`
-   at the top of protocol/store/worker files; `npm run typecheck` runs `tsc`. TypeScript is a dev-only
-   checker; no `.ts` files and no build-step change.
+   at the top of protocol/API/workflow files; `npm run typecheck` runs `tsc`. TypeScript is a dev-only
+   checker; the only checked-in `.ts` files are the generated declarations.
 4. **Golden wire fixtures.** Rust writes `.msgpack` bytes for every message into `contracts/msgpack/`.
    JS tests decode them and compare against the JSON fixture. A field change fails both sides' CI.
-5. **One runtime codec.** All encode/decode goes through `web/src/protocol/codec.js`, which validates
-   the message type, required fields, and enum values. Components never parse raw msgpack.
+5. **One runtime codec.** All encode/decode goes through `web/src/protocol/index.js`, so message
+   construction and raw msgpack access stay in one place. Components never parse raw msgpack.
 
-Contract-change rule (already in the README): **fixture + Rust + JS in the same PR.** CI checks that
-generated types and fixtures are current.
+Contract-change rule (already in the README): **fixture + Rust + JS in the same PR.** CI regenerates
+the declarations with `just types` and fails on an uncommitted diff.
 
 ## Assumptions to confirm
 

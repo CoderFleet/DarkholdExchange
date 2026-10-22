@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Rust formatting
+        run: cargo fmt --all --check
+
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Rust tests
+        run: cargo test --workspace
+
+      - name: Install web dependencies
+        run: npm --prefix web ci
+
+      - name: Regenerate type bindings
+        run: cargo test -p dx-types export_bindings
+
+      - name: Check generated bindings are committed
+        run: git diff --exit-code -- web/src/protocol/generated
+
+      - name: Web typecheck
+        run: npm --prefix web run typecheck
+
+      - name: Web lint
+        run: npm --prefix web run lint
+
+      - name: Web tests
+        run: npm --prefix web test
+
+      - name: Web build
+        run: npm --prefix web run build
