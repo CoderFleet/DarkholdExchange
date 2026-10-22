@@ -2,9 +2,11 @@
 
 use crate::{MarketId, OrderId, Qty, Seq, Side, Ticks, TradeId, UserId};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// A settled fill. `seq` is the global command sequence that produced it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct Fill {
     pub trade_id: TradeId,
     pub market_id: MarketId,

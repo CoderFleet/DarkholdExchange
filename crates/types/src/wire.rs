@@ -3,9 +3,11 @@
 
 use crate::{Balance, BookSnapshot, Fill, MarketConfig, MarketId, ReasonCode, UserId};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type")]
+#[ts(export)]
 pub enum WsClientMessage {
     /// Select markets and depth. An empty list means all markets.
     Subscribe {
@@ -15,8 +17,9 @@ pub enum WsClientMessage {
     Ping,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(tag = "type")]
+#[ts(export)]
 pub enum WsServerMessage {
     Hello {
         markets: Vec<MarketConfig>,

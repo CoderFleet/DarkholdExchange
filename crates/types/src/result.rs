@@ -2,8 +2,10 @@
 
 use crate::{Fill, OrderId, OrderStatus, Qty, ReasonCode, Seq};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct CommandResponse {
     pub seq: Seq,
     pub status: OrderStatus,

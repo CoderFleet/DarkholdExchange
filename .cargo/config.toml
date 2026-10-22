@@ -1,0 +1,7 @@
+[env]
+# ts-rs writes one declaration per exported type. The path is relative to this
+# workspace-level config file so `cargo test` works from any package directory.
+TS_RS_EXPORT_DIR = { value = "web/src/protocol/generated", relative = true }
+# JavaScript cannot represent u64/i64 beyond 2^53. All wire values are kept in
+# that range; generating `number` keeps the frontend free of BigInt handling.
+TS_RS_LARGE_INT = "number"

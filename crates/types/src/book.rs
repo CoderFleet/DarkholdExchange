@@ -2,14 +2,17 @@
 
 use crate::{BookSeq, MarketId, Qty, Side, Ticks};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct BookLevel {
     pub price_ticks: Ticks,
     pub qty: Qty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct BookSnapshot {
     pub market_id: MarketId,
     pub book_seq: BookSeq,
@@ -31,14 +34,16 @@ impl BookSnapshot {
 }
 
 /// Absolute quantity at a level. `qty == 0` means the level was removed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct LevelChange {
     pub side: Side,
     pub price_ticks: Ticks,
     pub qty: Qty,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct BookDelta {
     pub market_id: MarketId,
     pub book_seq: BookSeq,

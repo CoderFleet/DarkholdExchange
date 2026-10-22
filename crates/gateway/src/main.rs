@@ -13,11 +13,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use dx_core::Core;
 use dx_types::{
-    Balance, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill, MarketConfig, MarketId,
-    Minor, OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, UserId,
-    WsClientMessage, WsServerMessage, seed_markets,
+    Balance, BookSnapshot, ClientOrderId, Command, CommandResponse, ErrorBody, Fill,
+    JournalResponse, MarketId, MarketView, Minor, OpenOrderView, OrderStatus, PlaceLimit,
+    PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage, WsServerMessage, seed_markets,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use tokio::sync::broadcast;
 
 #[derive(Clone)]
@@ -29,34 +29,8 @@ struct AppState {
 
 type ApiError = (StatusCode, Json<ErrorBody>);
 
-#[derive(Serialize)]
-struct ErrorBody {
-    reason: ReasonCode,
-}
-
 fn api_error(status: StatusCode, reason: ReasonCode) -> ApiError {
     (status, Json(ErrorBody { reason }))
-}
-
-#[derive(Serialize)]
-struct MarketView {
-    config: MarketConfig,
-    snapshot: BookSnapshot,
-}
-
-#[derive(Serialize)]
-struct OpenOrderView {
-    market_id: MarketId,
-    order_id: OrderId,
-    side: Side,
-    price_ticks: Ticks,
-    qty: Qty,
-    remaining: Qty,
-}
-
-#[derive(Serialize)]
-struct JournalResponse {
-    journal_id: u64,
 }
 
 #[derive(Deserialize)]
