@@ -34,19 +34,20 @@ pub struct ErrorBody {
     pub reason: ReasonCode,
 }
 
-/// Point-in-time gateway and engine health. Synthetic `p99` fields stay zero
-/// until the sequencer and latency histogram land; counters are live.
+/// Point-in-time gateway and engine health. Latency values are measured over
+/// command jobs admitted through the bounded writer queue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct MetricsSnapshot {
     /// Last command sequence processed by the core. Zero before the first command.
     pub seq: Seq,
+    /// Jobs waiting for the single core writer (commands, reads, baselines).
     pub queue_depth: u32,
     pub commands_total: u64,
     pub rejected_total: u64,
-    /// Microseconds. Zero while the bounded command queue is not wired.
+    /// Microseconds from queue submission to writer pickup, p99 over command jobs.
     pub queue_wait_p99_us: u64,
-    /// Microseconds. Zero until the latency histogram is wired.
+    /// Microseconds spent inside `process_with_deltas`, p99 over command jobs.
     pub core_p99_us: u64,
     pub ws_clients: u32,
     pub slow_consumers: u64,

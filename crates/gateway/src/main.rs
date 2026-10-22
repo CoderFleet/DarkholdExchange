@@ -4,49 +4,73 @@
 //! trades; snapshots are only baselines and lag-recovery checkpoints. Identity
 //! is simulated for the demo via `x-dev-user` (default user 1).
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+mod writer;
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::header;
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dx_core::Core;
 use dx_types::{
     Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody, Fill,
-    JournalResponse, MarketConfig, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView,
-    OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
+    JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
     WsServerMessage, seed_markets,
 };
 use serde::Deserialize;
 use tokio::sync::broadcast;
-
-/// Gateway-owned counters. The queue and histogram metrics are filled in when
-/// the single-writer sequencer lands; keeping the fields here lets the REST and
-/// WS contract stay stable in the meantime.
-#[derive(Default)]
-struct MetricsState {
-    commands_total: AtomicU64,
-    rejected_total: AtomicU64,
-    ws_clients: AtomicU32,
-    slow_consumers: AtomicU64,
-}
+use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer};
 
 #[derive(Clone)]
 struct AppState {
-    core: Arc<Mutex<Core>>,
-    tx: broadcast::Sender<WsServerMessage>,
-    recent_trades: Arc<Mutex<Vec<Fill>>>,
+    writer: WriterHandle,
     metrics: Arc<MetricsState>,
 }
 
-type ApiError = (StatusCode, Json<ErrorBody>);
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    body: Json<ErrorBody>,
+    retry_after: bool,
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> axum::response::Response {
+        let mut response = (self.status, self.body).into_response();
+        if self.retry_after {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        }
+        response
+    }
+}
 
 fn api_error(status: StatusCode, reason: ReasonCode) -> ApiError {
-    (status, Json(ErrorBody { reason }))
+    ApiError {
+        status,
+        body: Json(ErrorBody { reason }),
+        retry_after: matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ),
+    }
+}
+
+fn writer_error(error: WriterError) -> ApiError {
+    match error {
+        WriterError::QueueFull => api_error(StatusCode::TOO_MANY_REQUESTS, ReasonCode::QueueFull),
+        WriterError::Unavailable => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, ReasonCode::InternalError)
+        }
+    }
 }
 
 /// Transport mapping for a sequenced business rejection. The core still returns
@@ -118,12 +142,8 @@ async fn main() {
     let seed_fills = seed_demo(&mut core);
 
     let (tx, _) = broadcast::channel(512);
-    let state = AppState {
-        core: Arc::new(Mutex::new(core)),
-        tx,
-        recent_trades: Arc::new(Mutex::new(seed_fills)),
-        metrics: Arc::new(MetricsState::default()),
-    };
+    let (writer, metrics) = spawn_writer(core, tx, seed_fills, queue_capacity());
+    let state = AppState { writer, metrics };
 
     let app = Router::new()
         .route("/health", get(health))
@@ -151,23 +171,21 @@ async fn main() {
     axum::serve(listener, app).await.expect("gateway server");
 }
 
+fn queue_capacity() -> usize {
+    std::env::var("DX_COMMAND_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(1024)
+}
+
 async fn health() -> &'static str {
     "ok"
 }
 
-async fn markets(State(state): State<AppState>) -> Json<Vec<MarketView>> {
-    let core = state.core.lock().expect("core mutex");
-    let views = core
-        .engine()
-        .market_ids()
-        .into_iter()
-        .filter_map(|market_id| {
-            let config = core.config(market_id)?.clone();
-            let snapshot = core.snapshot(market_id, 20)?;
-            Some(MarketView { config, snapshot })
-        })
-        .collect();
-    Json(views)
+async fn markets(State(state): State<AppState>) -> Result<Json<Vec<MarketView>>, ApiError> {
+    let views = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(views))
 }
 
 async fn book(
@@ -176,8 +194,12 @@ async fn book(
     State(state): State<AppState>,
 ) -> Result<Json<BookSnapshot>, ApiError> {
     let depth = query.depth.unwrap_or(20).clamp(1, 200);
-    let core = state.core.lock().expect("core mutex");
-    match core.snapshot(market_id, depth) {
+    let snapshot = state
+        .writer
+        .snapshot(market_id, depth)
+        .await
+        .map_err(writer_error)?;
+    match snapshot {
         Some(snapshot) => Ok(Json(snapshot)),
         None => Err(api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownMarket)),
     }
@@ -189,67 +211,27 @@ async fn trades(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<Fill>>, ApiError> {
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    let known_market = {
-        let core = state.core.lock().expect("core mutex");
-        core.config(market_id).is_some()
-    };
-    if !known_market {
-        return Err(api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownMarket));
+    let trades = state
+        .writer
+        .trades(market_id, limit)
+        .await
+        .map_err(writer_error)?;
+    match trades {
+        Some(trades) => Ok(Json(trades)),
+        None => Err(api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownMarket)),
     }
-
-    let trades = state.recent_trades.lock().expect("trade mutex");
-    let mut result: Vec<_> = trades
-        .iter()
-        .rev()
-        .filter(|fill| fill.market_id == market_id)
-        .take(limit)
-        .cloned()
-        .collect();
-    result.reverse();
-    Ok(Json(result))
 }
 
-/// Process a command and publish its market-data events in core commit order.
-///
-/// The core mutex is held through publication so concurrent commands cannot
-/// reorder their deltas/trades. `broadcast::Sender::send` is non-blocking.
-fn execute_command(state: &AppState, user_id: UserId, command: Command) -> CommandResponse {
-    let (response, rejected) = {
-        let mut core = state.core.lock().expect("core mutex");
-        let outcome = core.process_with_deltas(user_id, command);
-        let publish = !outcome.cached && outcome.response.status != OrderStatus::Rejected;
-
-        if publish {
-            for delta in &outcome.deltas {
-                let _ = state.tx.send(WsServerMessage::Delta {
-                    delta: delta.clone(),
-                });
-            }
-
-            if !outcome.response.fills.is_empty() {
-                let mut recent = state.recent_trades.lock().expect("trade mutex");
-                recent.extend(outcome.response.fills.iter().cloned());
-                if recent.len() > 200 {
-                    let excess = recent.len() - 200;
-                    recent.drain(0..excess);
-                }
-            }
-
-            for fill in &outcome.response.fills {
-                let _ = state.tx.send(WsServerMessage::Trade { fill: fill.clone() });
-            }
-        }
-
-        let rejected = outcome.response.status == OrderStatus::Rejected;
-        (outcome.response, rejected)
-    };
-
-    state.metrics.commands_total.fetch_add(1, Ordering::Relaxed);
-    if rejected {
-        state.metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    response
+async fn execute_command(
+    state: &AppState,
+    user_id: UserId,
+    command: Command,
+) -> Result<CommandResponse, ApiError> {
+    state
+        .writer
+        .command(user_id, command)
+        .await
+        .map_err(writer_error)
 }
 
 fn finish_command(response: CommandResponse) -> Result<Json<CommandResponse>, ApiError> {
@@ -273,7 +255,7 @@ async fn command(
 ) -> Result<Json<CommandResponse>, ApiError> {
     let user_id = dev_user(&headers)?;
     let command = json_body(payload)?;
-    finish_command(execute_command(&state, user_id, command))
+    finish_command(execute_command(&state, user_id, command).await?)
 }
 
 async fn place_order(
@@ -289,7 +271,7 @@ async fn place_order(
             ReasonCode::CancelNotAllowed,
         ));
     }
-    finish_command(execute_command(&state, user_id, command))
+    finish_command(execute_command(&state, user_id, command).await?)
 }
 
 async fn cancel_order(
@@ -306,38 +288,26 @@ async fn cancel_order(
         client_order_id,
         order_id,
     });
-    finish_command(execute_command(&state, user_id, command))
+    finish_command(execute_command(&state, user_id, command).await?)
 }
 
 async fn balances(
     Path(user_id): Path<UserId>,
     State(state): State<AppState>,
-) -> Json<Vec<Balance>> {
-    let core = state.core.lock().expect("core mutex");
-    Json(core.balances(user_id))
+) -> Result<Json<Vec<Balance>>, ApiError> {
+    let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
+    Ok(Json(balances))
 }
 
-fn open_orders_for(state: &AppState, user_id: UserId) -> Vec<OpenOrderView> {
-    let core = state.core.lock().expect("core mutex");
-    let mut orders = Vec::new();
-    for market_id in core.engine().market_ids() {
-        let Some(book) = core.engine().book(market_id) else {
-            continue;
-        };
-        for order in book.orders() {
-            if order.user_id == user_id {
-                orders.push(OpenOrderView {
-                    market_id,
-                    order_id: order.id,
-                    side: order.side,
-                    price_ticks: order.price_ticks,
-                    qty: order.qty,
-                    remaining: order.remaining,
-                });
-            }
-        }
-    }
-    orders
+async fn open_orders_for(
+    state: &AppState,
+    user_id: UserId,
+) -> Result<Vec<OpenOrderView>, ApiError> {
+    state
+        .writer
+        .open_orders(user_id)
+        .await
+        .map_err(writer_error)
 }
 
 async fn open_orders_current(
@@ -345,25 +315,25 @@ async fn open_orders_current(
     headers: HeaderMap,
 ) -> Result<Json<Vec<OpenOrderView>>, ApiError> {
     let user_id = dev_user(&headers)?;
-    Ok(Json(open_orders_for(&state, user_id)))
+    Ok(Json(open_orders_for(&state, user_id).await?))
 }
 
 async fn open_orders(
     Path(user_id): Path<UserId>,
     State(state): State<AppState>,
-) -> Json<Vec<OpenOrderView>> {
-    Json(open_orders_for(&state, user_id))
+) -> Result<Json<Vec<OpenOrderView>>, ApiError> {
+    Ok(Json(open_orders_for(&state, user_id).await?))
 }
 
 fn metrics_snapshot(state: &AppState) -> MetricsSnapshot {
-    let seq = state.core.lock().expect("core mutex").last_seq();
+    let (queue_wait_p99_us, core_p99_us) = state.metrics.p99();
     MetricsSnapshot {
-        seq,
-        queue_depth: 0,
+        seq: state.metrics.seq.load(Ordering::Relaxed),
+        queue_depth: state.metrics.queue_depth.load(Ordering::Relaxed),
         commands_total: state.metrics.commands_total.load(Ordering::Relaxed),
         rejected_total: state.metrics.rejected_total.load(Ordering::Relaxed),
-        queue_wait_p99_us: 0,
-        core_p99_us: 0,
+        queue_wait_p99_us,
+        core_p99_us,
         ws_clients: state.metrics.ws_clients.load(Ordering::Relaxed),
         slow_consumers: state.metrics.slow_consumers.load(Ordering::Relaxed),
     }
@@ -378,9 +348,11 @@ async fn dev_deposit(
     payload: Result<Json<DevDeposit>, JsonRejection>,
 ) -> Result<Json<JournalResponse>, ApiError> {
     let body = json_body(payload)?;
-    let mut core = state.core.lock().expect("core mutex");
-    let journal_id = core
-        .deposit_cash(body.user_id, body.amount, body.client_request_id)
+    let journal_id = state
+        .writer
+        .deposit(body.user_id, body.amount, body.client_request_id)
+        .await
+        .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
     Ok(Json(JournalResponse { journal_id }))
 }
@@ -390,14 +362,16 @@ async fn dev_issue(
     payload: Result<Json<DevIssue>, JsonRejection>,
 ) -> Result<Json<JournalResponse>, ApiError> {
     let body = json_body(payload)?;
-    let mut core = state.core.lock().expect("core mutex");
-    let journal_id = core
-        .issue_passes(
+    let journal_id = state
+        .writer
+        .issue(
             body.user_id,
             body.market_id,
             body.qty,
             body.client_request_id,
         )
+        .await
+        .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
     Ok(Json(JournalResponse { journal_id }))
 }
@@ -427,10 +401,11 @@ async fn ws_market(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
-    let known_market = {
-        let core = state.core.lock().expect("core mutex");
-        core.config(market_id).is_some()
-    };
+    let known_market = state
+        .writer
+        .market_exists(market_id)
+        .await
+        .map_err(writer_error)?;
     if !known_market {
         return Err(api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownMarket));
     }
@@ -447,59 +422,16 @@ impl Drop for WsClientGuard {
     }
 }
 
-/// A snapshot baseline paired with a subscription positioned at the same commit.
-///
-/// The core lock is held while subscribing, taking snapshots, and reading the
-/// recent tape. Commands publish while holding that same lock, so no delta can
-/// slip between the snapshot and the subscription. Events committed after the
-/// baseline are queued for the receiver.
-struct StreamBaseline {
-    rx: broadcast::Receiver<WsServerMessage>,
-    markets: Vec<MarketConfig>,
-    snapshots: Vec<BookSnapshot>,
-    recent_trades: Vec<Fill>,
-}
-
-fn stream_baseline(
+async fn stream_baseline(
     state: &AppState,
     market_filter: Option<&[MarketId]>,
     depth: usize,
-) -> StreamBaseline {
-    let core = state.core.lock().expect("core mutex");
-    let rx = state.tx.subscribe();
-
-    let market_ids = match market_filter {
-        Some(ids) => ids.to_vec(),
-        None => core.engine().market_ids(),
-    };
-    let markets = market_ids
-        .iter()
-        .filter_map(|market_id| core.config(*market_id).cloned())
-        .collect();
-    let snapshots = market_ids
-        .iter()
-        .filter_map(|market_id| core.snapshot(*market_id, depth))
-        .collect();
-
-    let recent_trades = {
-        let trades = state.recent_trades.lock().expect("trade mutex");
-        let mut recent = trades
-            .iter()
-            .rev()
-            .filter(|fill| market_filter.is_none_or(|ids| ids.contains(&fill.market_id)))
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>();
-        recent.reverse();
-        recent
-    };
-
-    StreamBaseline {
-        rx,
-        markets,
-        snapshots,
-        recent_trades,
-    }
+) -> Result<StreamBaseline, ApiError> {
+    state
+        .writer
+        .baseline(market_filter.map(|ids| ids.to_vec()), depth)
+        .await
+        .map_err(writer_error)
 }
 
 async fn handle_socket(
@@ -515,7 +447,10 @@ async fn handle_socket(
 
     let mut market_filter = fixed_market.map(|market_id| vec![market_id]);
     let mut depth = 20usize;
-    let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+    let Ok(baseline) = stream_baseline(&state, market_filter.as_deref(), depth).await else {
+        eprintln!("ws baseline unavailable");
+        return;
+    };
     let mut rx = baseline.rx;
 
     if !send_msg(
@@ -562,7 +497,11 @@ async fn handle_socket(
                                     market_filter = if market_ids.is_empty() { None } else { Some(market_ids) };
                                 }
                                 depth = (requested_depth as usize).clamp(1, 200);
-                                let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+                                let Ok(baseline) =
+                                    stream_baseline(&state, market_filter.as_deref(), depth).await
+                                else {
+                                    return;
+                                };
                                 rx = baseline.rx;
                                 for snapshot in baseline.snapshots {
                                     if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
@@ -603,7 +542,11 @@ async fn handle_socket(
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         eprintln!("ws client lagged by {skipped} messages; resyncing");
                         state.metrics.slow_consumers.fetch_add(1, Ordering::Relaxed);
-                        let baseline = stream_baseline(&state, market_filter.as_deref(), depth);
+                        let Ok(baseline) =
+                            stream_baseline(&state, market_filter.as_deref(), depth).await
+                        else {
+                            return;
+                        };
                         rx = baseline.rx;
                         for market in &baseline.markets {
                             if !send_msg(
@@ -768,13 +711,12 @@ mod tests {
         core.issue_passes(2, MARKET, 5, 1).unwrap();
 
         let (tx, rx) = broadcast::channel(64);
-        let state = AppState {
-            core: Arc::new(Mutex::new(core)),
-            tx,
-            recent_trades: Arc::new(Mutex::new(Vec::new())),
-            metrics: Arc::new(MetricsState::default()),
-        };
-        (state, rx)
+        let (writer, metrics) = spawn_writer(core, tx, Vec::new(), 64);
+        (AppState { writer, metrics }, rx)
+    }
+
+    async fn run_command(state: &AppState, user_id: UserId, command: Command) -> CommandResponse {
+        execute_command(state, user_id, command).await.unwrap()
     }
 
     fn limit(client_order_id: ClientOrderId, side: Side, price_ticks: Ticks, qty: Qty) -> Command {
@@ -836,11 +778,11 @@ mod tests {
         snapshot.book_seq = delta.book_seq;
     }
 
-    #[test]
-    fn commands_publish_delta_without_snapshot() {
+    #[tokio::test]
+    async fn commands_publish_delta_without_snapshot() {
         let (state, mut rx) = test_state();
 
-        let response = execute_command(&state, 1, limit(1, Side::Buy, 4_900, 2));
+        let response = run_command(&state, 1, limit(1, Side::Buy, 4_900, 2)).await;
 
         assert_eq!(response.status, OrderStatus::Rested);
         let messages = drain(&mut rx);
@@ -858,17 +800,22 @@ mod tests {
                 qty: 2,
             }]
         );
-        assert_eq!(state.metrics.commands_total.load(Ordering::Relaxed), 1);
+
+        let metrics = metrics_snapshot(&state);
+        assert_eq!(metrics.seq, 1);
+        assert_eq!(metrics.commands_total, 1);
+        assert_eq!(metrics.queue_depth, 0);
+        assert!(state.metrics.latency_samples() > 0);
     }
 
-    #[test]
-    fn fills_publish_delta_then_trade() {
+    #[tokio::test]
+    async fn fills_publish_delta_then_trade() {
         let (state, mut rx) = test_state();
-        execute_command(&state, 2, limit(1, Side::Sell, PRICE, 2));
+        run_command(&state, 2, limit(1, Side::Sell, PRICE, 2)).await;
         drain(&mut rx);
 
         let command = market_order(1, Side::Buy, 2);
-        let response = execute_command(&state, 1, command.clone());
+        let response = run_command(&state, 1, command.clone()).await;
 
         assert_eq!(response.status, OrderStatus::Filled);
         let messages = drain(&mut rx);
@@ -892,61 +839,80 @@ mod tests {
         };
         assert_eq!(fill.qty, 2);
         assert_eq!(fill.price_ticks, PRICE);
-        assert_eq!(state.recent_trades.lock().expect("trade mutex").len(), 1);
+        assert_eq!(
+            state
+                .writer
+                .trades(MARKET, 10)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
 
-        let duplicate = execute_command(&state, 1, command);
+        let duplicate = run_command(&state, 1, command).await;
         assert_eq!(duplicate, response);
         assert!(drain(&mut rx).is_empty());
-        assert_eq!(state.recent_trades.lock().expect("trade mutex").len(), 1);
+        assert_eq!(
+            state
+                .writer
+                .trades(MARKET, 10)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
-    #[test]
-    fn cached_and_rejected_commands_publish_nothing() {
+    #[tokio::test]
+    async fn cached_and_rejected_commands_publish_nothing() {
         let (state, mut rx) = test_state();
         let command = limit(1, Side::Buy, 4_900, 2);
-        let first = execute_command(&state, 1, command.clone());
+        let first = run_command(&state, 1, command.clone()).await;
         assert_eq!(first.status, OrderStatus::Rested);
         drain(&mut rx);
 
-        let duplicate = execute_command(&state, 1, command);
+        let duplicate = run_command(&state, 1, command).await;
         assert_eq!(duplicate, first);
         assert!(drain(&mut rx).is_empty());
 
-        let rejected = execute_command(&state, 1, limit(2, Side::Buy, 2_499, 1));
+        let rejected = run_command(&state, 1, limit(2, Side::Buy, 2_499, 1)).await;
         assert_eq!(rejected.status, OrderStatus::Rejected);
         assert!(drain(&mut rx).is_empty());
 
-        let conflicting = execute_command(
+        let conflicting = run_command(
             &state,
             1,
             Command::Cancel(Cancel {
                 client_order_id: 1,
                 order_id: first.order_id.unwrap(),
             }),
-        );
+        )
+        .await;
         assert_eq!(conflicting.status, OrderStatus::Rejected);
         assert_eq!(conflicting.reason, Some(ReasonCode::DuplicateClientOrderId));
         assert!(drain(&mut rx).is_empty());
 
         assert_eq!(state.metrics.commands_total.load(Ordering::Relaxed), 4);
         assert_eq!(state.metrics.rejected_total.load(Ordering::Relaxed), 2);
-        let core = state.core.lock().expect("core mutex");
-        assert_eq!(core.snapshot(MARKET, 10).unwrap().book_seq, 1);
+        let snapshot = state.writer.snapshot(MARKET, 10).await.unwrap().unwrap();
+        assert_eq!(snapshot.book_seq, 1);
     }
 
-    #[test]
-    fn baseline_snapshot_and_stream_are_joined_without_a_gap() {
+    #[tokio::test]
+    async fn baseline_snapshot_and_stream_are_joined_without_a_gap() {
         let (state, _old_rx) = test_state();
-        execute_command(&state, 2, limit(1, Side::Sell, PRICE, 2));
+        run_command(&state, 2, limit(1, Side::Sell, PRICE, 2)).await;
 
-        let baseline = stream_baseline(&state, Some(&[MARKET]), 10);
+        let baseline = stream_baseline(&state, Some(&[MARKET]), 10).await.unwrap();
         assert_eq!(baseline.markets.len(), 1);
         assert_eq!(baseline.snapshots.len(), 1);
         let mut snapshot = baseline.snapshots.into_iter().next().unwrap();
         assert_eq!(snapshot.book_seq, 1);
         let mut rx = baseline.rx;
 
-        let response = execute_command(&state, 1, market_order(1, Side::Buy, 1));
+        let response = run_command(&state, 1, market_order(1, Side::Buy, 1)).await;
         assert_eq!(response.status, OrderStatus::Filled);
 
         let messages = drain(&mut rx);
@@ -960,22 +926,22 @@ mod tests {
         };
         snapshot.last_trade_price = Some(fill.price_ticks);
 
-        let expected = state.core.lock().expect("core mutex").snapshot(MARKET, 10);
+        let expected = state.writer.snapshot(MARKET, 10).await.unwrap();
         assert_eq!(Some(snapshot), expected);
     }
 
-    #[test]
-    fn concurrent_commands_publish_monotonic_book_sequences() {
+    #[tokio::test]
+    async fn concurrent_commands_publish_monotonic_book_sequences() {
         let (state, mut rx) = test_state();
-        let mut threads = Vec::new();
+        let mut tasks = Vec::new();
         for (client_order_id, price_ticks) in [(10, 4_900), (11, 4_800)] {
             let state = state.clone();
-            threads.push(std::thread::spawn(move || {
-                execute_command(&state, 1, limit(client_order_id, Side::Buy, price_ticks, 1))
+            tasks.push(tokio::spawn(async move {
+                run_command(&state, 1, limit(client_order_id, Side::Buy, price_ticks, 1)).await
             }));
         }
-        for thread in threads {
-            assert_eq!(thread.join().unwrap().status, OrderStatus::Rested);
+        for task in tasks {
+            assert_eq!(task.await.unwrap().status, OrderStatus::Rested);
         }
 
         let messages = drain(&mut rx);
@@ -987,6 +953,16 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(sequences, vec![1, 2]);
+    }
+
+    #[test]
+    fn maps_queue_overload_to_429_with_retry_after() {
+        let response = writer_error(WriterError::QueueFull).into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER).unwrap(),
+            HeaderValue::from_static("1")
+        );
     }
 
     #[test]

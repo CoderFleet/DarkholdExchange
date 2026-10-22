@@ -164,9 +164,12 @@ GET /api/metrics/latency
 }
 ```
 
-`queue_wait_p99_us` is zero until the bounded command queue is wired. `core_p99_us` is zero until
-the latency histogram is wired. The counters are live now. Do not invent values in the UI; render
-`—` for a zero placeholder if the panel is not ready.
+`queue_wait_p99_us` and `core_p99_us` are rolling p99 values from the gateway's bounded
+single-writer queue. Queue wait covers submission to writer pickup; core time covers
+`process_with_deltas`. Both are zero until the first command completes. When the queue is full,
+gateway endpoints return `429` with `ReasonCode::QueueFull` and `Retry-After: 1`; an unavailable
+writer returns `503`. Capacity defaults to 1024 and is configurable with
+`DX_COMMAND_QUEUE_CAPACITY`.
 
 ### 2.7 Temporary aliases
 
@@ -200,8 +203,9 @@ All gateway errors use:
 | `405` | Wrong method for the operation (cancel sent to `POST /api/orders`) | `cancel_not_allowed` |
 | `409` | Conflicting lifecycle state | `duplicate_client_order_id`, `market_closed`, `cancel_not_allowed` |
 | `422` | Sequenced business rejection | `outside_collar`, `insufficient_funds`, `self_trade` |
-| `429` | Rate limited or command queue full; `Retry-After` will be added with the limiter/queue | `rate_limited`, `queue_full` |
+| `429` | Command queue full; includes `Retry-After: 1` | `queue_full` |
 | `500` | Internal engine failure | `internal_error` |
+| `503` | Core writer unavailable | `internal_error` |
 
 The core still produces a `CommandResponse` with `status: Rejected`; the gateway translates it to
 the table above once at the edge. Do not add a second mapping in the browser.
@@ -402,14 +406,15 @@ Frozen now:
 - `/ws/market/{id}` fixed-market feed
 
 Core command processing returns ordered per-market `BookDelta` values through
-`Core::process_with_deltas`; `Core::process` remains the response-only wrapper. The gateway streams
-deltas and trades in core commit order, suppresses cached and rejected commands, and reserves
-snapshots for initial baselines, subscription changes, and lag recovery. The core mutex is the
-current publication boundary; the bounded single-writer queue will replace it.
+`Core::process_with_deltas`; `Core::process` remains the response-only wrapper. The gateway submits
+all core operations through a bounded queue owned by one writer thread. That writer processes jobs in
+queue order and publishes deltas/trades before taking the next job, so queue order is commit order.
+An initial baseline, subscription change, or resync is a single writer job: it subscribes, takes the
+snapshot, and reads the recent tape without a command publishing in between. Cached and rejected
+commands publish nothing. Snapshots remain reserved for baselines, subscription changes, and lag
+recovery.
 
 Still pending in the T1 runtime:
 
-- Bounded single-writer command queue
 - Batched publisher and cached resync snapshots
-- Real queue/latency histograms (the two p99 fields remain zero)
 - Frontend worker/store migration to the canonical feed
