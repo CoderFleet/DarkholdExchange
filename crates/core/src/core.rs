@@ -710,6 +710,11 @@ impl Core {
         self.poisoned
     }
 
+    /// Last sequence assigned by the core. Zero means no command has been processed.
+    pub fn last_seq(&self) -> Seq {
+        self.next_seq.saturating_sub(1)
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }

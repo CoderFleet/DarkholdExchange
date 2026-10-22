@@ -1,0 +1,19 @@
+{
+  "type": "Delta",
+  "delta": {
+    "market_id": 1,
+    "book_seq": 11,
+    "changes": [
+      {
+        "side": "Buy",
+        "price_ticks": 5000,
+        "qty": 3
+      },
+      {
+        "side": "Sell",
+        "price_ticks": 5100,
+        "qty": 0
+      }
+    ]
+  }
+}

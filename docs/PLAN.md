@@ -278,8 +278,8 @@ No `String` on the hot path. The core emits a stable enum; the UI maps it to tex
 ```
 OutsideCollar, InsufficientFunds, InsufficientInventory, HoldingLimitExceeded,
 SelfTrade, UnknownMarket, MarketClosed, DuplicateClientOrderId, InvalidQuantity,
-InvalidPrice, PriceNotTickAligned, OrderNotFound, NotOrderOwner, CancelNotAllowed,
-RateLimited, QueueFull, AuctionNotActive, AuctionClosed, StaleAuctionPrice,
+InvalidPrice, PriceNotTickAligned, InvalidRequest, OrderNotFound, NotOrderOwner,
+CancelNotAllowed, RateLimited, QueueFull, AuctionNotActive, AuctionClosed, StaleAuctionPrice,
 EscrowNotReady, InvalidReceipt, ReceiptExpired, InternalError
 ```
 

@@ -19,6 +19,7 @@ pub enum ReasonCode {
     InvalidQuantity,
     InvalidPrice,
     PriceNotTickAligned,
+    InvalidRequest,
     OrderNotFound,
     NotOrderOwner,
     CancelNotAllowed,

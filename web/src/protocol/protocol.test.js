@@ -75,3 +75,17 @@ it('decodes the golden MessagePack subscribe frame', () => {
     depth: 20,
   })
 })
+
+it('decodes the golden MessagePack delta frame', () => {
+  expect(decodeServerMessage(goldFrame('delta.msgpack'))).toEqual(fixture('delta.json'))
+})
+
+it('decodes the golden MessagePack resync frame', () => {
+  expect(decodeServerMessage(goldFrame('resync_required.msgpack'))).toEqual(
+    fixture('resync_required.json'),
+  )
+})
+
+it('decodes the golden MessagePack metrics frame', () => {
+  expect(decodeServerMessage(goldFrame('metrics.msgpack'))).toEqual(fixture('metrics.json'))
+})

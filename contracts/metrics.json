@@ -1,0 +1,13 @@
+{
+  "type": "Metrics",
+  "metrics": {
+    "seq": 42,
+    "queue_depth": 4,
+    "commands_total": 120000,
+    "rejected_total": 120,
+    "queue_wait_p99_us": 850,
+    "core_p99_us": 210,
+    "ws_clients": 32,
+    "slow_consumers": 1
+  }
+}

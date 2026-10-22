@@ -28,6 +28,10 @@ web:
 types:
     cargo test -p dx-types export_bindings
 
+# regenerate the golden MessagePack frames from the JSON/Rust contract
+fixtures:
+    cargo run -q -p dx-types --example generate_msgpack
+
 check:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings

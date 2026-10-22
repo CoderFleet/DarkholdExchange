@@ -49,6 +49,12 @@ jobs:
       - name: Check generated bindings are committed
         run: git diff --exit-code -- web/src/protocol/generated
 
+      - name: Regenerate MessagePack fixtures
+        run: cargo run -q -p dx-types --example generate_msgpack
+
+      - name: Check MessagePack fixtures are committed
+        run: git diff --exit-code -- contracts/msgpack
+
       - name: Web typecheck
         run: npm --prefix web run typecheck
 

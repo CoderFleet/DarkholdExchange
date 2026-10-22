@@ -21,6 +21,30 @@ fn server_messages_roundtrip_through_msgpack() {
             user_id: Some(1),
         },
         WsServerMessage::Snapshot { snapshot },
+        WsServerMessage::Delta {
+            delta: BookDelta {
+                market_id: 1,
+                book_seq: 8,
+                changes: vec![LevelChange {
+                    side: Side::Buy,
+                    price_ticks: 5_000,
+                    qty: 3,
+                }],
+            },
+        },
+        WsServerMessage::ResyncRequired { market_id: 1 },
+        WsServerMessage::Metrics {
+            metrics: MetricsSnapshot {
+                seq: 42,
+                queue_depth: 4,
+                commands_total: 120_000,
+                rejected_total: 120,
+                queue_wait_p99_us: 850,
+                core_p99_us: 210,
+                ws_clients: 32,
+                slow_consumers: 1,
+            },
+        },
         WsServerMessage::Pong,
         WsServerMessage::Error {
             code: ReasonCode::OutsideCollar,
@@ -72,6 +96,59 @@ fn decodes_golden_subscribe_frame() {
         WsClientMessage::Subscribe {
             market_ids: vec![1, 3],
             depth: 20,
+        }
+    );
+}
+
+#[test]
+fn decodes_golden_delta_frame() {
+    let decoded: WsServerMessage = rmp_serde::from_slice(&golden("delta.msgpack")).unwrap();
+    assert_eq!(
+        decoded,
+        WsServerMessage::Delta {
+            delta: BookDelta {
+                market_id: 1,
+                book_seq: 11,
+                changes: vec![
+                    LevelChange {
+                        side: Side::Buy,
+                        price_ticks: 5_000,
+                        qty: 3,
+                    },
+                    LevelChange {
+                        side: Side::Sell,
+                        price_ticks: 5_100,
+                        qty: 0,
+                    },
+                ],
+            },
+        }
+    );
+}
+
+#[test]
+fn decodes_golden_resync_frame() {
+    let decoded: WsServerMessage =
+        rmp_serde::from_slice(&golden("resync_required.msgpack")).unwrap();
+    assert_eq!(decoded, WsServerMessage::ResyncRequired { market_id: 1 });
+}
+
+#[test]
+fn decodes_golden_metrics_frame() {
+    let decoded: WsServerMessage = rmp_serde::from_slice(&golden("metrics.msgpack")).unwrap();
+    assert_eq!(
+        decoded,
+        WsServerMessage::Metrics {
+            metrics: MetricsSnapshot {
+                seq: 42,
+                queue_depth: 4,
+                commands_total: 120_000,
+                rejected_total: 120,
+                queue_wait_p99_us: 850,
+                core_p99_us: 210,
+                ws_clients: 32,
+                slow_consumers: 1,
+            },
         }
     );
 }
