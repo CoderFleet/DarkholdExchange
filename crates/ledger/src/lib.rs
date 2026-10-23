@@ -4,6 +4,7 @@ mod account;
 mod error;
 mod journal;
 mod ledger;
+pub mod money;
 
 pub use account::*;
 pub use error::*;

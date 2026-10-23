@@ -1,4 +1,4 @@
-use dkx_ledger::*;
+use dx_ledger::money::*;
 use proptest::prelude::*;
 
 #[test]

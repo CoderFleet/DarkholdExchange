@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
-use crate::error::{LedgerError, Violation};
-use crate::types::{
+use crate::money::error::{LedgerError, Violation};
+use crate::money::types::{
     Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, JournalId, Leg, MarketId, OrderId,
     Paise, SettleOutcome, UserId,
 };

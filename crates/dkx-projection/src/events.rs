@@ -1,4 +1,4 @@
-use dkx_ledger::{Fill, JournalEntry, Paise};
+use dx_ledger::money::{Fill, JournalEntry, Paise};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,5 +1,5 @@
 use crate::events::ProjectionEvent;
-use dkx_ledger::Account;
+use dx_ledger::money::Account;
 use sqlx::PgPool;
 
 pub const BATCH_SIZE: usize = 500;

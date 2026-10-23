@@ -497,20 +497,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "dkx-ledger"
-version = "0.1.0"
-dependencies = [
- "proptest",
- "serde",
- "thiserror",
-]
-
-[[package]]
 name = "dkx-projection"
 version = "0.1.0"
 dependencies = [
  "axum",
- "dkx-ledger",
+ "dx-ledger",
  "serde",
  "serde_json",
  "sqlx",
@@ -526,7 +517,7 @@ version = "0.1.0"
 dependencies = [
  "crossbeam-queue",
  "dkx-hash",
- "dkx-ledger",
+ "dx-ledger",
  "rmp-serde",
  "serde",
  "sha2",
@@ -582,6 +573,8 @@ version = "0.1.0"
 dependencies = [
  "dx-types",
  "proptest",
+ "serde",
+ "thiserror",
 ]
 
 [[package]]

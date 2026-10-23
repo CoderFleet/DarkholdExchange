@@ -1,4 +1,4 @@
-use crate::types::{Account, Asset, Paise};
+use crate::money::types::{Account, Asset, Paise};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
