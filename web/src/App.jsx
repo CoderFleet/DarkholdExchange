@@ -25,11 +25,16 @@ import {
   marketBounds,
   statusText,
 } from './format'
+import { useWalletStore } from './stores/useWalletStore'
+import { WalletView } from './components/WalletView'
+import { HistoryView } from './components/HistoryView'
 import './App.css'
 
 const TRADER_IDS = [1, 2, 3, 4, 5, 6]
 
 function App() {
+  const [activeView, setActiveView] = useState('trade')
+  const wallet = useWalletStore()
   const [markets, setMarkets] = useState([])
   const [snapshots, setSnapshots] = useState({})
   const [tradesByMarket, setTradesByMarket] = useState({})
@@ -50,7 +55,8 @@ function App() {
     ])
     setBalances(nextBalances)
     setOpenOrders(nextOrders)
-  }, [])
+    wallet.updateFromBalances(nextBalances)
+  }, [wallet])
 
   const loadTrades = useCallback(async (marketId) => {
     if (marketId == null) return
@@ -230,7 +236,9 @@ function App() {
   }
 
   const handleUserChange = (event) => {
-    setUserId(Number(event.target.value))
+    const nextId = Number(event.target.value)
+    setUserId(nextId)
+    wallet.setUserId(nextId)
     setBalances([])
     setOpenOrders([])
   }
@@ -243,49 +251,91 @@ function App() {
         onUserChange={handleUserChange}
       />
 
+      <nav className="main-nav" aria-label="Views">
+        <button
+          type="button"
+          className={`nav-tab ${activeView === 'trade' ? 'active' : ''}`}
+          onClick={() => setActiveView('trade')}
+        >
+          Exchange
+        </button>
+        <button
+          type="button"
+          className={`nav-tab ${activeView === 'wallet' ? 'active' : ''}`}
+          onClick={() => setActiveView('wallet')}
+        >
+          Wallet & Portfolio
+          <span className="nav-badge">
+            {formatMoney(wallet.cashAvail)}
+          </span>
+        </button>
+        <button
+          type="button"
+          className={`nav-tab ${activeView === 'history' ? 'active' : ''}`}
+          onClick={() => setActiveView('history')}
+        >
+          History & Statements
+        </button>
+      </nav>
+
       {bootError && <div className="banner error">{bootError}</div>}
 
-      <MarketTabs
-        markets={markets}
-        snapshots={snapshots}
-        selectedMarketId={selectedMarketId}
-        onSelect={setSelectedMarketId}
-      />
-
-      {selectedMarket ? (
-        <>
-          <MarketHeader market={selectedMarket} snapshot={selectedSnapshot} />
-          <div className="terminal-grid">
-            <OrderBook market={selectedMarket} snapshot={selectedSnapshot} />
-            <div className="column-stack">
-              <TradeTape market={selectedMarket} trades={selectedTrades} />
-              <OpenOrders
-                market={selectedMarket}
-                orders={openOrders}
-                cancelling={cancelling}
-                onCancel={handleCancel}
-              />
-            </div>
-            <div className="column-stack">
-              <OrderTicket
-                key={selectedMarket.id}
-                market={selectedMarket}
-                snapshot={selectedSnapshot}
-                submitting={submitting}
-                onSubmit={submit}
-              />
-              <Balances
-                market={selectedMarket}
-                balances={balances}
-                userId={userId}
-              />
-            </div>
-          </div>
-        </>
+      {activeView === 'wallet' ? (
+        <WalletView
+          wallet={wallet}
+          onTopup={(amt) => wallet.topup(amt)}
+          onRefresh={() => wallet.fetchWallet()}
+        />
+      ) : activeView === 'history' ? (
+        <HistoryView
+          wallet={wallet}
+          onRefresh={() => wallet.fetchHistory()}
+        />
       ) : (
-        <div className="loading-panel">
-          {bootError ? 'Gateway unavailable.' : 'Connecting to the exchange…'}
-        </div>
+        <>
+          <MarketTabs
+            markets={markets}
+            snapshots={snapshots}
+            selectedMarketId={selectedMarketId}
+            onSelect={setSelectedMarketId}
+          />
+
+          {selectedMarket ? (
+            <>
+              <MarketHeader market={selectedMarket} snapshot={selectedSnapshot} />
+              <div className="terminal-grid">
+                <OrderBook market={selectedMarket} snapshot={selectedSnapshot} />
+                <div className="column-stack">
+                  <TradeTape market={selectedMarket} trades={selectedTrades} />
+                  <OpenOrders
+                    market={selectedMarket}
+                    orders={openOrders}
+                    cancelling={cancelling}
+                    onCancel={handleCancel}
+                  />
+                </div>
+                <div className="column-stack">
+                  <OrderTicket
+                    key={selectedMarket.id}
+                    market={selectedMarket}
+                    snapshot={selectedSnapshot}
+                    submitting={submitting}
+                    onSubmit={submit}
+                  />
+                  <Balances
+                    market={selectedMarket}
+                    balances={balances}
+                    userId={userId}
+                  />
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="loading-panel">
+              {bootError ? 'Gateway unavailable.' : 'Connecting to the exchange…'}
+            </div>
+          )}
+        </>
       )}
 
       <Footer />

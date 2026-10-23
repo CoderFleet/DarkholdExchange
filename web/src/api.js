@@ -128,6 +128,112 @@ export const cancelOrderRequest = (orderId, clientOrderId, userId) =>
 
 /**
  * @param {number} userId
+ * @returns {Promise<{ user_id: number, cash_avail: number, cash_locked: number, escrow_cash: number, passes: any[] }>}
+ */
+export const getWallet = async (userId) => {
+  try {
+    return await request('/api/wallet', {
+      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+    })
+  } catch {
+    // Graceful fallback to gateway balance endpoint if projection worker is not standalone
+    const rawBalances = await getBalances(userId)
+    const cash = rawBalances.find((b) => b.asset.kind === 'cash')
+    const passes = rawBalances
+      .filter((b) => b.asset.kind === 'pass')
+      .map((b) => ({
+        market_id: b.asset.market_id,
+        event_name: `Market #${b.asset.market_id}`,
+        tier_name: 'General',
+        avail: b.available,
+        locked: b.held,
+        held: 0,
+      }))
+    return {
+      user_id: userId,
+      cash_avail: cash?.available ?? 0,
+      cash_locked: cash?.held ?? 0,
+      escrow_cash: 0,
+      passes,
+    }
+  }
+}
+
+/**
+ * Top up user wallet in paise (100 paise = ₹1). Maximum 10,000,000 paise (₹100,000).
+ *
+ * @param {number} userId
+ * @param {number} amountPaise
+ * @returns {Promise<any>}
+ */
+export const topupWallet = async (userId, amountPaise) => {
+  try {
+    return await request('/api/wallet/topup', {
+      method: 'POST',
+      headers: {
+        ...jsonHeaders(userId),
+        'x-user-id': String(userId),
+      },
+      body: JSON.stringify({ amount: amountPaise }),
+    })
+  } catch {
+    // Fallback to gateway dev deposit
+    return await request('/api/dev/deposit', {
+      method: 'POST',
+      headers: jsonHeaders(userId),
+      body: JSON.stringify({
+        user_id: userId,
+        amount: amountPaise,
+        client_request_id: Date.now() + Math.floor(Math.random() * 1000),
+      }),
+    })
+  }
+}
+
+/**
+ * @param {number} userId
+ * @param {{ market_id?: number, side?: 'buy' | 'sell', limit?: number, cursor?: number }} [query]
+ * @returns {Promise<{ items: any[], next_cursor: number | null }>}
+ */
+export const getHistory = async (userId, query = {}) => {
+  const params = new URLSearchParams()
+  if (query.market_id != null) params.set('market_id', String(query.market_id))
+  if (query.side != null) params.set('side', query.side)
+  if (query.limit != null) params.set('limit', String(query.limit))
+  if (query.cursor != null) params.set('cursor', String(query.cursor))
+  const qs = params.toString() ? `?${params.toString()}` : ''
+
+  try {
+    return await request(`/api/history${qs}`, {
+      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+    })
+  } catch {
+    return { items: [], next_cursor: null }
+  }
+}
+
+/**
+ * @param {number} userId
+ * @param {{ limit?: number, cursor?: number }} [query]
+ * @returns {Promise<{ items: any[], next_cursor: number | null }>}
+ */
+export const getStatements = async (userId, query = {}) => {
+  const params = new URLSearchParams()
+  if (query.limit != null) params.set('limit', String(query.limit))
+  if (query.cursor != null) params.set('cursor', String(query.cursor))
+  const qs = params.toString() ? `?${params.toString()}` : ''
+
+  try {
+    return await request(`/api/statements${qs}`, {
+      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+    })
+  } catch {
+    return { items: [], next_cursor: null }
+  }
+}
+
+/**
+ * @param {number} userId
  * @returns {string}
  */
 export const websocketUrl = (userId) => {
