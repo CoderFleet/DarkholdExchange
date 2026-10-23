@@ -521,6 +521,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dkx-wal"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-queue",
+ "dkx-hash",
+ "dkx-ledger",
+ "rmp-serde",
+ "serde",
+ "sha2",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "dotenvy"
 version = "0.15.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
