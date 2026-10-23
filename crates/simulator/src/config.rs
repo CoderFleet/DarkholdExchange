@@ -6,11 +6,38 @@ use std::str::FromStr;
 use dx_types::{MarketId, Minor, Qty, Ticks, UserId};
 use serde::Serialize;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Workload {
+    PlaceCancel,
+    Fills,
+}
+
+impl FromStr for Workload {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "place-cancel" => Ok(Self::PlaceCancel),
+            "fills" => Ok(Self::Fills),
+            _ => Err(format!(
+                "unknown workload `{value}`; expected `place-cancel` or `fills`"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LoadConfig {
     pub base_url: String,
+    pub workload: Workload,
     pub duration_secs: u64,
     pub placements_per_second: u64,
+    pub fills_per_second: u64,
+    pub fill_makers: usize,
+    pub fill_takers: usize,
+    pub fill_passes: Qty,
+    pub fill_price_ticks: Ticks,
     pub users: usize,
     pub ws_connections: usize,
     pub probe_rate_per_second: u64,
@@ -31,8 +58,14 @@ impl Default for LoadConfig {
     fn default() -> Self {
         Self {
             base_url: "http://127.0.0.1:18080".into(),
+            workload: Workload::PlaceCancel,
             duration_secs: 10,
             placements_per_second: 1_000,
+            fills_per_second: 1_000,
+            fill_makers: 3_000,
+            fill_takers: 3_000,
+            fill_passes: 4,
+            fill_price_ticks: 5_000,
             users: 32,
             ws_connections: 4,
             probe_rate_per_second: 10,
@@ -61,12 +94,30 @@ impl LoadConfig {
         while let Some(flag) = args.next() {
             match flag.as_str() {
                 "--base-url" => config.base_url = next_value(&mut args, &flag)?,
+                "--workload" => {
+                    config.workload = parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
                 "--duration-secs" => {
                     config.duration_secs = parse_value(&flag, &next_value(&mut args, &flag)?)?
                 }
                 "--placements-per-second" => {
                     config.placements_per_second =
                         parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
+                "--fills-per-second" => {
+                    config.fills_per_second = parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
+                "--fill-makers" => {
+                    config.fill_makers = parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
+                "--fill-takers" => {
+                    config.fill_takers = parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
+                "--fill-passes" => {
+                    config.fill_passes = parse_value(&flag, &next_value(&mut args, &flag)?)?
+                }
+                "--fill-price-ticks" => {
+                    config.fill_price_ticks = parse_value(&flag, &next_value(&mut args, &flag)?)?
                 }
                 "--users" => config.users = parse_value(&flag, &next_value(&mut args, &flag)?)?,
                 "--ws-connections" => {
@@ -128,6 +179,50 @@ impl LoadConfig {
         if self.placements_per_second == 0 || self.placements_per_second > 100_000 {
             return Err("--placements-per-second must be between 1 and 100000".into());
         }
+        if self.workload == Workload::Fills {
+            if self.fills_per_second == 0 || self.fills_per_second > 100_000 {
+                return Err("--fills-per-second must be between 1 and 100000".into());
+            }
+            if self.fill_makers == 0 || self.fill_makers > 10_000 {
+                return Err("--fill-makers must be between 1 and 10000".into());
+            }
+            if self.fill_takers == 0 || self.fill_takers > 10_000 {
+                return Err("--fill-takers must be between 1 and 10000".into());
+            }
+            if self.fill_makers + self.fill_takers > 10_000 {
+                return Err("--fill-makers + --fill-takers must be at most 10000".into());
+            }
+            if self.fill_passes == 0 || self.fill_passes > 100 {
+                return Err("--fill-passes must be between 1 and 100".into());
+            }
+            if self.fill_price_ticks == 0 {
+                return Err("--fill-price-ticks must be positive".into());
+            }
+            if self.qty != 1 {
+                return Err("--workload fills currently requires --qty 1".into());
+            }
+            let Some(expected_fills) = self.fills_per_second.checked_mul(self.duration_secs) else {
+                return Err("--fills-per-second * --duration-secs overflows".into());
+            };
+            let Some(maker_capacity) = (self.fill_makers as u64).checked_mul(self.fill_passes)
+            else {
+                return Err("--fill-makers * --fill-passes overflows".into());
+            };
+            let Some(taker_capacity) = (self.fill_takers as u64).checked_mul(self.fill_passes)
+            else {
+                return Err("--fill-takers * --fill-passes overflows".into());
+            };
+            if maker_capacity < expected_fills {
+                return Err(format!(
+                    "not enough maker capacity: need {expected_fills} fills, have {maker_capacity}; raise --fill-makers or --fill-passes"
+                ));
+            }
+            if taker_capacity < expected_fills {
+                return Err(format!(
+                    "not enough taker capacity: need {expected_fills} fills, have {taker_capacity}; raise --fill-takers or --fill-passes"
+                ));
+            }
+        }
         if self.users == 0 || self.users > 10_000 {
             return Err("--users must be between 1 and 10000".into());
         }
@@ -144,6 +239,13 @@ impl LoadConfig {
         }
         if self.user_base.checked_add(self.users as u64).is_none() {
             return Err("--user-base + --users overflows user id space".into());
+        }
+        if self
+            .user_base
+            .checked_add((self.fill_makers + self.fill_takers) as u64)
+            .is_none()
+        {
+            return Err("--user-base + fill users overflows user id space".into());
         }
         if self.market_id == 0 {
             return Err("--market-id must be positive".into());
@@ -180,9 +282,15 @@ impl LoadConfig {
          \n\
          Flags:\n\
            --base-url <url>                default http://127.0.0.1:18080\n\
+           --workload <name>               place-cancel (default) or fills\n\
            --duration-secs <n>             default 10\n\
-           --placements-per-second <n>     default 1000\n\
-           --users <n>                     default 32\n\
+           --placements-per-second <n>     default 1000 (place-cancel)\n\
+           --fills-per-second <n>          default 1000 (fills)\n\
+           --fill-makers <n>               default 3000 (fills)\n\
+           --fill-takers <n>               default 3000 (fills)\n\
+           --fill-passes <qty>             default 4 (fills)\n\
+           --fill-price-ticks <ticks>      default 5000 (fills)\n\
+           --users <n>                     default 32 (place-cancel users / fill workers)\n\
            --ws-connections <n>            default 4\n\
            --probe-rate <n>                default 10 (0 disables)\n\
            --user-base <id>                default 1000\n\
@@ -268,5 +376,64 @@ mod tests {
     fn rejects_demo_user_collision() {
         let error = LoadConfig::from_args(["--user-base", "5"].map(String::from)).unwrap_err();
         assert!(error.contains("--user-base"));
+    }
+
+    #[test]
+    fn parses_fill_workload() {
+        let config = LoadConfig::from_args(
+            [
+                "--workload",
+                "fills",
+                "--fills-per-second",
+                "1100",
+                "--fill-makers",
+                "3000",
+                "--fill-takers",
+                "3000",
+                "--fill-passes",
+                "4",
+                "--fill-price-ticks",
+                "5000",
+            ]
+            .map(String::from),
+        )
+        .unwrap();
+
+        assert_eq!(config.workload, Workload::Fills);
+        assert_eq!(config.fills_per_second, 1_100);
+        assert_eq!(config.fill_makers, 3_000);
+        assert_eq!(config.fill_takers, 3_000);
+        assert_eq!(config.fill_passes, 4);
+        assert_eq!(config.fill_price_ticks, 5_000);
+    }
+
+    #[test]
+    fn rejects_insufficient_fill_capacity() {
+        let error = LoadConfig::from_args(
+            [
+                "--workload",
+                "fills",
+                "--fills-per-second",
+                "1100",
+                "--duration-secs",
+                "10",
+                "--fill-makers",
+                "100",
+                "--fill-takers",
+                "100",
+                "--fill-passes",
+                "4",
+            ]
+            .map(String::from),
+        )
+        .unwrap_err();
+        assert!(error.contains("not enough maker capacity"));
+    }
+
+    #[test]
+    fn rejects_non_unit_fill_qty() {
+        let error = LoadConfig::from_args(["--workload", "fills", "--qty", "2"].map(String::from))
+            .unwrap_err();
+        assert!(error.contains("--qty 1"));
     }
 }

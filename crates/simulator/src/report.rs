@@ -75,6 +75,26 @@ pub struct ClientReport {
     pub cancel: OutcomeCounts,
     pub place_ack: LatencySummary,
     pub cancel_ack: LatencySummary,
+    pub fills: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SetupReport {
+    pub maker_orders: u64,
+    pub maker_ok: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FillReport {
+    pub target_per_second: u64,
+    pub expected_fills: u64,
+    pub fills: u64,
+    pub fills_per_second: f64,
+    pub ws_trades_per_connection: f64,
+    pub makers: usize,
+    pub takers: usize,
+    pub passes_per_user: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -120,6 +140,7 @@ pub struct WsReport {
     pub bytes: u64,
     pub deltas_per_second: f64,
     pub bytes_per_second: f64,
+    pub trades_per_connection: f64,
 }
 
 impl WsReport {
@@ -144,6 +165,9 @@ impl WsReport {
             let seconds = longest_elapsed_ms as f64 / 1_000.0;
             report.deltas_per_second = report.deltas as f64 / seconds;
             report.bytes_per_second = report.bytes as f64 / seconds;
+        }
+        if !report.connections.is_empty() {
+            report.trades_per_connection = report.trades as f64 / report.connections.len() as f64;
         }
         report
     }
@@ -211,12 +235,17 @@ pub struct LoadReport {
     pub probe: ProbeReport,
     pub ws: WsReport,
     pub gateway: GatewayReport,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill: Option<FillReport>,
     pub notes: Vec<String>,
 }
 
 impl LoadReport {
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
+        let fills = self.fill.is_some();
         writeln!(out, "## Environment").unwrap();
         writeln!(out).unwrap();
         writeln!(
@@ -249,11 +278,37 @@ impl LoadReport {
         writeln!(out, "|---|---:|").unwrap();
         writeln!(
             out,
-            "| Target placements/s | {} |",
-            self.config.placements_per_second
+            "| Workload | `{}` |",
+            if fills { "fills" } else { "place-cancel" }
         )
         .unwrap();
-        writeln!(out, "| Users | {} |", self.config.users).unwrap();
+        if fills {
+            writeln!(out, "| Target fills/s | {} |", self.config.fills_per_second).unwrap();
+            writeln!(out, "| Makers | {} |", self.config.fill_makers).unwrap();
+            writeln!(out, "| Takers | {} |", self.config.fill_takers).unwrap();
+            writeln!(
+                out,
+                "| Passes per maker/taker | {} |",
+                self.config.fill_passes
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| Fill price | {} ticks |",
+                self.config.fill_price_ticks
+            )
+            .unwrap();
+            writeln!(out, "| Worker tasks | {} |", self.config.users).unwrap();
+        } else {
+            writeln!(
+                out,
+                "| Target placements/s | {} |",
+                self.config.placements_per_second
+            )
+            .unwrap();
+            writeln!(out, "| Users | {} |", self.config.users).unwrap();
+            writeln!(out, "| Main price | {} ticks |", self.config.price_ticks).unwrap();
+        }
         writeln!(out, "| WS connections | {} |", self.config.ws_connections).unwrap();
         writeln!(
             out,
@@ -261,12 +316,7 @@ impl LoadReport {
             self.config.probe_rate_per_second
         )
         .unwrap();
-        writeln!(
-            out,
-            "| Main market / price | {} / {} ticks |",
-            self.config.market_id, self.config.price_ticks
-        )
-        .unwrap();
+        writeln!(out, "| Main market | {} |", self.config.market_id).unwrap();
         writeln!(
             out,
             "| Probe market / price | {} / {} ticks |",
@@ -279,18 +329,43 @@ impl LoadReport {
         writeln!(out).unwrap();
         writeln!(out, "| Metric | Value |").unwrap();
         writeln!(out, "|---|---:|").unwrap();
-        writeln!(
-            out,
-            "| Offered placements/s | {:.2} |",
-            self.offered.placements as f64 / (self.duration_ms as f64 / 1_000.0)
-        )
-        .unwrap();
-        writeln!(
-            out,
-            "| Achieved placements/s | {:.2} |",
-            self.achieved.placements_per_second
-        )
-        .unwrap();
+        let seconds = (self.duration_ms as f64 / 1_000.0).max(0.001);
+        if let Some(fill) = &self.fill {
+            writeln!(
+                out,
+                "| Offered taker buys/s | {:.2} |",
+                self.offered.placements as f64 / seconds
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| Achieved taker buys/s | {:.2} |",
+                self.achieved.placements_per_second
+            )
+            .unwrap();
+            writeln!(out, "| Achieved fills/s | {:.2} |", fill.fills_per_second).unwrap();
+            writeln!(out, "| Fills acknowledged | {} |", fill.fills).unwrap();
+            writeln!(out, "| Expected fills | {} |", fill.expected_fills).unwrap();
+            writeln!(
+                out,
+                "| WS trades/connection | {:.2} |",
+                fill.ws_trades_per_connection
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                out,
+                "| Offered placements/s | {:.2} |",
+                self.offered.placements as f64 / seconds
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| Achieved placements/s | {:.2} |",
+                self.achieved.placements_per_second
+            )
+            .unwrap();
+        }
         writeln!(
             out,
             "| Achieved accepted commands/s | {:.2} |",
@@ -315,8 +390,18 @@ impl LoadReport {
         writeln!(out).unwrap();
         writeln!(out, "| Path | Samples | p50 | p95 | p99 | p99.9 | Max |").unwrap();
         writeln!(out, "|---|---:|---:|---:|---:|---:|---:|").unwrap();
-        write_latency_row(&mut out, "Place acknowledgement", &self.client.place_ack);
-        write_latency_row(&mut out, "Cancel acknowledgement", &self.client.cancel_ack);
+        write_latency_row(
+            &mut out,
+            if fills {
+                "Fill acknowledgement"
+            } else {
+                "Place acknowledgement"
+            },
+            &self.client.place_ack,
+        );
+        if self.client.cancel.attempts > 0 {
+            write_latency_row(&mut out, "Cancel acknowledgement", &self.client.cancel_ack);
+        }
         write_latency_row(&mut out, "Probe end-to-end (place)", &self.probe.place_e2e);
         write_latency_row(
             &mut out,
@@ -329,9 +414,54 @@ impl LoadReport {
         writeln!(out).unwrap();
         writeln!(out, "| Operation | Attempts | OK | Rejected | 429 | 503 | HTTP other | Unexpected | Transport |").unwrap();
         writeln!(out, "|---|---:|---:|---:|---:|---:|---:|---:|---:|").unwrap();
-        write_outcome_row(&mut out, "Place", &self.client.place);
-        write_outcome_row(&mut out, "Cancel", &self.client.cancel);
+        write_outcome_row(
+            &mut out,
+            if fills { "Taker buy" } else { "Place" },
+            &self.client.place,
+        );
+        if self.client.cancel.attempts > 0 {
+            write_outcome_row(&mut out, "Cancel", &self.client.cancel);
+        }
         writeln!(out).unwrap();
+
+        if let Some(setup) = &self.setup {
+            writeln!(out, "## Maker setup").unwrap();
+            writeln!(out).unwrap();
+            writeln!(out, "| Metric | Value |").unwrap();
+            writeln!(out, "|---|---:|").unwrap();
+            writeln!(out, "| Maker orders | {} |", setup.maker_orders).unwrap();
+            writeln!(out, "| Rested OK | {} |", setup.maker_ok).unwrap();
+            writeln!(out, "| Elapsed (ms) | {} |", setup.elapsed_ms).unwrap();
+            writeln!(out).unwrap();
+        }
+
+        if let Some(fill) = &self.fill {
+            writeln!(out, "## Fill validation").unwrap();
+            writeln!(out).unwrap();
+            writeln!(out, "| Metric | Value |").unwrap();
+            writeln!(out, "|---|---:|").unwrap();
+            writeln!(out, "| Response fills | {} |", fill.fills).unwrap();
+            writeln!(
+                out,
+                "| WS trades/connection | {:.2} |",
+                fill.ws_trades_per_connection
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| Fills match WS trades | {} |",
+                fill.fills > 0 && fill.ws_trades_per_connection == fill.fills as f64
+            )
+            .unwrap();
+            writeln!(
+                out,
+                "| Makers / takers | {} / {} |",
+                fill.makers, fill.takers
+            )
+            .unwrap();
+            writeln!(out, "| Passes per user | {} |", fill.passes_per_user).unwrap();
+            writeln!(out).unwrap();
+        }
 
         writeln!(out, "## Probe").unwrap();
         writeln!(out).unwrap();

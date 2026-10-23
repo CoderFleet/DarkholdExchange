@@ -48,3 +48,7 @@ bench:
 # run the repeatable 1k placements/s gateway load baseline
 load:
     bash scripts/load-test.sh
+
+# run the repeatable 1k fills/s gateway load baseline
+load-fills:
+    DX_LOAD_WORKLOAD=fills bash scripts/load-test.sh

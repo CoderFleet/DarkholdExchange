@@ -1,0 +1,220 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:18081",
+    "workload": "fills",
+    "duration_secs": 10,
+    "placements_per_second": 1000,
+    "fills_per_second": 1100,
+    "fill_makers": 3000,
+    "fill_takers": 3000,
+    "fill_passes": 4,
+    "fill_price_ticks": 5000,
+    "users": 32,
+    "ws_connections": 4,
+    "probe_rate_per_second": 10,
+    "user_base": 1000,
+    "market_id": 1,
+    "price_ticks": 4700,
+    "qty": 1,
+    "probe_user": 5,
+    "probe_market_id": 2,
+    "probe_price_ticks": 9600,
+    "seed_cash": 10000000,
+    "seed_passes": 2
+  },
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "available_parallelism": 8,
+    "gateway_queue_capacity": 1024
+  },
+  "started_at_unix_ms": 1792727294576,
+  "duration_ms": 10000,
+  "offered": {
+    "placements": 11000,
+    "commands": 11000
+  },
+  "achieved": {
+    "placements_per_second": 1100.0,
+    "commands_per_second": 1120.0
+  },
+  "client": {
+    "place": {
+      "attempts": 11000,
+      "ok": 11000,
+      "rejected": 0,
+      "queue_full": 0,
+      "unavailable": 0,
+      "http_other": 0,
+      "unexpected": 0,
+      "transport_errors": 0
+    },
+    "cancel": {
+      "attempts": 0,
+      "ok": 0,
+      "rejected": 0,
+      "queue_full": 0,
+      "unavailable": 0,
+      "http_other": 0,
+      "unexpected": 0,
+      "transport_errors": 0
+    },
+    "place_ack": {
+      "samples": 11000,
+      "p50_us": 174,
+      "p95_us": 339,
+      "p99_us": 483,
+      "p999_us": 1480,
+      "max_us": 2980
+    },
+    "cancel_ack": {
+      "samples": 0,
+      "p50_us": 0,
+      "p95_us": 0,
+      "p99_us": 0,
+      "p999_us": 0,
+      "max_us": 0
+    },
+    "fills": 11000
+  },
+  "probe": {
+    "enabled": true,
+    "place_attempts": 100,
+    "place_ok": 100,
+    "cancel_attempts": 100,
+    "cancel_ok": 100,
+    "overloaded": 0,
+    "place_e2e": {
+      "samples": 100,
+      "p50_us": 220,
+      "p95_us": 377,
+      "p99_us": 521,
+      "p999_us": 661,
+      "max_us": 661
+    },
+    "cancel_e2e": {
+      "samples": 99,
+      "p50_us": 147,
+      "p95_us": 243,
+      "p99_us": 266,
+      "p999_us": 266,
+      "max_us": 266
+    },
+    "ws_messages": 200,
+    "ws_deltas": 200,
+    "ws_resync_required": 0
+  },
+  "ws": {
+    "connections": [
+      {
+        "messages": 22000,
+        "deltas": 11000,
+        "trades": 11000,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 2617266,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1072.8567248610163,
+        "bytes_per_second": 255268.3117136448
+      },
+      {
+        "messages": 22000,
+        "deltas": 11000,
+        "trades": 11000,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 2617266,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1072.8567248610163,
+        "bytes_per_second": 255268.3117136448
+      },
+      {
+        "messages": 22000,
+        "deltas": 11000,
+        "trades": 11000,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 2617266,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1072.8567248610163,
+        "bytes_per_second": 255268.3117136448
+      },
+      {
+        "messages": 22000,
+        "deltas": 11000,
+        "trades": 11000,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 2617266,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1072.8567248610163,
+        "bytes_per_second": 255268.3117136448
+      }
+    ],
+    "messages": 88000,
+    "deltas": 44000,
+    "trades": 44000,
+    "snapshots": 0,
+    "metrics": 0,
+    "resync_required": 0,
+    "seq_gaps": 0,
+    "bytes": 10469064,
+    "deltas_per_second": 4291.426899444065,
+    "bytes_per_second": 1021073.2468545792,
+    "trades_per_connection": 11000.0
+  },
+  "gateway": {
+    "before": {
+      "seq": 12014,
+      "queue_depth": 0,
+      "commands_total": 12000,
+      "rejected_total": 0,
+      "queue_wait_p99_us": 86,
+      "core_p99_us": 10,
+      "ws_clients": 5,
+      "slow_consumers": 0
+    },
+    "after": {
+      "seq": 23214,
+      "queue_depth": 0,
+      "commands_total": 23200,
+      "rejected_total": 0,
+      "queue_wait_p99_us": 77,
+      "core_p99_us": 22,
+      "ws_clients": 5,
+      "slow_consumers": 0
+    }
+  },
+  "setup": {
+    "maker_orders": 12000,
+    "maker_ok": 12000,
+    "elapsed_ms": 158
+  },
+  "fill": {
+    "target_per_second": 1100,
+    "expected_fills": 11000,
+    "fills": 11000,
+    "fills_per_second": 1100.0,
+    "ws_trades_per_connection": 11000.0,
+    "makers": 3000,
+    "takers": 3000,
+    "passes_per_user": 4
+  },
+  "notes": [
+    "Maker asks are seeded before the measured window; offered taker commands and fill rates exclude maker setup.",
+    "Each taker buy crosses pre-rested one-unit maker asks, so one accepted taker command produces one fill.",
+    "Fills are counted from CommandResponse.fills and cross-checked against WebSocket Trade frames.",
+    "The pacer stops at the duration boundary, so acknowledged fills can be a few ticks above or below the nominal target.",
+    "The end-to-end probe uses a separate market and fixed-market WebSocket, so probe deltas are unambiguous.",
+    "Gateway command counters include the low-rate probe and are cumulative since gateway start; scripts/load-test.sh starts a fresh gateway.",
+    "Loopback HTTP/WS with no TLS, proxy, or injected network delay."
+  ]
+}

@@ -7,6 +7,7 @@ High-frequency secondary marketplace with an in-memory limit order book.
     just api      # terminal 1
     just web      # terminal 2
     just load     # repeatable gateway load baseline
+    just load-fills  # repeatable fill-heavy gateway baseline
 
 ## Docs
 - [T1 protocol contract](docs/PROTOCOL.md) — frozen REST/WS shapes and delta rules

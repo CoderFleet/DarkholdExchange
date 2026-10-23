@@ -8,14 +8,14 @@
 
 use std::error::Error;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dx_types::{
-    ClientOrderId, Command, CommandResponse, JournalResponse, MetricsSnapshot, OrderId,
-    OrderStatus, PlaceLimit, Side, UserId, WsServerMessage,
+    ClientOrderId, Command, CommandResponse, JournalResponse, MarketStatus, MarketView,
+    MetricsSnapshot, OrderId, OrderStatus, PlaceLimit, Side, UserId, WsServerMessage,
 };
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use reqwest::{Client, StatusCode};
 use serde_json::json;
 use tokio::sync::{Mutex, mpsc, watch};
@@ -23,10 +23,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
-use crate::config::LoadConfig;
+use crate::config::{LoadConfig, Workload};
 use crate::report::{
-    AchievedLoad, ClientReport, EnvironmentReport, GatewayReport, LatencySummary, LoadReport,
-    OfferedLoad, OutcomeCounts, ProbeReport, WsConnectionReport, WsReport,
+    AchievedLoad, ClientReport, EnvironmentReport, FillReport, GatewayReport, LatencySummary,
+    LoadReport, OfferedLoad, OutcomeCounts, ProbeReport, SetupReport, WsConnectionReport, WsReport,
 };
 
 type LoadResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -37,7 +37,11 @@ const PLACE_CLIENT_BASE: u64 = 10_000_000_000;
 const CANCEL_CLIENT_BASE: u64 = 20_000_000_000;
 const PROBE_PLACE_BASE: u64 = 30_000_000_000;
 const PROBE_CANCEL_BASE: u64 = 40_000_000_000;
+const MAKER_CLIENT_BASE: u64 = 50_000_000_000;
 const CANCEL_RETRY_LIMIT: usize = 100;
+const SEED_CONCURRENCY: usize = 32;
+const MAKER_SETUP_CONCURRENCY: usize = 32;
+const TAKER_RETRY_LIMIT: usize = 3;
 
 pub async fn run(config: LoadConfig) -> LoadResult<LoadReport> {
     let http = Client::builder()
@@ -46,7 +50,17 @@ pub async fn run(config: LoadConfig) -> LoadResult<LoadReport> {
         .timeout(Duration::from_secs(10))
         .build()?;
 
-    seed_users(&http, &config).await?;
+    let setup = match config.workload {
+        Workload::PlaceCancel => {
+            seed_place_cancel_users(&http, &config).await?;
+            None
+        }
+        Workload::Fills => {
+            validate_fill_market(&http, &config).await?;
+            seed_fill_users(&http, &config).await?;
+            Some(place_maker_liquidity(&http, &config).await?)
+        }
+    };
 
     let (ws_stop_tx, _) = watch::channel(false);
     let mut ws_handles: Vec<JoinHandle<LoadResult<WsStats>>> = Vec::new();
@@ -86,18 +100,37 @@ pub async fn run(config: LoadConfig) -> LoadResult<LoadReport> {
     let place_ids = Arc::new(AtomicU64::new(PLACE_CLIENT_BASE));
     let cancel_ids = Arc::new(AtomicU64::new(CANCEL_CLIENT_BASE));
 
+    let fill_work =
+        (config.workload == Workload::Fills).then(|| Arc::new(fill_taker_work(&config)));
+    let fill_next = Arc::new(AtomicUsize::new(0));
+
     let mut user_tasks = JoinSet::new();
     for index in 0..config.users {
-        let user_id = config.user_base + index as u64;
-        user_tasks.spawn(run_user_task(
-            config.clone(),
-            http.clone(),
-            user_id,
-            tick_rx.clone(),
-            place_ids.clone(),
-            cancel_ids.clone(),
-            load_stop_rx.clone(),
-        ));
+        match config.workload {
+            Workload::PlaceCancel => {
+                let user_id = config.user_base + index as u64;
+                user_tasks.spawn(run_user_task(
+                    config.clone(),
+                    http.clone(),
+                    user_id,
+                    tick_rx.clone(),
+                    place_ids.clone(),
+                    cancel_ids.clone(),
+                    load_stop_rx.clone(),
+                ));
+            }
+            Workload::Fills => {
+                user_tasks.spawn(run_fill_task(
+                    config.clone(),
+                    http.clone(),
+                    fill_work.clone().expect("fill work list"),
+                    fill_next.clone(),
+                    tick_rx.clone(),
+                    place_ids.clone(),
+                    load_stop_rx.clone(),
+                ));
+            }
+        }
     }
 
     let probe_handle = probe_seq.map(|initial_seq| {
@@ -221,7 +254,19 @@ pub async fn run(config: LoadConfig) -> LoadResult<LoadReport> {
         cancel: client_stats.cancel,
         place_ack: LatencySummary::from_samples(client_stats.place_latencies_us),
         cancel_ack: LatencySummary::from_samples(client_stats.cancel_latencies_us),
+        fills: client_stats.fills,
     };
+    let ws = WsReport::from_connections(ws_reports);
+    let fill = (config.workload == Workload::Fills).then(|| FillReport {
+        target_per_second: config.fills_per_second,
+        expected_fills: config.fills_per_second * config.duration_secs,
+        fills: client_stats.fills,
+        fills_per_second: client_stats.fills as f64 / seconds,
+        ws_trades_per_connection: ws.trades_per_connection,
+        makers: config.fill_makers,
+        takers: config.fill_takers,
+        passes_per_user: config.fill_passes,
+    });
     let probe = ProbeReport {
         enabled: config.probe_rate_per_second > 0,
         place_attempts: probe_stats.place_attempts,
@@ -254,18 +299,39 @@ pub async fn run(config: LoadConfig) -> LoadResult<LoadReport> {
         achieved,
         client,
         probe,
-        ws: WsReport::from_connections(ws_reports),
+        ws,
         gateway,
-        notes: vec![
-            "Each user slot rests a one-unit buy below the best bid and immediately cancels it; cancels are not counted as placements.".into(),
-            "The end-to-end probe uses a separate market and fixed-market WebSocket, so probe deltas are unambiguous.".into(),
-            "Gateway command histograms are cumulative since gateway start; scripts/load-test.sh starts a fresh gateway.".into(),
-            "Loopback HTTP/WS with no TLS, proxy, or injected network delay.".into(),
-        ],
+        setup,
+        fill,
+        notes: fill_notes(&config),
     })
 }
 
-async fn seed_users(http: &Client, config: &LoadConfig) -> LoadResult<()> {
+fn fill_notes(config: &LoadConfig) -> Vec<String> {
+    let mut notes = match config.workload {
+        Workload::PlaceCancel => vec![
+            "Each user slot rests a one-unit buy below the best bid and immediately cancels it; cancels are not counted as placements.".into(),
+        ],
+        Workload::Fills => vec![
+            "Maker asks are seeded before the measured window; offered taker commands and fill rates exclude maker setup.".into(),
+            "Each taker buy crosses pre-rested one-unit maker asks, so one accepted taker command produces one fill.".into(),
+            "Fills are counted from CommandResponse.fills and cross-checked against WebSocket Trade frames.".into(),
+            "The pacer stops at the duration boundary, so acknowledged fills can be a few ticks above or below the nominal target.".into(),
+        ],
+    };
+    notes.push(
+        "The end-to-end probe uses a separate market and fixed-market WebSocket, so probe deltas are unambiguous."
+            .into(),
+    );
+    notes.push(
+        "Gateway command counters include the low-rate probe and are cumulative since gateway start; scripts/load-test.sh starts a fresh gateway."
+            .into(),
+    );
+    notes.push("Loopback HTTP/WS with no TLS, proxy, or injected network delay.".into());
+    notes
+}
+
+async fn seed_place_cancel_users(http: &Client, config: &LoadConfig) -> LoadResult<()> {
     for index in 0..config.users {
         let user_id = config.user_base + index as u64;
         let deposit_id = SEED_CLIENT_BASE + (index as u64) * 2;
@@ -307,12 +373,244 @@ async fn expect_success(response: reqwest::Response, action: &str) -> LoadResult
     Err(load_error(format!("{action} failed with {status}: {body}")))
 }
 
+async fn validate_fill_market(http: &Client, config: &LoadConfig) -> LoadResult<()> {
+    let response = http
+        .get(format!("{}/api/markets", config.base_url))
+        .send()
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(load_error(format!(
+            "market request failed with {status}: {body}"
+        )));
+    }
+    let markets: Vec<MarketView> = response.json().await?;
+    let view = markets
+        .into_iter()
+        .find(|view| view.config.id == config.market_id)
+        .ok_or_else(|| load_error(format!("market {} not found", config.market_id)))?;
+    let market = &view.config;
+
+    if market.status != MarketStatus::Open {
+        return Err(load_error(format!("market {} is not open", market.id)));
+    }
+    if config.fill_passes > market.holding_limit as u64 {
+        return Err(load_error(format!(
+            "--fill-passes {} exceeds market {} holding limit {}",
+            config.fill_passes, market.id, market.holding_limit
+        )));
+    }
+    if !market.price_in_collar(config.fill_price_ticks) {
+        return Err(load_error(format!(
+            "--fill-price-ticks {} is outside market {} collar {}..={}",
+            config.fill_price_ticks,
+            market.id,
+            market.floor_ticks(),
+            market.cap_ticks()
+        )));
+    }
+    if let Some(best_bid) = view.snapshot.bids.first()
+        && config.fill_price_ticks <= best_bid.price_ticks
+    {
+        return Err(load_error(format!(
+            "--fill-price-ticks {} must be above best bid {} so maker asks rest",
+            config.fill_price_ticks, best_bid.price_ticks
+        )));
+    }
+    if let Some(best_ask) = view.snapshot.asks.first()
+        && config.fill_price_ticks >= best_ask.price_ticks
+    {
+        return Err(load_error(format!(
+            "--fill-price-ticks {} must be below best ask {} so maker asks are the first fill",
+            config.fill_price_ticks, best_ask.price_ticks
+        )));
+    }
+
+    let notional = market
+        .notional_minor(config.fill_price_ticks, config.qty)
+        .ok_or_else(|| load_error("fill notional overflow"))?;
+    let fee = market.taker_fee_minor(notional);
+    let per_buy = notional
+        .checked_add(fee)
+        .ok_or_else(|| load_error("fill cash requirement overflow"))?;
+    let passes = i64::try_from(config.fill_passes)
+        .map_err(|_| load_error("--fill-passes does not fit i64"))?;
+    let required_cash = per_buy
+        .checked_mul(passes)
+        .ok_or_else(|| load_error("fill cash requirement overflow"))?;
+    if config.seed_cash < required_cash {
+        return Err(load_error(format!(
+            "--seed-cash {} is below the {} needed for {} taker buys",
+            config.seed_cash, required_cash, config.fill_passes
+        )));
+    }
+    Ok(())
+}
+
+async fn seed_fill_users(http: &Client, config: &LoadConfig) -> LoadResult<()> {
+    let mut users = Vec::with_capacity(config.fill_makers + config.fill_takers);
+    for index in 0..config.fill_takers {
+        users.push((config.user_base + index as u64, false));
+    }
+    for index in 0..config.fill_makers {
+        users.push((
+            config.user_base + config.fill_takers as u64 + index as u64,
+            true,
+        ));
+    }
+
+    let mut tasks = stream::iter(users.into_iter().enumerate().map(
+        |(index, (user_id, maker))| async move {
+            seed_fill_user(http, config, index, user_id, maker).await
+        },
+    ))
+    .buffer_unordered(SEED_CONCURRENCY);
+
+    while let Some(result) = tasks.next().await {
+        result?;
+    }
+    Ok(())
+}
+
+async fn seed_fill_user(
+    http: &Client,
+    config: &LoadConfig,
+    index: usize,
+    user_id: UserId,
+    maker: bool,
+) -> LoadResult<()> {
+    let deposit_id = SEED_CLIENT_BASE + (index as u64) * 2;
+    let response = http
+        .post(format!("{}/api/dev/deposit", config.base_url))
+        .json(&json!({
+            "user_id": user_id,
+            "amount": config.seed_cash,
+            "client_request_id": deposit_id,
+        }))
+        .send()
+        .await?;
+    expect_success(response, "dev deposit").await?;
+
+    if maker {
+        let response = http
+            .post(format!("{}/api/dev/issue", config.base_url))
+            .json(&json!({
+                "user_id": user_id,
+                "market_id": config.market_id,
+                "qty": config.fill_passes,
+                "client_request_id": deposit_id + 1,
+            }))
+            .send()
+            .await?;
+        expect_success(response, "dev issue").await?;
+    }
+    Ok(())
+}
+
+async fn place_maker_liquidity(http: &Client, config: &LoadConfig) -> LoadResult<SetupReport> {
+    let mut orders = Vec::with_capacity(config.fill_makers * config.fill_passes as usize);
+    let mut client_order_id = MAKER_CLIENT_BASE;
+    for index in 0..config.fill_makers {
+        let user_id = config.user_base + config.fill_takers as u64 + index as u64;
+        for _ in 0..config.fill_passes {
+            orders.push((user_id, client_order_id));
+            client_order_id += 1;
+        }
+    }
+
+    let maker_orders = orders.len() as u64;
+    let started = Instant::now();
+    let mut tasks = stream::iter(
+        orders
+            .into_iter()
+            .map(|(user_id, client_order_id)| async move {
+                send_maker_ask(http, config, user_id, client_order_id).await
+            }),
+    )
+    .buffer_unordered(MAKER_SETUP_CONCURRENCY);
+
+    let mut maker_ok = 0;
+    while let Some(result) = tasks.next().await {
+        result?;
+        maker_ok += 1;
+    }
+
+    Ok(SetupReport {
+        maker_orders,
+        maker_ok,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
+async fn send_maker_ask(
+    http: &Client,
+    config: &LoadConfig,
+    user_id: UserId,
+    client_order_id: ClientOrderId,
+) -> LoadResult<()> {
+    for _ in 0..CANCEL_RETRY_LIMIT {
+        let call = send_limit(
+            http,
+            config,
+            user_id,
+            client_order_id,
+            config.market_id,
+            Side::Sell,
+            config.fill_price_ticks,
+            config.qty,
+        )
+        .await;
+        match call.outcome {
+            Ok(response) if response.status == OrderStatus::Rested => return Ok(()),
+            Err(CommandFailure::Http(status, _))
+                if status == StatusCode::TOO_MANY_REQUESTS
+                    || status == StatusCode::SERVICE_UNAVAILABLE =>
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            Err(CommandFailure::Http(status, body)) => {
+                return Err(load_error(format!(
+                    "maker ask HTTP status {status}: {body}"
+                )));
+            }
+            Err(CommandFailure::Transport(error)) => {
+                return Err(load_error(format!("maker ask transport error: {error}")));
+            }
+            Err(CommandFailure::Decode(error)) => {
+                return Err(load_error(format!("maker ask decode error: {error}")));
+            }
+            Ok(response) => {
+                return Err(load_error(format!(
+                    "maker ask status {:?}, expected Rested",
+                    response.status
+                )));
+            }
+        }
+    }
+    Err(load_error("maker ask retry limit exceeded"))
+}
+
+fn fill_taker_work(config: &LoadConfig) -> Vec<UserId> {
+    let mut work = Vec::with_capacity(config.fill_takers * config.fill_passes as usize);
+    for index in 0..config.fill_takers {
+        let user_id = config.user_base + index as u64;
+        for _ in 0..config.fill_passes {
+            work.push(user_id);
+        }
+    }
+    work
+}
+
 fn spawn_pacer(
     config: &LoadConfig,
     mut stop: watch::Receiver<bool>,
 ) -> (mpsc::Receiver<()>, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1);
-    let rate = config.placements_per_second;
+    let rate = match config.workload {
+        Workload::PlaceCancel => config.placements_per_second,
+        Workload::Fills => config.fills_per_second,
+    };
     let handle = tokio::spawn(async move {
         let period = Duration::from_secs_f64(1.0 / rate as f64);
         let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -342,6 +640,7 @@ struct UserTaskStats {
     cancel: OutcomeCounts,
     place_latencies_us: Vec<u64>,
     cancel_latencies_us: Vec<u64>,
+    fills: u64,
 }
 
 impl UserTaskStats {
@@ -350,6 +649,7 @@ impl UserTaskStats {
         self.cancel.merge(other.cancel);
         self.place_latencies_us.extend(other.place_latencies_us);
         self.cancel_latencies_us.extend(other.cancel_latencies_us);
+        self.fills += other.fills;
     }
 }
 
@@ -430,6 +730,122 @@ async fn run_user_task(
     Ok(stats)
 }
 
+async fn run_fill_task(
+    config: LoadConfig,
+    http: Client,
+    work: Arc<Vec<UserId>>,
+    next_work: Arc<AtomicUsize>,
+    tick_rx: Arc<Mutex<mpsc::Receiver<()>>>,
+    place_ids: Arc<AtomicU64>,
+    mut stop: watch::Receiver<bool>,
+) -> LoadResult<UserTaskStats> {
+    let mut stats = UserTaskStats::default();
+
+    loop {
+        let permit = tokio::select! {
+            _ = stop.changed() => break,
+            permit = async {
+                let mut ticks = tick_rx.lock().await;
+                ticks.recv().await
+            } => permit,
+        };
+        if permit.is_none() {
+            break;
+        }
+
+        let work_index = next_work.fetch_add(1, Ordering::Relaxed);
+        let Some(&user_id) = work.get(work_index) else {
+            break;
+        };
+
+        let place_id = place_ids.fetch_add(1, Ordering::Relaxed);
+        let mut success = None;
+        for _ in 0..TAKER_RETRY_LIMIT {
+            let call = send_limit(
+                &http,
+                &config,
+                user_id,
+                place_id,
+                config.market_id,
+                Side::Buy,
+                config.fill_price_ticks,
+                config.qty,
+            )
+            .await;
+            stats.place.attempts += 1;
+
+            match call.outcome {
+                Ok(response) if response.status == OrderStatus::Filled => {
+                    stats.place_latencies_us.push(call.latency_us);
+                    success = Some(response);
+                    break;
+                }
+                Err(CommandFailure::Http(status, _)) if status == StatusCode::TOO_MANY_REQUESTS => {
+                    stats.place.queue_full += 1;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(CommandFailure::Http(status, _))
+                    if status == StatusCode::SERVICE_UNAVAILABLE =>
+                {
+                    stats.place.unavailable += 1;
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Err(CommandFailure::Http(status, body))
+                    if status == StatusCode::UNPROCESSABLE_ENTITY =>
+                {
+                    stats.place.rejected += 1;
+                    return Err(load_error(format!("taker fill rejection: {body}")));
+                }
+                Err(CommandFailure::Http(status, body)) => {
+                    stats.place.http_other += 1;
+                    return Err(load_error(format!(
+                        "taker fill HTTP status {status}: {body}"
+                    )));
+                }
+                Err(CommandFailure::Transport(error)) => {
+                    stats.place.transport_errors += 1;
+                    return Err(load_error(format!("taker fill transport error: {error}")));
+                }
+                Err(CommandFailure::Decode(error)) => {
+                    stats.place.http_other += 1;
+                    return Err(load_error(format!("taker fill decode error: {error}")));
+                }
+                Ok(response) => {
+                    stats.place.unexpected += 1;
+                    return Err(load_error(format!(
+                        "taker fill status {:?}, expected Filled",
+                        response.status
+                    )));
+                }
+            }
+        }
+
+        let Some(response) = success else {
+            stats.place.unexpected += 1;
+            return Err(load_error("taker fill retry limit exceeded"));
+        };
+        if response.filled_qty != config.qty || response.remaining_qty != 0 {
+            stats.place.unexpected += 1;
+            return Err(load_error(format!(
+                "taker fill incomplete: filled {} remaining {}",
+                response.filled_qty, response.remaining_qty
+            )));
+        }
+        if response.fills.len() as u64 != response.filled_qty {
+            stats.place.unexpected += 1;
+            return Err(load_error(format!(
+                "taker fill count mismatch: {} fills for filled qty {}",
+                response.fills.len(),
+                response.filled_qty
+            )));
+        }
+        stats.place.ok += 1;
+        stats.fills += response.fills.len() as u64;
+    }
+
+    Ok(stats)
+}
+
 async fn cancel_with_retry(
     http: &Client,
     config: &LoadConfig,
@@ -499,13 +915,37 @@ async fn send_place(
     user_id: UserId,
     client_order_id: ClientOrderId,
 ) -> CommandCall {
+    send_limit(
+        http,
+        config,
+        user_id,
+        client_order_id,
+        config.market_id,
+        Side::Buy,
+        config.price_ticks,
+        config.qty,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_limit(
+    http: &Client,
+    config: &LoadConfig,
+    user_id: UserId,
+    client_order_id: ClientOrderId,
+    market_id: dx_types::MarketId,
+    side: Side,
+    price_ticks: dx_types::Ticks,
+    qty: dx_types::Qty,
+) -> CommandCall {
     let started = Instant::now();
     let command = Command::PlaceLimit(PlaceLimit {
         client_order_id,
-        market_id: config.market_id,
-        side: Side::Buy,
-        price_ticks: config.price_ticks,
-        qty: config.qty,
+        market_id,
+        side,
+        price_ticks,
+        qty,
     });
     let outcome = match http
         .post(format!("{}/api/orders", config.base_url))
@@ -945,28 +1385,17 @@ async fn send_place_for_probe(
     config: &LoadConfig,
     client_order_id: ClientOrderId,
 ) -> CommandCall {
-    let started = Instant::now();
-    let command = Command::PlaceLimit(PlaceLimit {
+    send_limit(
+        http,
+        config,
+        config.probe_user,
         client_order_id,
-        market_id: config.probe_market_id,
-        side: Side::Buy,
-        price_ticks: config.probe_price_ticks,
-        qty: config.qty,
-    });
-    let outcome = match http
-        .post(format!("{}/api/orders", config.base_url))
-        .header("x-dev-user", config.probe_user.to_string())
-        .json(&command)
-        .send()
-        .await
-    {
-        Ok(response) => decode_response(response).await,
-        Err(error) => Err(CommandFailure::Transport(error.to_string())),
-    };
-    CommandCall {
-        latency_us: started.elapsed().as_micros() as u64,
-        outcome,
-    }
+        config.probe_market_id,
+        Side::Buy,
+        config.probe_price_ticks,
+        config.qty,
+    )
+    .await
 }
 
 async fn send_cancel_for_probe(
