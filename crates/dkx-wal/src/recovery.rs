@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use dkx_hash::hash_log_entry;
 use crate::error::WalError;

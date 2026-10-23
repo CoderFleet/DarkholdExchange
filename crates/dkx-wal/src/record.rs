@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::Read;
 use dkx_hash::hash_log_entry;
 use crate::error::WalError;
 use serde::{Deserialize, Serialize};

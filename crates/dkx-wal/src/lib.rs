@@ -9,3 +9,4 @@ pub use record::*;
 pub use recovery::*;
 pub use snapshot::*;
 pub use writer::*;
+pub use dkx_hash::GENESIS_PREV_HASH;

@@ -85,11 +85,11 @@ impl WalWriter {
 
         self.commit_batch(&batch)?;
 
-        if let Some(gen) = snapshot_generator {
+        if let Some(generator) = snapshot_generator {
             if self.records_since_snapshot >= SNAPSHOT_EVERY_RECORDS
                 || self.last_snapshot_time.elapsed() >= Duration::from_secs(SNAPSHOT_EVERY_SECS)
             {
-                self.take_snapshot(gen)?;
+                self.take_snapshot(generator)?;
             }
         }
 
@@ -147,9 +147,9 @@ impl WalWriter {
 
     pub fn take_snapshot(
         &mut self,
-        gen: &dyn Fn(u64, [u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>),
+        generator: &dyn Fn(u64, [u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>),
     ) -> Result<(), WalError> {
-        let (ledger_bytes, escrow_bytes, engine_bytes) = gen(self.last_seq, self.last_hash);
+        let (ledger_bytes, escrow_bytes, engine_bytes) = generator(self.last_seq, self.last_hash);
         let snap = SnapshotData::new(
             self.last_seq,
             self.last_hash,
