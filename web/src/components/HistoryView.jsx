@@ -97,7 +97,7 @@ export function HistoryView({ wallet, onRefresh }) {
                 </thead>
                 <tbody>
                   {historyItems.map((item, idx) => (
-                    <tr key={item.id ?? idx}>
+                    <tr key={`trade-${item.id ?? 'fill'}-${item.market_id ?? 0}-${idx}`}>
                       <td className="mono muted">{formatTime(item.ts)}</td>
                       <td>
                         <span className="market-badge">{item.event_name || `M#${item.market_id}`}</span>
@@ -150,7 +150,7 @@ export function HistoryView({ wallet, onRefresh }) {
                 </thead>
                 <tbody>
                   {statementItems.map((st, idx) => (
-                    <tr key={st.id ?? idx}>
+                    <tr key={`stmt-${st.id ?? 'entry'}-${idx}`}>
                       <td className="mono text-purple">#{st.id}</td>
                       <td className="mono muted">{formatTime(st.ts)}</td>
                       <td>

@@ -46,12 +46,8 @@ export const useWalletStore = create((set, get) => ({
     set({ topupLoading: true, error: null })
     try {
       await topupWallet(userId, amountPaise)
-      // Optimistically update cash and then sync full wallet
-      set((state) => ({
-        cashAvail: state.cashAvail + amountPaise,
-        topupLoading: false,
-      }))
       await get().fetchWallet()
+      set({ topupLoading: false })
     } catch (err) {
       set({ error: err.message, topupLoading: false })
       throw err
@@ -84,18 +80,22 @@ export const useWalletStore = create((set, get) => ({
     }
   },
 
-  updateFromBalances: (balances) => {
+  updateFromBalances: (balances, markets = []) => {
+    const marketMap = Object.fromEntries((markets || []).map((m) => [m.id, m]))
     const cash = balances.find((b) => b.asset.kind === 'cash')
     const passBalances = balances
       .filter((b) => b.asset.kind === 'pass')
-      .map((b) => ({
-        market_id: b.asset.market_id,
-        event_name: `Market #${b.asset.market_id}`,
-        tier_name: 'General',
-        avail: b.available,
-        locked: b.held,
-        held: 0,
-      }))
+      .map((b) => {
+        const m = marketMap[b.asset.market_id]
+        return {
+          market_id: b.asset.market_id,
+          event_name: m?.name ?? `Market #${b.asset.market_id}`,
+          tier_name: m ? `Event #${m.event_id}` : 'General',
+          avail: b.available,
+          locked: b.held,
+          held: 0,
+        }
+      })
 
     set({
       cashAvail: cash?.available ?? 0,

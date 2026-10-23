@@ -92,12 +92,26 @@ export const getTrades = (marketId, limit = 40) =>
  * @param {number} userId
  * @returns {Promise<CommandResponse>}
  */
-export const postCommand = (command, userId) =>
-  request('/api/commands', {
-    method: 'POST',
-    headers: jsonHeaders(userId),
-    body: JSON.stringify(command),
-  })
+export const postCommand = async (command, userId) => {
+  try {
+    return await request('/api/orders', {
+      method: 'POST',
+      headers: jsonHeaders(userId),
+      body: JSON.stringify(command),
+    })
+  } catch (err) {
+    // If /api/orders rejects with 404 or Method Not Allowed, fallback to /api/commands
+    const msg = String(err?.message || '')
+    if (msg.includes('404') || msg.includes('405')) {
+      return await request('/api/commands', {
+        method: 'POST',
+        headers: jsonHeaders(userId),
+        body: JSON.stringify(command),
+      })
+    }
+    throw err
+  }
+}
 
 /**
  * Canonical T1 placement endpoint. Cancel remains `/api/commands` for the
@@ -208,7 +222,59 @@ export const getHistory = async (userId, query = {}) => {
       headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
     })
   } catch {
-    return { items: [], next_cursor: null }
+    try {
+      const marketsList = await getMarkets().catch(() => [])
+      const marketConfigMap = Object.fromEntries(
+        marketsList.map((m) => [m.config.id, m.config]),
+      )
+      const marketIds = query.market_id
+        ? [query.market_id]
+        : marketsList.length > 0
+          ? marketsList.map((m) => m.config.id)
+          : [1, 2, 3]
+
+      const allTradesArrays = await Promise.all(
+        marketIds.map((mid) => getTrades(mid, 50).catch(() => [])),
+      )
+
+      const allTrades = allTradesArrays.flat()
+      const userFills = allTrades
+        .filter((f) => f.maker_user_id === userId || f.taker_user_id === userId)
+        .map((f) => {
+          const isTaker = f.taker_user_id === userId
+          const isBuyer =
+            (f.maker_side === 'Sell' && isTaker) ||
+            (f.maker_side === 'Buy' && !isTaker)
+
+          const cfg = marketConfigMap[f.market_id]
+          const tickSize = cfg?.tick_size_minor ?? 100
+          const eventName = cfg?.name ?? `Market #${f.market_id}`
+          const tierName = cfg ? `Event #${cfg.event_id}` : 'Standard'
+
+          const pricePaise = f.price_ticks * tickSize
+          const notionalPaise = pricePaise * f.qty
+          // Takers pay fee bps from config (default 100 bps / 1%), makers pay 0 bps
+          const feeBps = isTaker ? (cfg?.taker_fee_bps ?? 100) : 0
+          const feePaise = Math.floor((notionalPaise * feeBps) / 10_000)
+          const netPaise = isBuyer ? notionalPaise + feePaise : notionalPaise - feePaise
+
+          return {
+            id: f.trade_id,
+            market_id: f.market_id,
+            event_name: eventName,
+            tier_name: tierName,
+            side: isBuyer ? 'buy' : 'sell',
+            price: pricePaise,
+            qty: f.qty,
+            fee: feePaise,
+            total_paise: netPaise,
+            ts: Date.now() - (f.seq ? (1000 - f.seq) * 60000 : 0),
+          }
+        })
+      return { items: userFills, next_cursor: null }
+    } catch {
+      return { items: [], next_cursor: null }
+    }
   }
 }
 

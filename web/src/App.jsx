@@ -55,8 +55,8 @@ function App() {
     ])
     setBalances(nextBalances)
     setOpenOrders(nextOrders)
-    wallet.updateFromBalances(nextBalances)
-  }, [wallet])
+    wallet.updateFromBalances(nextBalances, markets)
+  }, [wallet, markets])
 
   const loadTrades = useCallback(async (marketId) => {
     if (marketId == null) return
