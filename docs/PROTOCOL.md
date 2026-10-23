@@ -414,7 +414,13 @@ snapshot, and reads the recent tape without a command publishing in between. Cac
 commands publish nothing. Snapshots remain reserved for baselines, subscription changes, and lag
 recovery.
 
+The writer also keeps a lazy max-depth (200) snapshot cache per market. Book deltas and fills
+invalidate the affected market; the next snapshot request rebuilds it from the core. Baselines,
+resyncs, REST book reads, and market views slice the cached top levels instead of rebuilding the
+same book for every client. WebSocket sends coalesce already-ready messages into bounded batches
+(64 messages or 256 KiB) and flush once per batch; message types, ordering, filtering, and the
+one-message-per-frame contract are unchanged.
+
 Still pending in the T1 runtime:
 
-- Batched publisher and cached resync snapshots
 - Frontend worker/store migration to the canonical feed

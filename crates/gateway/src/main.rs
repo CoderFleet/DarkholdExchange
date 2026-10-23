@@ -24,8 +24,10 @@ use dx_types::{
     OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
     WsServerMessage, seed_markets,
 };
+use futures_util::SinkExt;
 use serde::Deserialize;
 use tokio::sync::broadcast;
+use tokio::sync::broadcast::error::TryRecvError;
 use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer};
 
 #[derive(Clone)]
@@ -434,6 +436,9 @@ async fn stream_baseline(
         .map_err(writer_error)
 }
 
+const WS_MAX_BATCH_MESSAGES: usize = 64;
+const WS_MAX_BATCH_BYTES: usize = 256 * 1024;
+
 async fn handle_socket(
     mut socket: WebSocket,
     state: AppState,
@@ -453,36 +458,28 @@ async fn handle_socket(
     };
     let mut rx = baseline.rx;
 
-    if !send_msg(
-        &mut socket,
-        &WsServerMessage::Hello {
-            markets: baseline.markets,
-            user_id,
-        },
-    )
-    .await
-    {
-        return;
-    }
-
-    for snapshot in baseline.snapshots {
-        if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
-            return;
-        }
-    }
-    for fill in baseline.recent_trades {
-        if !send_msg(&mut socket, &WsServerMessage::Trade { fill }).await {
-            return;
-        }
-    }
-    if !send_msg(
-        &mut socket,
-        &WsServerMessage::Metrics {
-            metrics: metrics_snapshot(&state),
-        },
-    )
-    .await
-    {
+    let mut initial =
+        Vec::with_capacity(2 + baseline.snapshots.len() + baseline.recent_trades.len());
+    initial.push(WsServerMessage::Hello {
+        markets: baseline.markets,
+        user_id,
+    });
+    initial.extend(
+        baseline
+            .snapshots
+            .into_iter()
+            .map(|snapshot| WsServerMessage::Snapshot { snapshot }),
+    );
+    initial.extend(
+        baseline
+            .recent_trades
+            .into_iter()
+            .map(|fill| WsServerMessage::Trade { fill }),
+    );
+    initial.push(WsServerMessage::Metrics {
+        metrics: metrics_snapshot(&state),
+    });
+    if !send_batch(&mut socket, initial).await {
         return;
     }
 
@@ -503,10 +500,13 @@ async fn handle_socket(
                                     return;
                                 };
                                 rx = baseline.rx;
-                                for snapshot in baseline.snapshots {
-                                    if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
-                                        return;
-                                    }
+                                let snapshots: Vec<WsServerMessage> = baseline
+                                    .snapshots
+                                    .into_iter()
+                                    .map(|snapshot| WsServerMessage::Snapshot { snapshot })
+                                    .collect();
+                                if !send_batch(&mut socket, snapshots).await {
+                                    return;
                                 }
                             }
                             Ok(WsClientMessage::Ping) => {
@@ -532,43 +532,97 @@ async fn handle_socket(
             broadcast = rx.recv() => {
                 match broadcast {
                     Ok(message) => {
-                        let Some(message) = filter_message(message, market_filter.as_deref(), depth) else {
-                            continue;
-                        };
-                        if !send_msg(&mut socket, &message).await {
+                        let mut batch = Vec::with_capacity(WS_MAX_BATCH_MESSAGES);
+                        if let Some(message) = filter_message(message, market_filter.as_deref(), depth) {
+                            batch.push(message);
+                        }
+
+                        let mut lagged = None;
+                        for _ in 1..WS_MAX_BATCH_MESSAGES {
+                            match rx.try_recv() {
+                                Ok(message) => {
+                                    if let Some(message) =
+                                        filter_message(message, market_filter.as_deref(), depth)
+                                    {
+                                        batch.push(message);
+                                    }
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Lagged(skipped)) => {
+                                    lagged = Some(skipped);
+                                    break;
+                                }
+                                Err(TryRecvError::Closed) => return,
+                            }
+                        }
+
+                        if !batch.is_empty() && !send_batch(&mut socket, batch).await {
                             return;
+                        }
+                        if let Some(skipped) = lagged {
+                            let Some(new_rx) = resync_socket(
+                                &state,
+                                &mut socket,
+                                market_filter.as_deref(),
+                                depth,
+                                skipped,
+                            )
+                            .await
+                            else {
+                                return;
+                            };
+                            rx = new_rx;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        eprintln!("ws client lagged by {skipped} messages; resyncing");
-                        state.metrics.slow_consumers.fetch_add(1, Ordering::Relaxed);
-                        let Ok(baseline) =
-                            stream_baseline(&state, market_filter.as_deref(), depth).await
+                        let Some(new_rx) = resync_socket(
+                            &state,
+                            &mut socket,
+                            market_filter.as_deref(),
+                            depth,
+                            skipped,
+                        )
+                        .await
                         else {
                             return;
                         };
-                        rx = baseline.rx;
-                        for market in &baseline.markets {
-                            if !send_msg(
-                                &mut socket,
-                                &WsServerMessage::ResyncRequired { market_id: market.id },
-                            )
-                            .await
-                            {
-                                return;
-                            }
-                        }
-                        for snapshot in baseline.snapshots {
-                            if !send_msg(&mut socket, &WsServerMessage::Snapshot { snapshot }).await {
-                                return;
-                            }
-                        }
+                        rx = new_rx;
                     }
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
         }
     }
+}
+
+async fn resync_socket(
+    state: &AppState,
+    socket: &mut WebSocket,
+    market_filter: Option<&[MarketId]>,
+    depth: usize,
+    skipped: u64,
+) -> Option<broadcast::Receiver<WsServerMessage>> {
+    eprintln!("ws client lagged by {skipped} messages; resyncing");
+    state.metrics.slow_consumers.fetch_add(1, Ordering::Relaxed);
+
+    let baseline = stream_baseline(state, market_filter, depth).await.ok()?;
+    let mut messages = Vec::with_capacity(baseline.markets.len() + baseline.snapshots.len());
+    for market in &baseline.markets {
+        messages.push(WsServerMessage::ResyncRequired {
+            market_id: market.id,
+        });
+    }
+    messages.extend(
+        baseline
+            .snapshots
+            .into_iter()
+            .map(|snapshot| WsServerMessage::Snapshot { snapshot }),
+    );
+
+    if !send_batch(socket, messages).await {
+        return None;
+    }
+    Some(baseline.rx)
 }
 
 fn filter_message(
@@ -605,6 +659,44 @@ fn filter_message(
         }
         other => Some(other),
     }
+}
+
+async fn send_batch(
+    socket: &mut WebSocket,
+    messages: impl IntoIterator<Item = WsServerMessage>,
+) -> bool {
+    let mut batch_messages = 0usize;
+    let mut batch_bytes = 0usize;
+
+    for message in messages {
+        let Ok(bytes) = rmp_serde::to_vec_named(&message) else {
+            eprintln!("failed to encode ws message");
+            return false;
+        };
+        let bytes_len = bytes.len();
+
+        if batch_messages > 0
+            && (batch_messages >= WS_MAX_BATCH_MESSAGES
+                || batch_bytes.saturating_add(bytes_len) > WS_MAX_BATCH_BYTES)
+        {
+            if socket.flush().await.is_err() {
+                return false;
+            }
+            batch_messages = 0;
+            batch_bytes = 0;
+        }
+
+        if socket.feed(Message::Binary(bytes.into())).await.is_err() {
+            return false;
+        }
+        batch_messages += 1;
+        batch_bytes = batch_bytes.saturating_add(bytes_len);
+    }
+
+    if batch_messages == 0 {
+        return true;
+    }
+    socket.flush().await.is_ok()
 }
 
 async fn send_msg(socket: &mut WebSocket, message: &WsServerMessage) -> bool {
@@ -912,6 +1004,9 @@ mod tests {
         assert_eq!(snapshot.book_seq, 1);
         let mut rx = baseline.rx;
 
+        let repeat = stream_baseline(&state, Some(&[MARKET]), 10).await.unwrap();
+        assert_eq!(repeat.snapshots[0], snapshot);
+
         let response = run_command(&state, 1, market_order(1, Side::Buy, 1)).await;
         assert_eq!(response.status, OrderStatus::Filled);
 
@@ -927,7 +1022,11 @@ mod tests {
         snapshot.last_trade_price = Some(fill.price_ticks);
 
         let expected = state.writer.snapshot(MARKET, 10).await.unwrap();
-        assert_eq!(Some(snapshot), expected);
+        assert_eq!(Some(snapshot.clone()), expected);
+
+        let after = stream_baseline(&state, Some(&[MARKET]), 10).await.unwrap();
+        assert_eq!(after.snapshots[0], snapshot);
+        assert_eq!(after.snapshots[0].book_seq, 2);
     }
 
     #[tokio::test]

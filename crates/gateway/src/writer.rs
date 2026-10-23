@@ -6,6 +6,7 @@
 //! queue order the commit order and keeps snapshots synchronized with the event
 //! stream without a core mutex.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -21,6 +22,7 @@ use tokio::sync::{broadcast, oneshot};
 
 pub(crate) const RECENT_TRADES_LIMIT: usize = 200;
 const BASELINE_TRADES_LIMIT: usize = 20;
+const SNAPSHOT_CACHE_DEPTH: usize = 200;
 const MAX_LATENCY_US: u64 = 60_000_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,39 @@ pub(crate) struct StreamBaseline {
     pub(crate) markets: Vec<MarketConfig>,
     pub(crate) snapshots: Vec<BookSnapshot>,
     pub(crate) recent_trades: Vec<Fill>,
+}
+
+/// Cached max-depth snapshots owned by the writer.
+///
+/// Entries are invalidated by book or last-trade changes and rebuilt lazily by
+/// the next snapshot request. Serving a shallower depth only slices the cached
+/// top levels, so one entry can answer every public depth up to the cache depth.
+#[derive(Default)]
+struct SnapshotCache {
+    entries: HashMap<MarketId, BookSnapshot>,
+}
+
+impl SnapshotCache {
+    fn invalidate(&mut self, market_id: MarketId) {
+        self.entries.remove(&market_id);
+    }
+
+    fn snapshot(&mut self, core: &Core, market_id: MarketId, depth: usize) -> Option<BookSnapshot> {
+        let depth = depth.clamp(1, SNAPSHOT_CACHE_DEPTH);
+        if let std::collections::hash_map::Entry::Vacant(entry) = self.entries.entry(market_id) {
+            let snapshot = core.snapshot(market_id, SNAPSHOT_CACHE_DEPTH)?;
+            entry.insert(snapshot);
+        }
+
+        let cached = self.entries.get(&market_id)?;
+        Some(BookSnapshot {
+            market_id: cached.market_id,
+            book_seq: cached.book_seq,
+            bids: cached.bids.iter().take(depth).cloned().collect(),
+            asks: cached.asks.iter().take(depth).cloned().collect(),
+            last_trade_price: cached.last_trade_price,
+        })
+    }
 }
 
 enum WriterRequest {
@@ -335,6 +370,7 @@ fn writer_loop(
     metrics: Arc<MetricsState>,
     jobs: Receiver<WriterJob>,
 ) {
+    let mut snapshot_cache = SnapshotCache::default();
     while let Ok(job) = jobs.recv() {
         metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
         let enqueued_at = job.enqueued_at;
@@ -354,6 +390,7 @@ fn writer_loop(
                 let publish = !outcome.cached && outcome.response.status != OrderStatus::Rejected;
                 if publish {
                     for delta in &outcome.deltas {
+                        snapshot_cache.invalidate(delta.market_id);
                         let _ = tx.send(WsServerMessage::Delta {
                             delta: delta.clone(),
                         });
@@ -368,6 +405,7 @@ fn writer_loop(
                     }
 
                     for fill in &outcome.response.fills {
+                        snapshot_cache.invalidate(fill.market_id);
                         let _ = tx.send(WsServerMessage::Trade { fill: fill.clone() });
                     }
                 }
@@ -387,7 +425,7 @@ fn writer_loop(
                     .into_iter()
                     .filter_map(|market_id| {
                         let config = core.config(market_id)?.clone();
-                        let snapshot = core.snapshot(market_id, 20)?;
+                        let snapshot = snapshot_cache.snapshot(&core, market_id, 20)?;
                         Some(MarketView { config, snapshot })
                     })
                     .collect();
@@ -398,7 +436,7 @@ fn writer_loop(
                 depth,
                 reply,
             } => {
-                let _ = reply.send(core.snapshot(market_id, depth));
+                let _ = reply.send(snapshot_cache.snapshot(&core, market_id, depth));
             }
             WriterRequest::Trades {
                 market_id,
@@ -475,7 +513,7 @@ fn writer_loop(
                     .collect();
                 let snapshots = market_ids
                     .iter()
-                    .filter_map(|market_id| core.snapshot(*market_id, depth))
+                    .filter_map(|market_id| snapshot_cache.snapshot(&core, *market_id, depth))
                     .collect();
                 let recent_trades = recent_trades_for(
                     &recent_trades,
@@ -512,6 +550,17 @@ fn recent_trades_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dx_types::{PlaceLimit, PlaceMarket, Side, seed_markets};
+
+    const MARKET: MarketId = 1;
+
+    fn funded_core() -> Core {
+        let mut core = Core::new(seed_markets()).unwrap();
+        core.deposit_cash(1, 10_000_000, 1).unwrap();
+        core.deposit_cash(2, 10_000_000, 2).unwrap();
+        core.issue_passes(2, MARKET, 5, 1).unwrap();
+        core
+    }
 
     #[test]
     fn queue_full_is_reported_without_blocking() {
@@ -556,5 +605,76 @@ mod tests {
         assert!(queue_wait_p99 >= 990, "{queue_wait_p99}");
         assert!(core_p99 >= 99, "{core_p99}");
         assert_eq!(metrics.latency_samples(), 100);
+    }
+
+    #[test]
+    fn snapshot_cache_matches_core_at_every_public_depth() {
+        let mut core = funded_core();
+        let mut cache = SnapshotCache::default();
+
+        for depth in [1, 20, 200] {
+            assert_eq!(
+                cache.snapshot(&core, MARKET, depth),
+                core.snapshot(MARKET, depth)
+            );
+        }
+
+        let response = core.process(
+            2,
+            Command::PlaceLimit(PlaceLimit {
+                client_order_id: 1,
+                market_id: MARKET,
+                side: Side::Sell,
+                price_ticks: 5_000,
+                qty: 2,
+            }),
+        );
+        assert_eq!(response.status, OrderStatus::Rested);
+        cache.invalidate(MARKET);
+
+        for depth in [1, 20, 200] {
+            assert_eq!(
+                cache.snapshot(&core, MARKET, depth),
+                core.snapshot(MARKET, depth)
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_cache_refreshes_last_trade_price_after_a_fill() {
+        let mut core = funded_core();
+        let mut cache = SnapshotCache::default();
+
+        let ask = core.process(
+            2,
+            Command::PlaceLimit(PlaceLimit {
+                client_order_id: 2,
+                market_id: MARKET,
+                side: Side::Sell,
+                price_ticks: 5_000,
+                qty: 1,
+            }),
+        );
+        assert_eq!(ask.status, OrderStatus::Rested);
+        cache.invalidate(MARKET);
+        let before = cache.snapshot(&core, MARKET, 20).unwrap();
+
+        let buy = core.process(
+            1,
+            Command::PlaceMarket(PlaceMarket {
+                client_order_id: 3,
+                market_id: MARKET,
+                side: Side::Buy,
+                qty: 1,
+                protect_price_ticks: 5_000,
+            }),
+        );
+        assert_eq!(buy.status, OrderStatus::Filled);
+        cache.invalidate(MARKET);
+
+        let after = cache.snapshot(&core, MARKET, 20).unwrap();
+        assert_eq!(after.last_trade_price, Some(5_000));
+        assert_ne!(before.book_seq, after.book_seq);
+        assert_eq!(Some(after), core.snapshot(MARKET, 20));
     }
 }
