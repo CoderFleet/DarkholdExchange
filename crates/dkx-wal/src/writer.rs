@@ -90,9 +90,9 @@ impl WalWriter {
         if let Some(generator) = snapshot_generator
             && (self.records_since_snapshot >= SNAPSHOT_EVERY_RECORDS
                 || self.last_snapshot_time.elapsed() >= Duration::from_secs(SNAPSHOT_EVERY_SECS))
-            {
-                self.take_snapshot(generator)?;
-            }
+        {
+            self.take_snapshot(generator)?;
+        }
 
         Ok(true)
     }

@@ -79,9 +79,10 @@ impl Ledger {
             return;
         }
         if self.idem_order.len() >= MAX_IDEMPOTENCY_ENTRIES
-            && let Some(old) = self.idem_order.pop_front() {
-                self.idem_results.remove(&old);
-            }
+            && let Some(old) = self.idem_order.pop_front()
+        {
+            self.idem_results.remove(&old);
+        }
         self.idem_order.push_back(key);
         self.idem_results.insert(key, res);
     }
@@ -555,13 +556,15 @@ impl Ledger {
         }
         for (account, &actual) in &self.balances {
             if let Account::CashLocked(user) = account
-                && !expected_cash_locked.contains_key(user) && actual != 0 {
-                    violations.push(Violation::ReservationMismatch {
-                        account: *account,
-                        account_locked: actual,
-                        sum_reservations: 0,
-                    });
-                }
+                && !expected_cash_locked.contains_key(user)
+                && actual != 0
+            {
+                violations.push(Violation::ReservationMismatch {
+                    account: *account,
+                    account_locked: actual,
+                    sum_reservations: 0,
+                });
+            }
         }
 
         for (&(user, market), &exp) in &expected_pass_locked {
@@ -576,13 +579,15 @@ impl Ledger {
         }
         for (account, &actual) in &self.balances {
             if let Account::PassLocked(user, market) = account
-                && !expected_pass_locked.contains_key(&(*user, *market)) && actual != 0 {
-                    violations.push(Violation::ReservationMismatch {
-                        account: *account,
-                        account_locked: actual,
-                        sum_reservations: 0,
-                    });
-                }
+                && !expected_pass_locked.contains_key(&(*user, *market))
+                && actual != 0
+            {
+                violations.push(Violation::ReservationMismatch {
+                    account: *account,
+                    account_locked: actual,
+                    sum_reservations: 0,
+                });
+            }
         }
 
         violations

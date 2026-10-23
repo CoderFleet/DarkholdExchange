@@ -305,9 +305,10 @@ async fn get_history(
         let side = if is_buyer { "buy" } else { "sell" };
 
         if let Some(ref req_side) = query.side
-            && req_side != side {
-                continue;
-            }
+            && req_side != side
+        {
+            continue;
+        }
 
         let (event_name, tier_name) = market_lookup_stub(market_id as u32);
         let total_paise = (price * qty) + if is_buyer { 0 } else { -fee };
@@ -478,21 +479,23 @@ where
         // Authenticate via Authorization Bearer or simulated header x-user-id
         if let Some(auth_val) = parts.headers.get("x-user-id")
             && let Ok(uid_str) = auth_val.to_str()
-                && let Ok(user_id) = uid_str.parse::<u64>() {
-                    return Ok(AuthUser {
-                        user_id,
-                        role: crate::auth::Role::User,
-                    });
-                }
+            && let Ok(user_id) = uid_str.parse::<u64>()
+        {
+            return Ok(AuthUser {
+                user_id,
+                role: crate::auth::Role::User,
+            });
+        }
         if let Some(auth_val) = parts.headers.get("authorization")
             && let Ok(token) = auth_val.to_str()
-                && token.starts_with("Bearer ") {
-                    // Default simulated user for demo JWT
-                    return Ok(AuthUser {
-                        user_id: 1,
-                        role: crate::auth::Role::User,
-                    });
-                }
+            && token.starts_with("Bearer ")
+        {
+            // Default simulated user for demo JWT
+            return Ok(AuthUser {
+                user_id: 1,
+                role: crate::auth::Role::User,
+            });
+        }
 
         // Default demo fallback user 1 if running locally
         Ok(AuthUser {
