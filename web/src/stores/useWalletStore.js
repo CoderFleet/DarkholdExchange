@@ -83,19 +83,20 @@ export const useWalletStore = create((set, get) => ({
   updateFromBalances: (balances, markets = []) => {
     const marketMap = Object.fromEntries((markets || []).map((m) => [m.id, m]))
     const cash = balances.find((b) => b.asset.kind === 'cash')
-    const passBalances = balances
-      .filter((b) => b.asset.kind === 'pass')
-      .map((b) => {
-        const m = marketMap[b.asset.market_id]
-        return {
+    const passBalances = balances.flatMap((b) => {
+      if (b.asset.kind !== 'pass') return []
+      const m = marketMap[b.asset.market_id]
+      return [
+        {
           market_id: b.asset.market_id,
           event_name: m?.name ?? `Market #${b.asset.market_id}`,
           tier_name: m ? `Event #${m.event_id}` : 'General',
           avail: b.available,
           locked: b.held,
           held: 0,
-        }
-      })
+        },
+      ]
+    })
 
     set({
       cashAvail: cash?.available ?? 0,

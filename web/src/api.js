@@ -101,7 +101,7 @@ export const postCommand = async (command, userId) => {
     })
   } catch (err) {
     // If /api/orders rejects with 404 or Method Not Allowed, fallback to /api/commands
-    const msg = String(err?.message || '')
+    const msg = err instanceof Error ? err.message : String(err ?? '')
     if (msg.includes('404') || msg.includes('405')) {
       return await request('/api/commands', {
         method: 'POST',
@@ -153,16 +153,19 @@ export const getWallet = async (userId) => {
     // Graceful fallback to gateway balance endpoint if projection worker is not standalone
     const rawBalances = await getBalances(userId)
     const cash = rawBalances.find((b) => b.asset.kind === 'cash')
-    const passes = rawBalances
-      .filter((b) => b.asset.kind === 'pass')
-      .map((b) => ({
-        market_id: b.asset.market_id,
-        event_name: `Market #${b.asset.market_id}`,
-        tier_name: 'General',
-        avail: b.available,
-        locked: b.held,
-        held: 0,
-      }))
+    const passes = rawBalances.flatMap((b) => {
+      if (b.asset.kind !== 'pass') return []
+      return [
+        {
+          market_id: b.asset.market_id,
+          event_name: `Market #${b.asset.market_id}`,
+          tier_name: 'General',
+          avail: b.available,
+          locked: b.held,
+          held: 0,
+        },
+      ]
+    })
     return {
       user_id: userId,
       cash_avail: cash?.available ?? 0,
