@@ -32,10 +32,10 @@ pub struct MerklePathStep {
 /// All integers big-endian.
 pub fn hash_merkle_leaf(salt: &[u8; 16], user_id: u64, balance: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(&[MERKLE_LEAF_PREFIX]);
+    hasher.update([MERKLE_LEAF_PREFIX]);
     hasher.update(salt);
-    hasher.update(&user_id.to_be_bytes());
-    hasher.update(&balance.to_be_bytes());
+    hasher.update(user_id.to_be_bytes());
+    hasher.update(balance.to_be_bytes());
 
     let output = hasher.finalize();
     let mut hash = [0u8; 32];
@@ -59,11 +59,11 @@ pub fn hash_merkle_node(
     };
 
     let mut hasher = Sha256::new();
-    hasher.update(&[MERKLE_NODE_PREFIX]);
+    hasher.update([MERKLE_NODE_PREFIX]);
     hasher.update(left_hash);
-    hasher.update(&left_sum.to_be_bytes());
+    hasher.update(left_sum.to_be_bytes());
     hasher.update(right_hash);
-    hasher.update(&right_sum.to_be_bytes());
+    hasher.update(right_sum.to_be_bytes());
 
     let output = hasher.finalize();
     let mut hash = [0u8; 32];

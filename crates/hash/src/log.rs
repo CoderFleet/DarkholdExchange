@@ -24,11 +24,11 @@ pub fn hash_log_entry(
 
     let mut hasher = Sha256::new();
     hasher.update(LOG_PREFIX);
-    hasher.update(&seq.to_be_bytes());
-    hasher.update(&ts_micros.to_be_bytes());
+    hasher.update(seq.to_be_bytes());
+    hasher.update(ts_micros.to_be_bytes());
     hasher.update(prev);
-    hasher.update(&[kind]);
-    hasher.update(&payload_len.to_be_bytes());
+    hasher.update([kind]);
+    hasher.update(payload_len.to_be_bytes());
     hasher.update(payload);
 
     let output = hasher.finalize();

@@ -37,14 +37,12 @@ pub fn recover(dir: impl AsRef<Path>) -> Result<RecoveredState, WalError> {
 
     let mut latest_valid_snap: Option<SnapshotData> = None;
     while let Some(snap_path) = snapshots.pop() {
-        if let Ok(bytes) = fs::read(&snap_path) {
-            if let Ok(snap) = rmp_serde::from_slice::<SnapshotData>(&bytes) {
-                if snap.verify().is_ok() {
+        if let Ok(bytes) = fs::read(&snap_path)
+            && let Ok(snap) = rmp_serde::from_slice::<SnapshotData>(&bytes)
+                && snap.verify().is_ok() {
                     latest_valid_snap = Some(snap);
                     break;
                 }
-            }
-        }
     }
 
     let (mut start_seq, mut current_hash) = match &latest_valid_snap {

@@ -263,6 +263,7 @@ async fn post_topup(
     }))
 }
 
+#[allow(clippy::type_complexity)]
 async fn get_history(
     State(state): State<ApiState>,
     auth: AuthUser,
@@ -303,11 +304,10 @@ async fn get_history(
         let is_buyer = buyer_id == auth.user_id as i64;
         let side = if is_buyer { "buy" } else { "sell" };
 
-        if let Some(ref req_side) = query.side {
-            if req_side != side {
+        if let Some(ref req_side) = query.side
+            && req_side != side {
                 continue;
             }
-        }
 
         let (event_name, tier_name) = market_lookup_stub(market_id as u32);
         let total_paise = (price * qty) + if is_buyer { 0 } else { -fee };
@@ -476,27 +476,23 @@ where
         _state: &S,
     ) -> Result<Self, Self::Rejection> {
         // Authenticate via Authorization Bearer or simulated header x-user-id
-        if let Some(auth_val) = parts.headers.get("x-user-id") {
-            if let Ok(uid_str) = auth_val.to_str() {
-                if let Ok(user_id) = uid_str.parse::<u64>() {
+        if let Some(auth_val) = parts.headers.get("x-user-id")
+            && let Ok(uid_str) = auth_val.to_str()
+                && let Ok(user_id) = uid_str.parse::<u64>() {
                     return Ok(AuthUser {
                         user_id,
                         role: crate::auth::Role::User,
                     });
                 }
-            }
-        }
-        if let Some(auth_val) = parts.headers.get("authorization") {
-            if let Ok(token) = auth_val.to_str() {
-                if token.starts_with("Bearer ") {
+        if let Some(auth_val) = parts.headers.get("authorization")
+            && let Ok(token) = auth_val.to_str()
+                && token.starts_with("Bearer ") {
                     // Default simulated user for demo JWT
                     return Ok(AuthUser {
                         user_id: 1,
                         role: crate::auth::Role::User,
                     });
                 }
-            }
-        }
 
         // Default demo fallback user 1 if running locally
         Ok(AuthUser {

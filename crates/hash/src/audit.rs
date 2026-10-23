@@ -29,13 +29,13 @@ pub fn hash_audit_entry(
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(AUDIT_PREFIX);
-    hasher.update(&seq.to_be_bytes());
-    hasher.update(&ts_micros.to_be_bytes());
+    hasher.update(seq.to_be_bytes());
+    hasher.update(ts_micros.to_be_bytes());
     hasher.update(prev);
-    hasher.update(&[kind]);
-    hasher.update(&market.to_be_bytes());
-    hasher.update(&qty.to_be_bytes());
-    hasher.update(&price.to_be_bytes());
+    hasher.update([kind]);
+    hasher.update(market.to_be_bytes());
+    hasher.update(qty.to_be_bytes());
+    hasher.update(price.to_be_bytes());
 
     let output = hasher.finalize();
     let mut hash = [0u8; 32];

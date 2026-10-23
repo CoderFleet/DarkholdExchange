@@ -17,6 +17,7 @@ pub const MAX_SEGMENT_SIZE_BYTES: u64 = 64 * 1024 * 1024; // 64 MB
 pub const SNAPSHOT_EVERY_RECORDS: u64 = 10_000;
 pub const SNAPSHOT_EVERY_SECS: u64 = 60;
 
+#[allow(clippy::type_complexity)]
 pub struct WalWriter {
     base_dir: PathBuf,
     durable_seq: Arc<AtomicU64>,
@@ -56,6 +57,7 @@ impl WalWriter {
         })
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn run_loop_step(
         &mut self,
         snapshot_generator: Option<&dyn Fn(u64, [u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>)>,
@@ -85,13 +87,12 @@ impl WalWriter {
 
         self.commit_batch(&batch)?;
 
-        if let Some(generator) = snapshot_generator {
-            if self.records_since_snapshot >= SNAPSHOT_EVERY_RECORDS
-                || self.last_snapshot_time.elapsed() >= Duration::from_secs(SNAPSHOT_EVERY_SECS)
+        if let Some(generator) = snapshot_generator
+            && (self.records_since_snapshot >= SNAPSHOT_EVERY_RECORDS
+                || self.last_snapshot_time.elapsed() >= Duration::from_secs(SNAPSHOT_EVERY_SECS))
             {
                 self.take_snapshot(generator)?;
             }
-        }
 
         Ok(true)
     }
@@ -142,6 +143,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn take_snapshot(
         &mut self,
         generator: &dyn Fn(u64, [u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>),

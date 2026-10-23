@@ -21,13 +21,13 @@ impl SnapshotData {
         engine_bytes: Vec<u8>,
     ) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(&last_seq.to_be_bytes());
-        hasher.update(&last_hash);
-        hasher.update(&(ledger_bytes.len() as u32).to_be_bytes());
+        hasher.update(last_seq.to_be_bytes());
+        hasher.update(last_hash);
+        hasher.update((ledger_bytes.len() as u32).to_be_bytes());
         hasher.update(&ledger_bytes);
-        hasher.update(&(escrow_bytes.len() as u32).to_be_bytes());
+        hasher.update((escrow_bytes.len() as u32).to_be_bytes());
         hasher.update(&escrow_bytes);
-        hasher.update(&(engine_bytes.len() as u32).to_be_bytes());
+        hasher.update((engine_bytes.len() as u32).to_be_bytes());
         hasher.update(&engine_bytes);
 
         let output = hasher.finalize();
