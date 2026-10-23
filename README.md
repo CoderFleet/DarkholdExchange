@@ -6,12 +6,14 @@ High-frequency secondary marketplace with an in-memory limit order book.
     just db-up
     just api      # terminal 1
     just web      # terminal 2
+    just load     # repeatable gateway load baseline
 
 ## Docs
 - [T1 protocol contract](docs/PROTOCOL.md) — frozen REST/WS shapes and delta rules
 - [Development plan](docs/PLAN.md) — build order, sprints, protocol v1, risks
 - [Decision log](docs/DECISIONS.md) — locked technical decisions and open questions
 - [Source spec](docs/spec/README.md) — PDF, architecture diagram, class diagram
+- [Load baselines](bench/results/README.md) — repeatable gateway benchmark and recorded runs
 
 ## Layout
 crates/{types,engine,ledger,core,solvency,simulator,gateway} · web/ · contracts/ · bench/ · docs/

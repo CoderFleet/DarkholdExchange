@@ -44,3 +44,7 @@ test:
 
 bench:
     cargo bench -p dx-engine
+
+# run the repeatable 1k placements/s gateway load baseline
+load:
+    bash scripts/load-test.sh

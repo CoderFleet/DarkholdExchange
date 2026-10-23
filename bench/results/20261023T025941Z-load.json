@@ -1,0 +1,194 @@
+{
+  "config": {
+    "base_url": "http://127.0.0.1:18080",
+    "duration_secs": 10,
+    "placements_per_second": 1000,
+    "users": 32,
+    "ws_connections": 4,
+    "probe_rate_per_second": 10,
+    "user_base": 1000,
+    "market_id": 1,
+    "price_ticks": 4700,
+    "qty": 1,
+    "probe_user": 5,
+    "probe_market_id": 2,
+    "probe_price_ticks": 9600,
+    "seed_cash": 10000000,
+    "seed_passes": 2
+  },
+  "environment": {
+    "os": "macos",
+    "arch": "aarch64",
+    "available_parallelism": 8,
+    "gateway_queue_capacity": 1024
+  },
+  "started_at_unix_ms": 1792724386397,
+  "duration_ms": 10000,
+  "offered": {
+    "placements": 9989,
+    "commands": 19978
+  },
+  "achieved": {
+    "placements_per_second": 998.9,
+    "commands_per_second": 2017.7
+  },
+  "client": {
+    "place": {
+      "attempts": 9989,
+      "ok": 9989,
+      "rejected": 0,
+      "queue_full": 0,
+      "unavailable": 0,
+      "http_other": 0,
+      "unexpected": 0,
+      "transport_errors": 0
+    },
+    "cancel": {
+      "attempts": 9989,
+      "ok": 9989,
+      "rejected": 0,
+      "queue_full": 0,
+      "unavailable": 0,
+      "http_other": 0,
+      "unexpected": 0,
+      "transport_errors": 0
+    },
+    "place_ack": {
+      "samples": 9989,
+      "p50_us": 153,
+      "p95_us": 298,
+      "p99_us": 409,
+      "p999_us": 1205,
+      "max_us": 2380
+    },
+    "cancel_ack": {
+      "samples": 9989,
+      "p50_us": 131,
+      "p95_us": 228,
+      "p99_us": 328,
+      "p999_us": 651,
+      "max_us": 2154
+    }
+  },
+  "probe": {
+    "enabled": true,
+    "place_attempts": 100,
+    "place_ok": 100,
+    "cancel_attempts": 99,
+    "cancel_ok": 99,
+    "overloaded": 0,
+    "place_e2e": {
+      "samples": 99,
+      "p50_us": 143,
+      "p95_us": 261,
+      "p99_us": 324,
+      "p999_us": 324,
+      "max_us": 324
+    },
+    "cancel_e2e": {
+      "samples": 99,
+      "p50_us": 138,
+      "p95_us": 203,
+      "p99_us": 259,
+      "p999_us": 259,
+      "max_us": 259
+    },
+    "ws_messages": 199,
+    "ws_deltas": 199,
+    "ws_resync_required": 0
+  },
+  "ws": {
+    "connections": [
+      {
+        "messages": 19978,
+        "deltas": 19978,
+        "trades": 0,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 1617848,
+        "elapsed_ms": 10254,
+        "deltas_per_second": 1948.3128535205774,
+        "bytes_per_second": 157777.25765554907
+      },
+      {
+        "messages": 19978,
+        "deltas": 19978,
+        "trades": 0,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 1617848,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1948.5028772066712,
+        "bytes_per_second": 157792.64605481323
+      },
+      {
+        "messages": 19978,
+        "deltas": 19978,
+        "trades": 0,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 1617848,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1948.5028772066712,
+        "bytes_per_second": 157792.64605481323
+      },
+      {
+        "messages": 19978,
+        "deltas": 19978,
+        "trades": 0,
+        "snapshots": 0,
+        "metrics": 0,
+        "resync_required": 0,
+        "seq_gaps": 0,
+        "bytes": 1617848,
+        "elapsed_ms": 10253,
+        "deltas_per_second": 1948.5028772066712,
+        "bytes_per_second": 157792.64605481323
+      }
+    ],
+    "messages": 79912,
+    "deltas": 79912,
+    "trades": 0,
+    "snapshots": 0,
+    "metrics": 0,
+    "resync_required": 0,
+    "seq_gaps": 0,
+    "bytes": 6471392,
+    "deltas_per_second": 7793.25141408231,
+    "bytes_per_second": 631109.0306221963
+  },
+  "gateway": {
+    "before": {
+      "seq": 14,
+      "queue_depth": 0,
+      "commands_total": 0,
+      "rejected_total": 0,
+      "queue_wait_p99_us": 0,
+      "core_p99_us": 0,
+      "ws_clients": 5,
+      "slow_consumers": 0
+    },
+    "after": {
+      "seq": 20191,
+      "queue_depth": 0,
+      "commands_total": 20177,
+      "rejected_total": 0,
+      "queue_wait_p99_us": 50,
+      "core_p99_us": 12,
+      "ws_clients": 5,
+      "slow_consumers": 0
+    }
+  },
+  "notes": [
+    "Each user slot rests a one-unit buy below the best bid and immediately cancels it; cancels are not counted as placements.",
+    "The end-to-end probe uses a separate market and fixed-market WebSocket, so probe deltas are unambiguous.",
+    "Gateway command histograms are cumulative since gateway start; scripts/load-test.sh starts a fresh gateway.",
+    "Loopback HTTP/WS with no TLS, proxy, or injected network delay."
+  ]
+}
