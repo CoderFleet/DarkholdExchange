@@ -4,9 +4,9 @@ pub mod recovery;
 pub mod snapshot;
 pub mod writer;
 
+pub use dkx_hash::GENESIS_PREV_HASH;
 pub use error::*;
 pub use record::*;
 pub use recovery::*;
 pub use snapshot::*;
 pub use writer::*;
-pub use dkx_hash::GENESIS_PREV_HASH;

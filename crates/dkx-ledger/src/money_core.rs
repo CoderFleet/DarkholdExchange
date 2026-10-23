@@ -40,12 +40,32 @@ pub enum Command {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    TopUpApplied { user: UserId, amount: Paise },
-    PassIssued { market: MarketId, to: UserId, qty: i64 },
-    CashReserved { user: UserId, amount: Paise, order: OrderId },
-    PassReserved { user: UserId, market: MarketId, qty: i64, order: OrderId },
-    Released { order: OrderId },
-    FillSettled { outcome: SettleOutcome },
+    TopUpApplied {
+        user: UserId,
+        amount: Paise,
+    },
+    PassIssued {
+        market: MarketId,
+        to: UserId,
+        qty: i64,
+    },
+    CashReserved {
+        user: UserId,
+        amount: Paise,
+        order: OrderId,
+    },
+    PassReserved {
+        user: UserId,
+        market: MarketId,
+        qty: i64,
+        order: OrderId,
+    },
+    Released {
+        order: OrderId,
+    },
+    FillSettled {
+        outcome: SettleOutcome,
+    },
 }
 
 pub struct MoneyCore {
@@ -113,7 +133,8 @@ impl MoneyCore {
                 order,
                 key,
             } => {
-                self.ledger.reserve_pass(*user, *market, *qty, *order, *key)?;
+                self.ledger
+                    .reserve_pass(*user, *market, *qty, *order, *key)?;
                 Ok(vec![Event::PassReserved {
                     user: *user,
                     market: *market,

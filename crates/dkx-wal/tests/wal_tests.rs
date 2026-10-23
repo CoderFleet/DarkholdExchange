@@ -1,10 +1,10 @@
 use std::fs::{self, OpenOptions};
 use std::io::Write;
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use crossbeam_queue::ArrayQueue;
-use dkx_wal::{recover, LogRecord, WalWriter, GENESIS_PREV_HASH};
+use dkx_wal::{GENESIS_PREV_HASH, LogRecord, WalWriter, recover};
 use tempfile::tempdir;
 
 #[test]
@@ -13,8 +13,14 @@ fn test_wal_write_and_recovery_continuous_chain() {
     let queue = Arc::new(ArrayQueue::new(1024));
     let durable = Arc::new(AtomicU64::new(0));
 
-    let mut writer = WalWriter::new(dir.path(), queue.clone(), durable.clone(), 0, GENESIS_PREV_HASH)
-        .expect("writer");
+    let mut writer = WalWriter::new(
+        dir.path(),
+        queue.clone(),
+        durable.clone(),
+        0,
+        GENESIS_PREV_HASH,
+    )
+    .expect("writer");
 
     let mut prev = GENESIS_PREV_HASH;
     let mut batch = Vec::new();
@@ -41,7 +47,8 @@ fn test_editing_record_breaks_chain_at_that_record() {
     let queue = Arc::new(ArrayQueue::new(1024));
     let durable = Arc::new(AtomicU64::new(0));
 
-    let mut writer = WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
+    let mut writer =
+        WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
 
     let mut prev = GENESIS_PREV_HASH;
     let mut batch = Vec::new();
@@ -71,7 +78,8 @@ fn test_torn_final_record_is_dropped() {
     let queue = Arc::new(ArrayQueue::new(1024));
     let durable = Arc::new(AtomicU64::new(0));
 
-    let mut writer = WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
+    let mut writer =
+        WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
 
     let mut prev = GENESIS_PREV_HASH;
     let mut batch = Vec::new();
@@ -86,9 +94,13 @@ fn test_torn_final_record_is_dropped() {
 
     // Append a partially written torn record
     let log_file = dir.path().join("data/log/00000000000000000001.log");
-    let mut file = OpenOptions::new().append(true).open(&log_file).expect("open");
+    let mut file = OpenOptions::new()
+        .append(true)
+        .open(&log_file)
+        .expect("open");
     // Write just 10 bytes of a new record header (cut off mid-record)
-    file.write_all(&[0, 0, 0, 100, 0, 0, 0, 6, 0, 0]).expect("write torn");
+    file.write_all(&[0, 0, 0, 100, 0, 0, 0, 6, 0, 0])
+        .expect("write torn");
     file.sync_all().expect("sync");
 
     let recovered = recover(dir.path()).expect("recover");
@@ -102,7 +114,8 @@ fn test_snapshot_midway_recovers_to_same_final_state() {
     let queue = Arc::new(ArrayQueue::new(1024));
     let durable = Arc::new(AtomicU64::new(0));
 
-    let mut writer = WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
+    let mut writer =
+        WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
 
     let mut prev = GENESIS_PREV_HASH;
     let mut batch1 = Vec::new();
@@ -117,9 +130,7 @@ fn test_snapshot_midway_recovers_to_same_final_state() {
 
     // Take snapshot at seq 5
     writer
-        .take_snapshot(&|_seq, _hash| {
-            (vec![1, 2, 3], vec![], vec![4, 5, 6])
-        })
+        .take_snapshot(&|_seq, _hash| (vec![1, 2, 3], vec![], vec![4, 5, 6]))
         .expect("snapshot");
 
     let mut batch2 = Vec::new();

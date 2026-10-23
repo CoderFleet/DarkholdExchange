@@ -1,6 +1,6 @@
-use sqlx::PgPool;
 use crate::events::ProjectionEvent;
 use dkx_ledger::Account;
+use sqlx::PgPool;
 
 pub const BATCH_SIZE: usize = 500;
 
@@ -37,9 +37,10 @@ impl ProjectionWorker {
 
         let mut tx = self.pool.begin().await?;
 
-        let row: (i64,) = sqlx::query_as("SELECT last_seq FROM projection_state WHERE id = 1 FOR UPDATE")
-            .fetch_one(&mut *tx)
-            .await?;
+        let row: (i64,) =
+            sqlx::query_as("SELECT last_seq FROM projection_state WHERE id = 1 FOR UPDATE")
+                .fetch_one(&mut *tx)
+                .await?;
         let mut last_seq = row.0 as u64;
 
         for chunk in events.chunks(BATCH_SIZE) {
@@ -51,7 +52,10 @@ impl ProjectionWorker {
                 }
 
                 match event {
-                    ProjectionEvent::LedgerPosted { seq: event_seq, entry } => {
+                    ProjectionEvent::LedgerPosted {
+                        seq: event_seq,
+                        entry,
+                    } => {
                         let kind_str = format!("{:?}", entry.kind);
                         let idem_str = entry.key.0.to_string();
 
@@ -65,7 +69,10 @@ impl ProjectionWorker {
                         )
                         .bind(entry.id as i64)
                         .bind(*event_seq as i64)
-                        .bind(sqlx::types::BigDecimal::parse_bytes(idem_str.as_bytes(), 10).unwrap_or_default())
+                        .bind(
+                            sqlx::types::BigDecimal::parse_bytes(idem_str.as_bytes(), 10)
+                                .unwrap_or_default(),
+                        )
                         .bind(kind_str)
                         .bind(entry.ts_micros as i64)
                         .execute(&mut *tx)
@@ -207,7 +214,10 @@ impl ProjectionWorker {
     }
 
     /// Truncates read model tables and rebuilds projection from scratch using the event log.
-    pub async fn rebuild_from_scratch(&self, all_events: &[ProjectionEvent]) -> Result<u64, ProjectionError> {
+    pub async fn rebuild_from_scratch(
+        &self,
+        all_events: &[ProjectionEvent],
+    ) -> Result<u64, ProjectionError> {
         let mut tx = self.pool.begin().await?;
 
         // Disable triggers temporarily or delete in order
@@ -218,12 +228,22 @@ impl ProjectionWorker {
             .execute(&mut *tx)
             .await?;
 
-        sqlx::query("DELETE FROM ledger_legs").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM ledger_entries").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM balances").execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM pass_balances").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM ledger_legs")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM ledger_entries")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM balances")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pass_balances")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM trades").execute(&mut *tx).await?;
-        sqlx::query("UPDATE projection_state SET last_seq = 0 WHERE id = 1").execute(&mut *tx).await?;
+        sqlx::query("UPDATE projection_state SET last_seq = 0 WHERE id = 1")
+            .execute(&mut *tx)
+            .await?;
 
         sqlx::query("ALTER TABLE ledger_entries ENABLE TRIGGER trg_immutable_ledger_entries")
             .execute(&mut *tx)

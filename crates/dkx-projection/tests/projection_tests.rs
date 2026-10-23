@@ -1,9 +1,7 @@
-use dkx_ledger::{
-    Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, Leg,
-};
+use dkx_ledger::{Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, Leg};
 use dkx_projection::{
-    market_lookup_stub, ApiErrorEnvelope, ApiState, AuthUser, ProjectionEvent, ProjectionWorker,
-    Role, TopUpCommand, TradeExecuted, MAX_TOPUP_PAISE,
+    ApiErrorEnvelope, ApiState, AuthUser, MAX_TOPUP_PAISE, ProjectionEvent, ProjectionWorker, Role,
+    TopUpCommand, TradeExecuted, market_lookup_stub,
 };
 
 #[test]

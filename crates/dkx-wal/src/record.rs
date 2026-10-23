@@ -1,7 +1,7 @@
-use std::io::Read;
-use dkx_hash::hash_log_entry;
 use crate::error::WalError;
+use dkx_hash::hash_log_entry;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogRecord {
@@ -80,10 +80,20 @@ impl LogRecord {
         }
 
         let mut offset = 0;
-        let seq = u64::from_be_bytes(body[offset..offset + 8].try_into().map_err(|_| WalError::SequenceGap { expected: 0, got: 0 })?);
+        let seq = u64::from_be_bytes(body[offset..offset + 8].try_into().map_err(|_| {
+            WalError::SequenceGap {
+                expected: 0,
+                got: 0,
+            }
+        })?);
         offset += 8;
 
-        let ts_micros = u64::from_be_bytes(body[offset..offset + 8].try_into().map_err(|_| WalError::SequenceGap { expected: 0, got: 0 })?);
+        let ts_micros = u64::from_be_bytes(body[offset..offset + 8].try_into().map_err(|_| {
+            WalError::SequenceGap {
+                expected: 0,
+                got: 0,
+            }
+        })?);
         offset += 8;
 
         let mut prev_hash = [0u8; 32];
@@ -93,7 +103,12 @@ impl LogRecord {
         let kind = body[offset];
         offset += 1;
 
-        let payload_len = u32::from_be_bytes(body[offset..offset + 4].try_into().map_err(|_| WalError::SequenceGap { expected: 0, got: 0 })?) as usize;
+        let payload_len = u32::from_be_bytes(body[offset..offset + 4].try_into().map_err(|_| {
+            WalError::SequenceGap {
+                expected: 0,
+                got: 0,
+            }
+        })?) as usize;
         offset += 4;
 
         if offset + payload_len + 32 != body_len {

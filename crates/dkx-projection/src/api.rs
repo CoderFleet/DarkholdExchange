@@ -1,8 +1,8 @@
 use axum::{
+    Json, Router,
     extract::{Query, State},
     http::StatusCode,
     routing::{get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -224,7 +224,10 @@ async fn post_topup(
             StatusCode::BAD_REQUEST,
             Json(ApiErrorEnvelope::new(
                 "AMOUNT_EXCEEDED",
-                format!("Maximum allowed top-up is {} paise (₹100,000)", MAX_TOPUP_PAISE),
+                format!(
+                    "Maximum allowed top-up is {} paise (₹100,000)",
+                    MAX_TOPUP_PAISE
+                ),
             )),
         ));
     }
@@ -242,19 +245,18 @@ async fn post_topup(
         )
     })?;
 
-    let current_avail: (i64,) = sqlx::query_as(
-        "SELECT cash_avail FROM balances WHERE user_id = $1",
-    )
-    .bind(auth.user_id as i64)
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
-        )
-    })?
-    .unwrap_or((0,));
+    let current_avail: (i64,) =
+        sqlx::query_as("SELECT cash_avail FROM balances WHERE user_id = $1")
+            .bind(auth.user_id as i64)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                )
+            })?
+            .unwrap_or((0,));
 
     Ok(Json(TopUpResponse {
         available_paise: current_avail.0,
@@ -326,7 +328,11 @@ async fn get_history(
         });
     }
 
-    let next_cursor = if has_more { items.last().map(|i| i.trade_id) } else { None };
+    let next_cursor = if has_more {
+        items.last().map(|i| i.trade_id)
+    } else {
+        None
+    };
 
     Ok(Json(HistoryResponse { items, next_cursor }))
 }
@@ -419,18 +425,17 @@ async fn get_ledger(
     let mut items = Vec::new();
 
     for (id, seq, kind, ts) in entries.into_iter().take(limit as usize) {
-        let legs_rows: Vec<(String, String, i64)> = sqlx::query_as(
-            "SELECT account, asset, amount FROM ledger_legs WHERE entry_id = $1",
-        )
-        .bind(id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
-            )
-        })?;
+        let legs_rows: Vec<(String, String, i64)> =
+            sqlx::query_as("SELECT account, asset, amount FROM ledger_legs WHERE entry_id = $1")
+                .bind(id)
+                .fetch_all(&state.pool)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                    )
+                })?;
 
         let legs = legs_rows
             .into_iter()
@@ -450,7 +455,11 @@ async fn get_ledger(
         });
     }
 
-    let next_cursor = if has_more { items.last().map(|i| i.id) } else { None };
+    let next_cursor = if has_more {
+        items.last().map(|i| i.id)
+    } else {
+        None
+    };
 
     Ok(Json(LedgerResponse { items, next_cursor }))
 }

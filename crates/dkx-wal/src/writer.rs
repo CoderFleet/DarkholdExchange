@@ -1,8 +1,8 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
@@ -135,10 +135,7 @@ impl WalWriter {
         let filename = format!("{:020}.log", self.last_seq + 1);
         let path = self.base_dir.join("data/log").join(filename);
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         self.current_segment = Some(file);
         self.current_segment_size = 0;

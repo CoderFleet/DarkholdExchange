@@ -30,11 +30,7 @@ pub struct MerklePathStep {
 /// Compute Merkle leaf hash:
 /// SHA256( 0x00 | salt 16B | user_id u64 | balance u64 )
 /// All integers big-endian.
-pub fn hash_merkle_leaf(
-    salt: &[u8; 16],
-    user_id: u64,
-    balance: u64,
-) -> [u8; 32] {
+pub fn hash_merkle_leaf(salt: &[u8; 16], user_id: u64, balance: u64) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(&[MERKLE_LEAF_PREFIX]);
     hasher.update(salt);
@@ -78,12 +74,7 @@ pub fn hash_merkle_node(
 
 /// Pair odd-count elements by pairing the last node with the empty node (zero hash, sum 0).
 pub fn pair_with_empty(node: &MerkleNode) -> Result<MerkleNode, HashError> {
-    hash_merkle_node(
-        &node.hash,
-        node.sum,
-        &EMPTY_NODE_HASH,
-        EMPTY_NODE_SUM,
-    )
+    hash_merkle_node(&node.hash, node.sum, &EMPTY_NODE_HASH, EMPTY_NODE_SUM)
 }
 
 /// Verifies a Merkle inclusion path up to the root hash and root total sum.

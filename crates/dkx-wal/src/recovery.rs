@@ -2,10 +2,10 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::Path;
 
-use dkx_hash::hash_log_entry;
 use crate::error::WalError;
 use crate::record::LogRecord;
 use crate::snapshot::SnapshotData;
+use dkx_hash::hash_log_entry;
 
 #[derive(Debug)]
 pub struct RecoveredState {

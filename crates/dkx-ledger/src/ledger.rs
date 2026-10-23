@@ -2,8 +2,8 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::error::{LedgerError, Violation};
 use crate::types::{
-    Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, JournalId, Leg, MarketId,
-    OrderId, Paise, SettleOutcome, UserId,
+    Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, JournalId, Leg, MarketId, OrderId,
+    Paise, SettleOutcome, UserId,
 };
 
 /// 100 basis points = 1.00%
@@ -13,8 +13,15 @@ const MAX_IDEMPOTENCY_ENTRIES: usize = 50_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reservation {
-    Cash { user: UserId, amount: Paise },
-    Pass { user: UserId, market: MarketId, qty: i64 },
+    Cash {
+        user: UserId,
+        amount: Paise,
+    },
+    Pass {
+        user: UserId,
+        market: MarketId,
+        qty: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,7 +96,9 @@ impl Ledger {
         let mut sums: HashMap<Asset, i64> = HashMap::new();
         for leg in &legs {
             let s = sums.entry(leg.asset).or_insert(0);
-            *s = s.checked_add(leg.amount).ok_or(LedgerError::ArithmeticOverflow)?;
+            *s = s
+                .checked_add(leg.amount)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
         }
         for (asset, net) in sums {
             if net != 0 {
@@ -103,7 +112,9 @@ impl Ledger {
                 .get(&leg.account)
                 .copied()
                 .unwrap_or_else(|| self.balance_of(leg.account));
-            let next = current.checked_add(leg.amount).ok_or(LedgerError::ArithmeticOverflow)?;
+            let next = current
+                .checked_add(leg.amount)
+                .ok_or(LedgerError::ArithmeticOverflow)?;
             if !leg.account.is_source() && next < 0 {
                 return Err(LedgerError::NegativeBalanceNotAllowed {
                     account: leg.account,
@@ -135,7 +146,12 @@ impl Ledger {
         Ok(id)
     }
 
-    pub fn topup(&mut self, user: UserId, amount: Paise, key: IdemKey) -> Result<JournalId, LedgerError> {
+    pub fn topup(
+        &mut self,
+        user: UserId,
+        amount: Paise,
+        key: IdemKey,
+    ) -> Result<JournalId, LedgerError> {
         if let Some(IdemResult::Journal(id)) = self.idem_results.get(&key) {
             return Ok(*id);
         }
@@ -233,7 +249,8 @@ impl Ledger {
         ];
 
         self.apply_entry(EntryKind::ReserveCash, legs, key)?;
-        self.reservations.insert(order, Reservation::Cash { user, amount });
+        self.reservations
+            .insert(order, Reservation::Cash { user, amount });
         self.record_idem(key, IdemResult::Unit);
         Ok(())
     }
@@ -280,7 +297,8 @@ impl Ledger {
         ];
 
         self.apply_entry(EntryKind::ReservePass, legs, key)?;
-        self.reservations.insert(order, Reservation::Pass { user, market, qty });
+        self.reservations
+            .insert(order, Reservation::Pass { user, market, qty });
         self.record_idem(key, IdemResult::Unit);
         Ok(())
     }
@@ -363,16 +381,24 @@ impl Ledger {
             .checked_mul(FEE_BPS)
             .ok_or(LedgerError::ArithmeticOverflow)?
             / BPS_DENOMINATOR;
-        let seller_proceeds = notional.checked_sub(fee).ok_or(LedgerError::ArithmeticOverflow)?;
+        let seller_proceeds = notional
+            .checked_sub(fee)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
 
         let buyer_res = match self.reservations.get(&fill.buyer_order) {
             Some(Reservation::Cash { user, amount }) => {
                 if *user != fill.buyer {
-                    return Err(LedgerError::ReservationNotFound { order: fill.buyer_order });
+                    return Err(LedgerError::ReservationNotFound {
+                        order: fill.buyer_order,
+                    });
                 }
                 *amount
             }
-            _ => return Err(LedgerError::ReservationNotFound { order: fill.buyer_order }),
+            _ => {
+                return Err(LedgerError::ReservationNotFound {
+                    order: fill.buyer_order,
+                });
+            }
         };
 
         if buyer_res < notional {
@@ -386,11 +412,17 @@ impl Ledger {
         let seller_res = match self.reservations.get(&fill.seller_order) {
             Some(Reservation::Pass { user, market, qty }) => {
                 if *user != fill.seller || *market != fill.market {
-                    return Err(LedgerError::ReservationNotFound { order: fill.seller_order });
+                    return Err(LedgerError::ReservationNotFound {
+                        order: fill.seller_order,
+                    });
                 }
                 *qty
             }
-            _ => return Err(LedgerError::ReservationNotFound { order: fill.seller_order }),
+            _ => {
+                return Err(LedgerError::ReservationNotFound {
+                    order: fill.seller_order,
+                });
+            }
         };
 
         if seller_res < fill.qty {

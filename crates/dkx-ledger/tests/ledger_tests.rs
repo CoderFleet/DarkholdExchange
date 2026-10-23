@@ -21,7 +21,9 @@ fn test_topup_and_issue_pass() {
 fn test_idempotency_returns_same_result_and_mutates_nothing() {
     let mut ledger = Ledger::new();
     let id1 = ledger.topup(1, 50_000, IdemKey(42)).expect("first topup");
-    let id2 = ledger.topup(1, 50_000, IdemKey(42)).expect("duplicate topup");
+    let id2 = ledger
+        .topup(1, 50_000, IdemKey(42))
+        .expect("duplicate topup");
 
     assert_eq!(id1, id2);
     assert_eq!(ledger.balance_of(Account::CashAvail(1)), 50_000);
@@ -53,11 +55,19 @@ fn test_normal_fill_with_100_bps_fee() {
     let qty = 2;
     let notional = price * qty; // 20,000
 
-    ledger.topup(buyer, 30_000, IdemKey(1)).expect("buyer topup");
-    ledger.issue_pass(market, seller, 5, IdemKey(2)).expect("seller issue");
+    ledger
+        .topup(buyer, 30_000, IdemKey(1))
+        .expect("buyer topup");
+    ledger
+        .issue_pass(market, seller, 5, IdemKey(2))
+        .expect("seller issue");
 
-    ledger.reserve_cash(buyer, notional, 1001, IdemKey(3)).expect("reserve cash");
-    ledger.reserve_pass(seller, market, qty, 2001, IdemKey(4)).expect("reserve pass");
+    ledger
+        .reserve_cash(buyer, notional, 1001, IdemKey(3))
+        .expect("reserve cash");
+    ledger
+        .reserve_pass(seller, market, qty, 2001, IdemKey(4))
+        .expect("reserve pass");
 
     let fill = Fill {
         market,
@@ -80,7 +90,10 @@ fn test_normal_fill_with_100_bps_fee() {
     let seller_proceeds = 20_000 - fee;
 
     assert_eq!(ledger.balance_of(Account::CashLocked(buyer)), 0);
-    assert_eq!(ledger.balance_of(Account::CashAvail(seller)), seller_proceeds);
+    assert_eq!(
+        ledger.balance_of(Account::CashAvail(seller)),
+        seller_proceeds
+    );
     assert_eq!(ledger.balance_of(Account::PlatformFee), fee);
     assert_eq!(ledger.balance_of(Account::PassLocked(seller, market)), 0);
     assert_eq!(ledger.balance_of(Account::PassAvail(buyer, market)), qty);
@@ -112,7 +125,9 @@ fn test_escrow_fill_rejected_until_stage_6() {
 fn test_liability_of_user() {
     let mut ledger = Ledger::new();
     ledger.topup(1, 50_000, IdemKey(1)).expect("topup");
-    ledger.reserve_cash(1, 20_000, 10, IdemKey(2)).expect("reserve");
+    ledger
+        .reserve_cash(1, 20_000, 10, IdemKey(2))
+        .expect("reserve");
 
     assert_eq!(ledger.liability_of(1), 50_000);
 }

@@ -15,7 +15,11 @@ pub fn hash_log_entry(
 ) -> Result<[u8; 32], HashError> {
     let payload_len: u32 = match u32::try_from(payload.len()) {
         Ok(len) => len,
-        Err(_) => return Err(HashError::PayloadTooLarge { size: payload.len() }),
+        Err(_) => {
+            return Err(HashError::PayloadTooLarge {
+                size: payload.len(),
+            });
+        }
     };
 
     let mut hasher = Sha256::new();

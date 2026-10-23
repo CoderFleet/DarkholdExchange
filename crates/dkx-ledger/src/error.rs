@@ -1,5 +1,5 @@
-use thiserror::Error;
 use crate::types::{Account, Asset, Paise};
+use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq, Clone)]
 pub enum LedgerError {
@@ -10,7 +10,9 @@ pub enum LedgerError {
         available: Paise,
     },
 
-    #[error("insufficient passes for user {user} in market {market}: requested {requested}, available {available}")]
+    #[error(
+        "insufficient passes for user {user} in market {market}: requested {requested}, available {available}"
+    )]
     InsufficientPasses {
         user: u64,
         market: u32,
@@ -38,16 +40,12 @@ pub enum LedgerError {
     NonPositiveAmount { amount: i64 },
 
     #[error("unbalanced journal entry: asset {asset:?} does not sum to zero (net {net})")]
-    UnbalancedJournalEntry {
-        asset: Asset,
-        net: i64,
-    },
+    UnbalancedJournalEntry { asset: Asset, net: i64 },
 
-    #[error("account balance would become negative for non-source account: {account:?} (balance {balance})")]
-    NegativeBalanceNotAllowed {
-        account: Account,
-        balance: i64,
-    },
+    #[error(
+        "account balance would become negative for non-source account: {account:?} (balance {balance})"
+    )]
+    NegativeBalanceNotAllowed { account: Account, balance: i64 },
 
     #[error("arithmetic overflow occurred during ledger operation")]
     ArithmeticOverflow,
@@ -55,8 +53,14 @@ pub enum LedgerError {
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum Violation {
-    AssetSumNonZero { asset: Asset, sum: i64 },
-    NegativeBalance { account: Account, balance: i64 },
+    AssetSumNonZero {
+        asset: Asset,
+        sum: i64,
+    },
+    NegativeBalance {
+        account: Account,
+        balance: i64,
+    },
     ReservationMismatch {
         account: Account,
         account_locked: i64,

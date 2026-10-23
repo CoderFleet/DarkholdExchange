@@ -11,10 +11,7 @@ pub struct TradeExecuted {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProjectionEvent {
-    LedgerPosted {
-        seq: u64,
-        entry: JournalEntry,
-    },
+    LedgerPosted { seq: u64, entry: JournalEntry },
     TradeExecuted(TradeExecuted),
 }
 

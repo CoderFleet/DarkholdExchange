@@ -1,6 +1,6 @@
-use sha2::{Digest, Sha256};
-use serde::{Deserialize, Serialize};
 use crate::error::WalError;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotData {
