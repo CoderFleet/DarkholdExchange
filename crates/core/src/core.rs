@@ -193,7 +193,13 @@ impl Core {
 
         match place.side {
             Side::Buy => {
-                if !self.within_holding_limit(user_id, market.id, place.qty, market.holding_limit) {
+                if !self.within_holding_limit(
+                    user_id,
+                    market.id,
+                    place.side,
+                    place.qty,
+                    market.holding_limit,
+                ) {
                     return CommandResponse::rejected(seq, ReasonCode::HoldingLimitExceeded);
                 }
                 let Some(cash) = worst_case_cash(&market, place.price_ticks, place.qty) else {
@@ -327,7 +333,13 @@ impl Core {
 
         match place.side {
             Side::Buy => {
-                if !self.within_holding_limit(user_id, market.id, place.qty, market.holding_limit) {
+                if !self.within_holding_limit(
+                    user_id,
+                    market.id,
+                    place.side,
+                    place.qty,
+                    market.holding_limit,
+                ) {
                     return CommandResponse::rejected(seq, ReasonCode::HoldingLimitExceeded);
                 }
                 let Some(cash) = worst_case_cash(&market, place.protect_price_ticks, place.qty)
@@ -616,6 +628,7 @@ impl Core {
         &self,
         user_id: UserId,
         market_id: MarketId,
+        side: Side,
         qty: Qty,
         limit: u32,
     ) -> bool {
@@ -627,11 +640,14 @@ impl Core {
             .get(&(user_id, market_id))
             .copied()
             .unwrap_or(0);
-        available
-            .saturating_add(held)
-            .saturating_add(open)
-            .saturating_add(qty)
-            <= limit as u64
+        let projected = available.saturating_add(held).saturating_add(open);
+        // A sell moves an already-owned pass into an order; it does not add a new
+        // pass to the identity's exposure. Only buys consume new holding capacity.
+        let projected = match side {
+            Side::Buy => projected.saturating_add(qty),
+            Side::Sell => projected,
+        };
+        projected <= limit as u64
     }
 
     fn add_open_buy(

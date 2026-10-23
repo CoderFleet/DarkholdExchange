@@ -213,6 +213,29 @@ fn holding_limit_counts_passes_and_open_buys() {
 }
 
 #[test]
+fn holding_limit_allows_selling_all_held_passes() {
+    let mut core = core();
+    core.issue_passes(1, MARKET, 4, 1).unwrap();
+
+    for index in 0..4 {
+        let response = core.process(1, limit(10 + index, Side::Sell, PRICE, 1));
+        assert_eq!(response.status, OrderStatus::Rested, "{response:?}");
+    }
+    assert_eq!(
+        core.balance(1, Asset::Pass { market_id: MARKET }),
+        Balance {
+            asset: Asset::Pass { market_id: MARKET },
+            available: 0,
+            held: 4,
+        }
+    );
+
+    let rejected = core.process(1, limit(20, Side::Sell, PRICE, 1));
+    assert_rejected(&rejected, ReasonCode::InsufficientInventory);
+    core.check_invariants().unwrap();
+}
+
+#[test]
 fn insufficient_funds_is_rejected_without_mutating() {
     let mut core = core();
     core.deposit_cash(1, 100, 1).unwrap();
