@@ -421,6 +421,9 @@ same book for every client. WebSocket sends coalesce already-ready messages into
 (64 messages or 256 KiB) and flush once per batch; message types, ordering, filtering, and the
 one-message-per-frame contract are unchanged.
 
-Still pending in the T1 runtime:
-
-- Frontend worker/store migration to the canonical feed
+The terminal now consumes the canonical `/ws/market/{id}` feed through a module worker and a Zustand
+market store. The worker owns the socket, MessagePack decoding, reconnect backoff, and subscription
+frames; React components never open the socket directly. The store applies absolute deltas, detects
+`book_seq` gaps, clears the stale baseline, requests a fresh snapshot with a `Subscribe` frame, and
+resumes from the new `book_seq`. REST remains the bootstrap path for the market list and initial
+tape, and command-response fills are merged into the tape by `trade_id`.

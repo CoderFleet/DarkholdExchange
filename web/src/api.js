@@ -9,7 +9,7 @@
 /** @typedef {import('./protocol/generated/MetricsSnapshot').MetricsSnapshot} MetricsSnapshot */
 /** @typedef {import('./protocol/generated/OpenOrderView').OpenOrderView} OpenOrderView */
 /** @typedef {import('./protocol/generated/ReasonCode').ReasonCode} ReasonCode */
-/** @typedef {Error & { reason?: ReasonCode }} ApiError */
+/** @typedef {Error & { reason?: ReasonCode, status?: number }} ApiError */
 /** @typedef {Exclude<Command, { type: 'Cancel' }>} PlaceCommand */
 
 /**
@@ -45,6 +45,7 @@ const request = async (path, options = {}) => {
       new Error(reason ? String(reason).replaceAll('_', ' ') : `HTTP ${response.status}`)
     )
     error.reason = reason
+    error.status = response.status
     throw error
   }
   return /** @type {T} */ (body)
@@ -100,9 +101,10 @@ export const postCommand = async (command, userId) => {
       body: JSON.stringify(command),
     })
   } catch (err) {
-    // If /api/orders rejects with 404 or Method Not Allowed, fallback to /api/commands
-    const msg = err instanceof Error ? err.message : String(err ?? '')
-    if (msg.includes('404') || msg.includes('405')) {
+    // Older gateways may not expose the canonical endpoint. Fall back to the
+    // legacy command route only when the response status says it is missing.
+    const status = /** @type {ApiError} */ (err).status
+    if (status === 404 || status === 405) {
       return await request('/api/commands', {
         method: 'POST',
         headers: jsonHeaders(userId),
@@ -114,8 +116,7 @@ export const postCommand = async (command, userId) => {
 }
 
 /**
- * Canonical T1 placement endpoint. Cancel remains `/api/commands` for the
- * current UI until it migrates to `cancelOrderRequest`.
+ * Canonical T1 placement endpoint.
  *
  * @param {PlaceCommand} command
  * @param {number} userId

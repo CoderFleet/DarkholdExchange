@@ -1,21 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
-  cancelOrder as cancelOrderCommand,
-  decodeServerMessage,
-  encodeClientMessage,
   nextClientOrderId,
   placeLimit,
   placeMarket,
   Side,
-  subscribe,
 } from './protocol'
 import {
+  cancelOrderRequest,
   getBalances,
   getMarkets,
   getOpenOrders,
   getTrades,
   postCommand,
-  websocketUrl,
 } from './api'
 import {
   formatMoney,
@@ -26,6 +22,7 @@ import {
   statusText,
 } from './format'
 import { useWalletStore } from './stores/useWalletStore'
+import { useMarketFeedStore } from './stores/useMarketFeedStore'
 import { WalletView } from './components/WalletView'
 import { HistoryView } from './components/HistoryView'
 import './App.css'
@@ -35,14 +32,25 @@ const TRADER_IDS = [1, 2, 3, 4, 5, 6]
 function App() {
   const [activeView, setActiveView] = useState('trade')
   const wallet = useWalletStore()
-  const [markets, setMarkets] = useState([])
-  const [snapshots, setSnapshots] = useState({})
-  const [tradesByMarket, setTradesByMarket] = useState({})
+  const updateWalletFromBalances = useWalletStore(
+    (state) => state.updateFromBalances,
+  )
+
+  const markets = useMarketFeedStore((state) => state.markets)
+  const snapshots = useMarketFeedStore((state) => state.snapshots)
+  const tradesByMarket = useMarketFeedStore((state) => state.trades)
+  const feedStatus = useMarketFeedStore((state) => state.status)
+  const resyncing = useMarketFeedStore((state) => state.resyncing)
+  const lastTrade = useMarketFeedStore((state) => state.lastTrade)
+  const hydrateMarkets = useMarketFeedStore((state) => state.hydrate)
+  const seedTrades = useMarketFeedStore((state) => state.seedTrades)
+  const connectFeed = useMarketFeedStore((state) => state.connect)
+  const disconnectFeed = useMarketFeedStore((state) => state.disconnect)
+
   const [balances, setBalances] = useState([])
   const [openOrders, setOpenOrders] = useState([])
   const [selectedMarketId, setSelectedMarketId] = useState(null)
   const [userId, setUserId] = useState(1)
-  const [connection, setConnection] = useState('connecting')
   const [toast, setToast] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(null)
@@ -55,24 +63,24 @@ function App() {
     ])
     setBalances(nextBalances)
     setOpenOrders(nextOrders)
-    wallet.updateFromBalances(nextBalances, markets)
-  }, [wallet, markets])
+    updateWalletFromBalances(
+      nextBalances,
+      useMarketFeedStore.getState().markets,
+    )
+  }, [updateWalletFromBalances])
 
   const loadTrades = useCallback(async (marketId) => {
     if (marketId == null) return
     const nextTrades = await getTrades(marketId, 60)
-    setTradesByMarket((current) => ({ ...current, [marketId]: nextTrades }))
-  }, [])
+    seedTrades(marketId, nextTrades)
+  }, [seedTrades])
 
   useEffect(() => {
     let cancelled = false
     getMarkets()
       .then((views) => {
         if (cancelled) return
-        setMarkets(views.map((view) => view.config))
-        setSnapshots(
-          Object.fromEntries(views.map((view) => [view.config.id, view.snapshot])),
-        )
+        hydrateMarkets(views)
         setSelectedMarketId((current) => current ?? views[0]?.config.id ?? null)
       })
       .catch((error) => {
@@ -81,7 +89,7 @@ function App() {
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [hydrateMarkets])
 
   useEffect(() => {
     let cancelled = false
@@ -102,96 +110,42 @@ function App() {
   useEffect(() => {
     if (selectedMarketId == null) return undefined
     let cancelled = false
-    getTrades(selectedMarketId, 60)
-      .then((nextTrades) => {
-        if (cancelled) return
-        setTradesByMarket((current) => ({
-          ...current,
-          [selectedMarketId]: nextTrades,
-        }))
-      })
-      .catch((error) => {
-        if (!cancelled) setToast({ kind: 'error', text: error.message })
-      })
+    loadTrades(selectedMarketId).catch((error) => {
+      if (!cancelled) setToast({ kind: 'error', text: error.message })
+    })
     return () => {
       cancelled = true
     }
-  }, [selectedMarketId])
+  }, [selectedMarketId, loadTrades])
+
+  useEffect(() => {
+    if (!lastTrade) return
+    if (
+      lastTrade.maker_user_id === userId ||
+      lastTrade.taker_user_id === userId
+    ) {
+      // The feed is an external system; a fill is the event that invalidates the
+      // REST account snapshot. The request itself updates state asynchronously.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      loadAccount(userId).catch(() => {})
+    }
+  }, [lastTrade, userId, loadAccount])
+
+  useEffect(() => {
+    if (selectedMarketId == null) return
+    connectFeed(userId, selectedMarketId)
+
+    // The worker closes an old socket when connect() is called for a new
+    // market/user, so this effect only owns the logical selection.
+  }, [userId, selectedMarketId, connectFeed])
+
+  useEffect(() => () => disconnectFeed(), [disconnectFeed])
 
   useEffect(() => {
     if (!toast) return undefined
     const timer = setTimeout(() => setToast(null), 4500)
     return () => clearTimeout(timer)
   }, [toast])
-
-  useEffect(() => {
-    let stopped = false
-    let socket
-    let retryTimer
-
-    const connect = () => {
-      setConnection('connecting')
-      socket = new WebSocket(websocketUrl(userId))
-      socket.binaryType = 'arraybuffer'
-
-      socket.onopen = () => {
-        if (stopped) return
-        setConnection('live')
-        socket.send(encodeClientMessage(subscribe({ marketIds: [], depth: 20 })))
-      }
-
-      socket.onmessage = (event) => {
-        let message
-        try {
-          message = decodeServerMessage(event.data)
-        } catch {
-          return
-        }
-
-        if (message.type === 'Hello') {
-          setMarkets(message.markets)
-          setSelectedMarketId(
-            (current) => current ?? message.markets[0]?.id ?? null,
-          )
-        } else if (message.type === 'Snapshot') {
-          const { snapshot } = message
-          setSnapshots((current) => ({
-            ...current,
-            [snapshot.market_id]: snapshot,
-          }))
-        } else if (message.type === 'Trade') {
-          const { fill } = message
-          setTradesByMarket((current) => {
-            const previous = current[fill.market_id] ?? []
-            return {
-              ...current,
-              [fill.market_id]: [...previous, fill].slice(-120),
-            }
-          })
-          if (fill.maker_user_id === userId || fill.taker_user_id === userId) {
-            loadAccount(userId).catch(() => {})
-          }
-        }
-      }
-
-      socket.onclose = () => {
-        if (stopped) return
-        setConnection('offline')
-        retryTimer = setTimeout(connect, 1500)
-      }
-
-      socket.onerror = () => {
-        socket.close()
-      }
-    }
-
-    connect()
-    return () => {
-      stopped = true
-      clearTimeout(retryTimer)
-      socket?.close()
-    }
-  }, [userId, loadAccount])
 
   const selectedMarket = useMemo(
     () => markets.find((market) => market.id === selectedMarketId) ?? null,
@@ -202,20 +156,29 @@ function App() {
     ? tradesByMarket[selectedMarket.id] ?? []
     : []
 
-  const submit = async (command) => {
-    setSubmitting(true)
+  const runCommand = async (request) => {
     try {
-      const response = await postCommand(command, userId)
+      const response = await request()
       setToast({
         kind: response.status === 'Rejected' ? 'error' : 'success',
         text: statusText(response),
       })
+      if (response.fills?.length) {
+        for (const fill of response.fills) seedTrades(fill.market_id, [fill])
+      }
       await loadAccount(userId)
       if (selectedMarketId != null) await loadTrades(selectedMarketId)
       return response
     } catch (error) {
       setToast({ kind: 'error', text: error.message })
       return null
+    }
+  }
+
+  const submit = async (command) => {
+    setSubmitting(true)
+    try {
+      return await runCommand(() => postCommand(command, userId))
     } finally {
       setSubmitting(false)
     }
@@ -224,11 +187,8 @@ function App() {
   const handleCancel = async (orderId) => {
     setCancelling(orderId)
     try {
-      await submit(
-        cancelOrderCommand({
-          clientOrderId: nextClientOrderId(),
-          orderId,
-        }),
+      await runCommand(() =>
+        cancelOrderRequest(orderId, nextClientOrderId(), userId),
       )
     } finally {
       setCancelling(null)
@@ -246,7 +206,8 @@ function App() {
   return (
     <div className="app-shell">
       <Header
-        connection={connection}
+        connection={feedStatus}
+        resyncing={resyncing}
         userId={userId}
         onUserChange={handleUserChange}
       />
@@ -344,7 +305,23 @@ function App() {
   )
 }
 
-function Header({ connection, userId, onUserChange }) {
+function Header({ connection, resyncing, userId, onUserChange }) {
+  const label = resyncing
+    ? 'Resyncing'
+    : connection === 'live'
+      ? 'Live'
+      : connection === 'connecting'
+        ? 'Connecting'
+        : connection === 'reconnecting'
+          ? 'Reconnecting'
+          : 'Offline'
+  const tone =
+    connection === 'live' && !resyncing
+      ? 'live'
+      : connection === 'offline'
+        ? 'offline'
+        : 'connecting'
+
   return (
     <header className="topbar">
       <div className="brand">
@@ -356,13 +333,9 @@ function Header({ connection, userId, onUserChange }) {
         </div>
       </div>
       <div className="topbar-controls">
-        <div className={`connection ${connection}`}>
+        <div className={`connection ${tone}`}>
           <span className="dot" />
-          {connection === 'live'
-            ? 'Live'
-            : connection === 'connecting'
-              ? 'Connecting'
-              : 'Reconnecting'}
+          {label}
         </div>
         <label className="identity">
           Identity

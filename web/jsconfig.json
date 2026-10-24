@@ -12,5 +12,12 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/api.js", "src/protocol/index.js", "src/protocol/generated/**/*.ts"]
+  "include": [
+    "src/api.js",
+    "src/feed/marketFeed.js",
+    "src/feed/marketFeedClient.js",
+    "src/protocol/index.js",
+    "src/protocol/generated/**/*.ts",
+    "src/stores/useMarketFeedStore.js"
+  ]
 }
