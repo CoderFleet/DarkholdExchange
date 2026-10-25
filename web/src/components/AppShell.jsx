@@ -6,7 +6,7 @@ import { IssuerPage } from '../pages/IssuerPage'
 import { LoginPage } from '../pages/LoginPage'
 import { SignupPage } from '../pages/SignupPage'
 import { useAuthStore } from '../stores/useAuthStore'
-import { Navbar } from './Navbar'
+import {Navbar} from './Navbar'
 import { RequireRole } from './RequireRole'
 import '../shell.css'
 

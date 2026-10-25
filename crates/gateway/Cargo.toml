@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = { version = "0.8.9", features = ["ws"] }
+dx-auth = { version = "0.1.0", path = "../auth" }
 dx-core = { version = "0.1.0", path = "../core" }
 dx-types = { version = "0.1.0", path = "../types" }
 futures-util = "0.3"
