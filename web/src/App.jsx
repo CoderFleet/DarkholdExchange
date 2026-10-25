@@ -29,8 +29,8 @@ import './App.css'
 
 const TRADER_IDS = [1, 2, 3, 4, 5, 6]
 
-function App() {
-  const [activeView, setActiveView] = useState('trade')
+function App({ initialView = 'trade' }) {
+  const activeView = initialView
   const wallet = useWalletStore()
   const updateWalletFromBalances = useWalletStore(
     (state) => state.updateFromBalances,
@@ -211,33 +211,6 @@ function App() {
         userId={userId}
         onUserChange={handleUserChange}
       />
-
-      <nav className="main-nav" aria-label="Views">
-        <button
-          type="button"
-          className={`nav-tab ${activeView === 'trade' ? 'active' : ''}`}
-          onClick={() => setActiveView('trade')}
-        >
-          Exchange
-        </button>
-        <button
-          type="button"
-          className={`nav-tab ${activeView === 'wallet' ? 'active' : ''}`}
-          onClick={() => setActiveView('wallet')}
-        >
-          Wallet & Portfolio
-          <span className="nav-badge">
-            {formatMoney(wallet.cashAvail)}
-          </span>
-        </button>
-        <button
-          type="button"
-          className={`nav-tab ${activeView === 'history' ? 'active' : ''}`}
-          onClick={() => setActiveView('history')}
-        >
-          History & Statements
-        </button>
-      </nav>
 
       {bootError && <div className="banner error">{bootError}</div>}
 

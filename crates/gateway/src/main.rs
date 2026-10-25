@@ -25,7 +25,7 @@ use dx_types::{
     WsServerMessage, seed_markets,
 };
 use futures_util::SinkExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
 use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer};
@@ -160,6 +160,10 @@ async fn main() {
         .route("/api/metrics/latency", get(latency_metrics))
         .route("/api/users/{user_id}/balances", get(balances))
         .route("/api/users/{user_id}/orders", get(open_orders))
+        .route("/api/wallet", get(wallet_current))
+        .route("/api/wallet/topup", post(wallet_topup))
+        .route("/api/history", get(history_current))
+        .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
         .route("/api/dev/issue", post(dev_issue))
         .route("/ws", get(ws))
@@ -379,14 +383,307 @@ async fn dev_issue(
 }
 
 fn dev_user(headers: &HeaderMap) -> Result<UserId, ApiError> {
-    match headers.get("x-dev-user") {
-        None => Ok(1),
-        Some(value) => value
-            .to_str()
+    if let Some(val) = headers
+        .get("x-user-id")
+        .or_else(|| headers.get("x-dev-user"))
+    {
+        val.to_str()
             .ok()
             .and_then(|value| value.parse::<UserId>().ok())
-            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt)),
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))
+    } else {
+        Ok(1)
     }
+}
+
+#[derive(Serialize)]
+struct PassWalletView {
+    market_id: MarketId,
+    event_name: String,
+    tier_name: String,
+    avail: Qty,
+    locked: Qty,
+    held: Qty,
+}
+
+#[derive(Serialize)]
+struct UserWalletView {
+    user_id: UserId,
+    cash_avail: Minor,
+    cash_locked: Minor,
+    escrow_cash: Minor,
+    passes: Vec<PassWalletView>,
+}
+
+#[derive(Deserialize)]
+struct TopupPayload {
+    amount: Minor,
+}
+
+async fn wallet_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<UserWalletView>, ApiError> {
+    let user_id = dev_user(&headers)?;
+    let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+
+    let mut cash_avail = 0;
+    let mut cash_locked = 0;
+    let mut passes = Vec::new();
+
+    for b in balances {
+        match b.asset {
+            dx_types::Asset::Cash => {
+                cash_avail = b.available;
+                cash_locked = b.held;
+            }
+            dx_types::Asset::Pass { market_id } => {
+                let m_name = markets
+                    .iter()
+                    .find(|m| m.config.id == market_id)
+                    .map(|m| m.config.name.clone())
+                    .unwrap_or_else(|| format!("Market #{market_id}"));
+                passes.push(PassWalletView {
+                    market_id,
+                    event_name: m_name,
+                    tier_name: "General".into(),
+                    avail: b.available as Qty,
+                    locked: b.held as Qty,
+                    held: 0,
+                });
+            }
+        }
+    }
+
+    Ok(Json(UserWalletView {
+        user_id,
+        cash_avail,
+        cash_locked,
+        escrow_cash: 0,
+        passes,
+    }))
+}
+
+async fn wallet_topup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<TopupPayload>, JsonRejection>,
+) -> Result<Json<UserWalletView>, ApiError> {
+    let user_id = dev_user(&headers)?;
+    let body = json_body(payload)?;
+    if body.amount <= 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidQuantity,
+        ));
+    }
+    let req_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+
+    state
+        .writer
+        .deposit(user_id, body.amount, req_id)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+
+    wallet_current(State(state), headers).await
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    market_id: Option<MarketId>,
+    side: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct HistoryItem {
+    id: u64,
+    market_id: MarketId,
+    event_name: String,
+    tier_name: String,
+    side: String,
+    price: Minor,
+    qty: Qty,
+    fee: Minor,
+    total_paise: Minor,
+    ts: u64,
+}
+
+#[derive(Serialize)]
+struct HistoryResponse {
+    items: Vec<HistoryItem>,
+    next_cursor: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StatementItem {
+    id: u64,
+    ts: u64,
+    kind: String,
+    account: String,
+    asset: String,
+    amount: Minor,
+}
+
+#[derive(Serialize)]
+struct StatementResponse {
+    items: Vec<StatementItem>,
+    next_cursor: Option<u64>,
+}
+
+async fn history_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<HistoryResponse>, ApiError> {
+    let user_id = dev_user(&headers)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+
+    let market_ids: Vec<MarketId> = if let Some(mid) = query.market_id {
+        vec![mid]
+    } else {
+        markets.iter().map(|m| m.config.id).collect()
+    };
+
+    let mut items = Vec::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    for mid in market_ids {
+        if let Ok(Some(trades)) = state.writer.trades(mid, limit).await {
+            let m_config = markets
+                .iter()
+                .find(|m| m.config.id == mid)
+                .map(|m| &m.config);
+            let tick_size = m_config.map(|c| c.tick_size_minor).unwrap_or(100);
+            let m_name = m_config
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("Market #{mid}"));
+
+            for f in trades {
+                if f.maker_user_id == user_id || f.taker_user_id == user_id {
+                    let is_taker = f.taker_user_id == user_id;
+                    let is_buyer = (f.maker_side == Side::Sell && is_taker)
+                        || (f.maker_side == Side::Buy && !is_taker);
+
+                    let side_str = if is_buyer { "buy" } else { "sell" };
+                    if let Some(ref req_side) = query.side
+                        && req_side.to_lowercase() != side_str
+                    {
+                        continue;
+                    }
+
+                    let price_paise = (f.price_ticks as i64) * tick_size;
+                    let notional_paise = price_paise * (f.qty as i64);
+                    let fee_paise = if is_taker {
+                        notional_paise * (m_config.map(|c| c.taker_fee_bps).unwrap_or(100) as i64)
+                            / 10_000
+                    } else {
+                        0
+                    };
+                    let total_paise = if is_buyer {
+                        notional_paise + fee_paise
+                    } else {
+                        notional_paise - fee_paise
+                    };
+
+                    items.push(HistoryItem {
+                        id: f.trade_id,
+                        market_id: mid,
+                        event_name: m_name.clone(),
+                        tier_name: "General".into(),
+                        side: side_str.into(),
+                        price: price_paise,
+                        qty: f.qty,
+                        fee: fee_paise,
+                        total_paise,
+                        ts: now.saturating_sub(f.seq.saturating_mul(1000)),
+                    });
+                }
+            }
+        }
+    }
+
+    items.sort_by_key(|a| std::cmp::Reverse(a.id));
+    if items.len() > limit {
+        items.truncate(limit);
+    }
+
+    Ok(Json(HistoryResponse {
+        items,
+        next_cursor: None,
+    }))
+}
+
+async fn statements_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<StatementResponse>, ApiError> {
+    let user_id = dev_user(&headers)?;
+    let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    let mut items = Vec::new();
+    let mut seq = 1u64;
+
+    for b in balances {
+        match b.asset {
+            dx_types::Asset::Cash => {
+                if b.available > 0 {
+                    items.push(StatementItem {
+                        id: seq,
+                        ts: now.saturating_sub(120_000),
+                        kind: "Deposit".into(),
+                        account: format!("CashAvail({user_id})"),
+                        asset: "Cash".into(),
+                        amount: b.available,
+                    });
+                    seq += 1;
+                }
+                if b.held > 0 {
+                    items.push(StatementItem {
+                        id: seq,
+                        ts: now.saturating_sub(60_000),
+                        kind: "ReserveCash".into(),
+                        account: format!("CashLocked({user_id})"),
+                        asset: "Cash".into(),
+                        amount: b.held,
+                    });
+                    seq += 1;
+                }
+            }
+            dx_types::Asset::Pass { market_id } => {
+                if b.available > 0 {
+                    items.push(StatementItem {
+                        id: seq,
+                        ts: now.saturating_sub(90_000),
+                        kind: "IssuePass".into(),
+                        account: format!("PassAvail({user_id}, {market_id})"),
+                        asset: format!("Pass({market_id})"),
+                        amount: b.available,
+                    });
+                    seq += 1;
+                }
+            }
+        }
+    }
+
+    items.sort_by_key(|a| std::cmp::Reverse(a.id));
+    Ok(Json(StatementResponse {
+        items,
+        next_cursor: None,
+    }))
 }
 
 async fn ws(

@@ -34,7 +34,9 @@ export function AppShell() {
       <Navbar />
       <Routes>
         <Route path="/" element={<Navigate to="/market" replace />} />
-        <Route path="/market" element={<App />} />
+        <Route path="/market" element={<App initialView="trade" />} />
+        <Route path="/wallet" element={<App initialView="wallet" />} />
+        <Route path="/history" element={<App initialView="history" />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route

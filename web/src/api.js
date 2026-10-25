@@ -162,37 +162,10 @@ export const cancelOrderRequest = (orderId, clientOrderId, userId) =>
  * @param {number} userId
  * @returns {Promise<{ user_id: number, cash_avail: number, cash_locked: number, escrow_cash: number, passes: any[] }>}
  */
-export const getWallet = async (userId) => {
-  try {
-    return await request('/api/wallet', {
-      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-    })
-  } catch {
-    // Graceful fallback to gateway balance endpoint if projection worker is not standalone
-    const rawBalances = await getBalances(userId)
-    const cash = rawBalances.find((b) => b.asset.kind === 'cash')
-    const passes = rawBalances.flatMap((b) => {
-      if (b.asset.kind !== 'pass') return []
-      return [
-        {
-          market_id: b.asset.market_id,
-          event_name: `Market #${b.asset.market_id}`,
-          tier_name: 'General',
-          avail: b.available,
-          locked: b.held,
-          held: 0,
-        },
-      ]
-    })
-    return {
-      user_id: userId,
-      cash_avail: cash?.available ?? 0,
-      cash_locked: cash?.held ?? 0,
-      escrow_cash: 0,
-      passes,
-    }
-  }
-}
+export const getWallet = (userId) =>
+  request('/api/wallet', {
+    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+  })
 
 /**
  * Top up user wallet in paise (100 paise = ₹1). Maximum 10,000,000 paise (₹100,000).
@@ -201,36 +174,22 @@ export const getWallet = async (userId) => {
  * @param {number} amountPaise
  * @returns {Promise<any>}
  */
-export const topupWallet = async (userId, amountPaise) => {
-  try {
-    return await request('/api/wallet/topup', {
-      method: 'POST',
-      headers: {
-        ...jsonHeaders(userId),
-        'x-user-id': String(userId),
-      },
-      body: JSON.stringify({ amount: amountPaise }),
-    })
-  } catch {
-    // Fallback to gateway dev deposit
-    return await request('/api/dev/deposit', {
-      method: 'POST',
-      headers: jsonHeaders(userId),
-      body: JSON.stringify({
-        user_id: userId,
-        amount: amountPaise,
-        client_request_id: Date.now() + Math.floor(Math.random() * 1000),
-      }),
-    })
-  }
-}
+export const topupWallet = (userId, amountPaise) =>
+  request('/api/wallet/topup', {
+    method: 'POST',
+    headers: {
+      ...jsonHeaders(userId),
+      'x-user-id': String(userId),
+    },
+    body: JSON.stringify({ amount: amountPaise }),
+  })
 
 /**
  * @param {number} userId
  * @param {{ market_id?: number, side?: 'buy' | 'sell', limit?: number, cursor?: number }} [query]
  * @returns {Promise<{ items: any[], next_cursor: number | null }>}
  */
-export const getHistory = async (userId, query = {}) => {
+export const getHistory = (userId, query = {}) => {
   const params = new URLSearchParams()
   if (query.market_id != null) params.set('market_id', String(query.market_id))
   if (query.side != null) params.set('side', query.side)
@@ -238,65 +197,9 @@ export const getHistory = async (userId, query = {}) => {
   if (query.cursor != null) params.set('cursor', String(query.cursor))
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  try {
-    return await request(`/api/history${qs}`, {
-      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-    })
-  } catch {
-    try {
-      const marketsList = await getMarkets().catch(() => [])
-      const marketConfigMap = Object.fromEntries(
-        marketsList.map((m) => [m.config.id, m.config]),
-      )
-      const marketIds = query.market_id
-        ? [query.market_id]
-        : marketsList.length > 0
-          ? marketsList.map((m) => m.config.id)
-          : [1, 2, 3]
-
-      const allTradesArrays = await Promise.all(
-        marketIds.map((mid) => getTrades(mid, 50).catch(() => [])),
-      )
-
-      const allTrades = allTradesArrays.flat()
-      const userFills = allTrades
-        .filter((f) => f.maker_user_id === userId || f.taker_user_id === userId)
-        .map((f) => {
-          const isTaker = f.taker_user_id === userId
-          const isBuyer =
-            (f.maker_side === 'Sell' && isTaker) ||
-            (f.maker_side === 'Buy' && !isTaker)
-
-          const cfg = marketConfigMap[f.market_id]
-          const tickSize = cfg?.tick_size_minor ?? 100
-          const eventName = cfg?.name ?? `Market #${f.market_id}`
-          const tierName = cfg ? `Event #${cfg.event_id}` : 'Standard'
-
-          const pricePaise = f.price_ticks * tickSize
-          const notionalPaise = pricePaise * f.qty
-          // Takers pay fee bps from config (default 100 bps / 1%), makers pay 0 bps
-          const feeBps = isTaker ? (cfg?.taker_fee_bps ?? 100) : 0
-          const feePaise = Math.floor((notionalPaise * feeBps) / 10_000)
-          const netPaise = isBuyer ? notionalPaise + feePaise : notionalPaise - feePaise
-
-          return {
-            id: f.trade_id,
-            market_id: f.market_id,
-            event_name: eventName,
-            tier_name: tierName,
-            side: isBuyer ? 'buy' : 'sell',
-            price: pricePaise,
-            qty: f.qty,
-            fee: feePaise,
-            total_paise: netPaise,
-            ts: Date.now() - (f.seq ? (1000 - f.seq) * 60000 : 0),
-          }
-        })
-      return { items: userFills, next_cursor: null }
-    } catch {
-      return { items: [], next_cursor: null }
-    }
-  }
+  return request(`/api/history${qs}`, {
+    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+  })
 }
 
 /**
@@ -304,19 +207,15 @@ export const getHistory = async (userId, query = {}) => {
  * @param {{ limit?: number, cursor?: number }} [query]
  * @returns {Promise<{ items: any[], next_cursor: number | null }>}
  */
-export const getStatements = async (userId, query = {}) => {
+export const getStatements = (userId, query = {}) => {
   const params = new URLSearchParams()
   if (query.limit != null) params.set('limit', String(query.limit))
   if (query.cursor != null) params.set('cursor', String(query.cursor))
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  try {
-    return await request(`/api/statements${qs}`, {
-      headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-    })
-  } catch {
-    return { items: [], next_cursor: null }
-  }
+  return request(`/api/statements${qs}`, {
+    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
+  })
 }
 
 /**

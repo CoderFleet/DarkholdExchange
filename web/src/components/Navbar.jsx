@@ -20,6 +20,8 @@ export function Navbar() {
       <span className="shell-brand">Darkhold Exchange</span>
       <nav aria-label="Main">
         <NavLink to="/market">Market</NavLink>
+        <NavLink to="/wallet">Wallet</NavLink>
+        <NavLink to="/history">History</NavLink>
         {user?.role === 'admin' && <NavLink to="/admin">Admin</NavLink>}
         {user?.role === 'issuer' && <NavLink to="/issuer">Issuer</NavLink>}
       </nav>
