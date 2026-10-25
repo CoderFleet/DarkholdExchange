@@ -1,4 +1,5 @@
 // @ts-check
+import { getAuthToken } from './authToken.js'
 /** @typedef {import('./protocol/generated/Balance').Balance} Balance */
 /** @typedef {import('./protocol/generated/BookSnapshot').BookSnapshot} BookSnapshot */
 /** @typedef {import('./protocol/generated/Command').Command} Command */
@@ -9,7 +10,7 @@
 /** @typedef {import('./protocol/generated/MetricsSnapshot').MetricsSnapshot} MetricsSnapshot */
 /** @typedef {import('./protocol/generated/OpenOrderView').OpenOrderView} OpenOrderView */
 /** @typedef {import('./protocol/generated/ReasonCode').ReasonCode} ReasonCode */
-/** @typedef {Error & { reason?: ReasonCode, status?: number }} ApiError */
+/** @typedef {Error & { reason?: ReasonCode, status?: number, retryAfter?: number }} ApiError */
 /** @typedef {Exclude<Command, { type: 'Cancel' }>} PlaceCommand */
 
 /**
@@ -30,13 +31,26 @@ const jsonHeaders = (userId) => ({
 })
 
 /**
+ * Adds the login token when there is one. Without a token the request is sent exactly as
+ * before, so the dev-user header flow keeps working.
+ *
+ * @param {RequestInit} options
+ * @returns {RequestInit}
+ */
+const withAuth = (options) => {
+  const token = getAuthToken()
+  if (!token) return options
+  return { ...options, headers: { ...options.headers, authorization: `Bearer ${token}` } }
+}
+
+/**
  * @template T
  * @param {string} path
  * @param {RequestInit} [options]
  * @returns {Promise<T>}
  */
 const request = async (path, options = {}) => {
-  const response = await fetch(path, options)
+  const response = await fetch(path, withAuth(options))
   /** @type {ErrorBody | null} */
   const body = await response.json().catch(() => null)
   if (!response.ok) {
@@ -46,6 +60,9 @@ const request = async (path, options = {}) => {
     )
     error.reason = reason
     error.status = response.status
+    // "Try again later" replies say how many seconds to wait.
+    const retryAfter = Number(response.headers?.get?.('retry-after'))
+    if (retryAfter > 0) error.retryAfter = retryAfter
     throw error
   }
   return /** @type {T} */ (body)
