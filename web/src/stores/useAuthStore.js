@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { authErrorText, getMe, login, signup } from '../authApi'
+import { setAuthToken } from '../authToken'
 
 const TOKEN_KEY = 'dx-auth-token'
 
@@ -17,6 +18,8 @@ const readToken = () => {
 }
 
 const writeToken = (token) => {
+  // Let api.js know, so every request carries (or stops carrying) the token.
+  setAuthToken(token)
   try {
     if (token) window.localStorage.setItem(TOKEN_KEY, token)
     else window.localStorage.removeItem(TOKEN_KEY)
@@ -24,6 +27,9 @@ const writeToken = (token) => {
     // storage unavailable: ignore
   }
 }
+
+// Use a saved token for the very first requests after a refresh, before restore() has checked it.
+setAuthToken(readToken())
 
 export const useAuthStore = create((set) => {
   // Shared by login and signup: call the API, then store who we are.
@@ -54,6 +60,7 @@ export const useAuthStore = create((set) => {
       }
       try {
         const user = await getMe(token)
+        setAuthToken(token)
         set({ token, user, status: 'authenticated' })
       } catch {
         writeToken(null)
