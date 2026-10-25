@@ -146,6 +146,8 @@ async fn main() {
     let (tx, _) = broadcast::channel(512);
     let (writer, metrics) = spawn_writer(core, tx, seed_fills, queue_capacity());
     let state = AppState { writer, metrics };
+    // Login, sign-up and /api/me (docs/AUTH.md).
+    let auth = dx_auth::AuthState::from_env();
 
     let app = Router::new()
         .route("/health", get(health))
@@ -164,7 +166,8 @@ async fn main() {
         .route("/api/dev/issue", post(dev_issue))
         .route("/ws", get(ws))
         .route("/ws/market/{market_id}", get(ws_market))
-        .with_state(state);
+        .with_state(state)
+        .merge(dx_auth::router(auth));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
