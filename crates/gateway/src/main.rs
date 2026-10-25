@@ -148,6 +148,8 @@ async fn main() {
     let state = AppState { writer, metrics };
     // Login, sign-up and /api/me (docs/AUTH.md).
     let auth = dx_auth::AuthState::from_env();
+    // Events and tiers for the admin console. Publishing does not reach the engine yet.
+    let admin = dx_admin::AdminState::without_engine();
 
     let app = Router::new()
         .route("/health", get(health))
@@ -171,7 +173,8 @@ async fn main() {
         .route("/ws", get(ws))
         .route("/ws/market/{market_id}", get(ws_market))
         .with_state(state)
-        .merge(dx_auth::router(auth));
+        .merge(dx_auth::router(auth.clone()))
+        .merge(dx_admin::router(admin, auth));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
