@@ -448,6 +448,35 @@ fn runtime_market_is_tradable_and_consumes_a_sequence() {
 }
 
 #[test]
+fn state_version_tracks_commands_and_journal_operations() {
+    let mut core = core();
+    assert_eq!(core.state_version(), 0);
+
+    core.deposit_cash(1, 1_000_000, 1).unwrap();
+    assert_eq!(core.state_version(), 1);
+
+    // Idempotent duplicate deposits do not post another journal.
+    core.deposit_cash(1, 1_000_000, 1).unwrap();
+    assert_eq!(core.state_version(), 1);
+
+    let bid = core.process(1, limit(1, Side::Buy, PRICE, 1));
+    assert_eq!(bid.status, OrderStatus::Rested);
+    assert_eq!(core.state_version(), 2);
+
+    // A cached retry does not create a new version.
+    let retry = core.process_with_deltas(1, limit(1, Side::Buy, PRICE, 1));
+    assert!(retry.cached);
+    assert_eq!(core.state_version(), 2);
+
+    let mut config = seed_markets().into_iter().next().unwrap();
+    config.id = 100;
+    config.event_id = 99;
+    config.name = "Version market".into();
+    core.add_market(config).unwrap();
+    assert_eq!(core.state_version(), 3);
+}
+
+#[test]
 fn state_hash_is_deterministic_and_changes_with_state() {
     let mut a = core();
     let mut b = core();

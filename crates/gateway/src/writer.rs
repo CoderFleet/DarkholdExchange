@@ -833,7 +833,8 @@ fn build_solvency_snapshot(
         }
     }
 
-    SolvencySnapshot::from_balances(core.last_seq(), balances).map_err(|error| error.to_string())
+    SolvencySnapshot::from_balances(core.state_version(), balances)
+        .map_err(|error| error.to_string())
 }
 
 fn recent_trades_for(
@@ -978,6 +979,7 @@ mod tests {
             .unwrap();
 
         let expected_hash = writer.state_hash().await.unwrap();
+        let expected_solvency_seq = writer.solvency(vec![]).await.unwrap().seq;
         writer.shutdown().await.unwrap();
         drop(writer);
 
@@ -985,14 +987,25 @@ mod tests {
         let mut restored = funded_core();
         let fills = crate::wal::replay(&recovered.replayed_records, &mut restored).unwrap();
         assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(
+            build_solvency_snapshot(&restored, &[]).unwrap().seq,
+            expected_solvency_seq
+        );
         assert_eq!(fills.len(), 1);
         assert_eq!(restored.balance(3, Asset::Cash).available, 1_000_000);
     }
 
     #[test]
     fn solvency_snapshot_includes_zero_balance_users_and_verifies() {
-        let core = funded_core();
+        let mut core = funded_core();
         let snapshot = build_solvency_snapshot(&core, &[99]).unwrap();
+        assert_eq!(snapshot.seq, core.state_version());
+
+        let before = snapshot.seq;
+        core.deposit_cash(1, 1, 2).unwrap();
+        let after = build_solvency_snapshot(&core, &[99]).unwrap();
+        assert!(after.seq > before);
+        assert_eq!(after.seq, core.state_version());
 
         let cash = snapshot.tree(Asset::Cash).unwrap();
         assert!(cash.proof(1).unwrap().verify().unwrap());

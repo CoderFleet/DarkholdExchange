@@ -38,6 +38,12 @@ pub struct Core {
     ledger: Ledger,
     markets: HashMap<MarketId, MarketConfig>,
     next_seq: Seq,
+    /// Monotonic version for state fingerprints and solvency snapshots.
+    ///
+    /// Advances on every committed command and every new ledger journal. Unlike
+    /// `next_seq`, this includes deposits and issuance, which bypass command
+    /// sequencing.
+    state_version: u64,
     idempotency: HashMap<(UserId, ClientOrderId), CachedCommand>,
     /// Sum of open buy quantities per identity/market, for the holding limit.
     open_buy_qty: HashMap<(UserId, MarketId), Qty>,
@@ -94,6 +100,7 @@ impl Core {
             ledger: Ledger::new(),
             markets,
             next_seq: 1,
+            state_version: 0,
             idempotency: HashMap::new(),
             open_buy_qty: HashMap::new(),
             poisoned: false,
@@ -182,7 +189,12 @@ impl Core {
     fn alloc_seq(&mut self) -> Seq {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
+        self.bump_state_version();
         seq
+    }
+
+    fn bump_state_version(&mut self) {
+        self.state_version = self.state_version.saturating_add(1);
     }
 
     fn place_limit(
@@ -779,12 +791,18 @@ impl Core {
         amount: Minor,
         client_request_id: ClientOrderId,
     ) -> Result<u64, ReasonCode> {
-        self.ledger
+        let journals = self.ledger.journal_count();
+        let journal_id = self
+            .ledger
             .deposit_cash(user_id, amount, client_request_id)
             .map_err(|error| match error {
                 LedgerError::NonPositiveAmount => ReasonCode::InvalidQuantity,
                 _ => ReasonCode::InternalError,
-            })
+            })?;
+        if self.ledger.journal_count() != journals {
+            self.bump_state_version();
+        }
+        Ok(journal_id)
     }
 
     /// Dev/simulator pass issuance. Idempotent per user/market/request.
@@ -798,12 +816,18 @@ impl Core {
         if !self.markets.contains_key(&market_id) {
             return Err(ReasonCode::UnknownMarket);
         }
-        self.ledger
+        let journals = self.ledger.journal_count();
+        let journal_id = self
+            .ledger
             .issue_passes(user_id, market_id, qty, client_request_id)
             .map_err(|error| match error {
                 LedgerError::NonPositiveAmount => ReasonCode::InvalidQuantity,
                 _ => ReasonCode::InternalError,
-            })
+            })?;
+        if self.ledger.journal_count() != journals {
+            self.bump_state_version();
+        }
+        Ok(journal_id)
     }
 
     pub fn balance(&self, user_id: UserId, asset: Asset) -> Balance {
@@ -859,6 +883,14 @@ impl Core {
         self.next_seq.saturating_sub(1)
     }
 
+    /// Monotonic version covering commands and journal-posting operations.
+    ///
+    /// This is the identifier used by solvency snapshots. It advances on deposits
+    /// and issuance even though those operations do not consume `last_seq`.
+    pub fn state_version(&self) -> u64 {
+        self.state_version
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -888,6 +920,7 @@ impl Core {
             hasher.update(qty.to_le_bytes());
         }
         hasher.update(self.next_seq.to_le_bytes());
+        hasher.update(self.state_version.to_le_bytes());
         hasher.update([self.poisoned as u8]);
         hasher.finalize().into()
     }

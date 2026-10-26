@@ -55,7 +55,7 @@
 | 11 | Batch auction + commit-reveal | ❌ | Nothing implemented. | Defer until P1 items are complete, unless the submission needs it. |
 | 12 | Escrow state machine | ❌ | Ledger returns `escrow_not_ready`; demo markets have `escrow_enabled: false`. | Implement `Filled → PendingDelivery → Delivered/TimedOut → Refunded` if claimed. |
 | 13 | ed25519 signed delivery receipts | ❌ | No receipt types, key registry, or signature verification. | Add with escrow. |
-| 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. | Fix the snapshot `seq` caveat below. |
+| 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
 | 15 | Hash-chained audit log | 🟡 | `crates/hash/src/audit.rs` + `web/src/lib/hash.ts` + golden vectors. No records/endpoint/UI. | Record sequenced commands, expose `GET /api/audit`, verify the chain on `/verify`. |
 | 16 | Per-user/per-IP rate limits | ❌ | Only login has a throttle (`crates/auth`). | Add token buckets at command admission; return 429 + `Retry-After`. |
 | 17 | Adaptive proof-of-work | ❌ | No challenge endpoint or client solver. | Add challenge/verify flow and browser Web Worker solver. |
@@ -91,16 +91,13 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
-| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
+| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
 | **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
-The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work.
+The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
 ## Known caveats / quick fixes
 
-- **Solvency snapshot `seq`:** it currently uses the core command sequence, but dev deposits/top-ups
-  bypass `next_seq`. Replace it with a single state version, such as the WAL sequence, when the
-  solvency worker is wired to the log.
 - **WAL snapshots/compaction are not wired:** startup rejects a snapshot and replays the full log.
   Periodic snapshots remain a follow-up; the current path is correct but grows with the log.
 - **WAL replay baseline is the demo seed:** `seed_demo` is not logged. Changing the seed changes the

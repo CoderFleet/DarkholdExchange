@@ -124,7 +124,7 @@ export function VerifyPage() {
             <div className="verify-stat">
               <span className="eyebrow">Snapshot</span>
               <strong>#{data.seq}</strong>
-              <span>Core command sequence</span>
+              <span>Core state version</span>
             </div>
             <div className="verify-stat">
               <span className="eyebrow">Asset trees</span>

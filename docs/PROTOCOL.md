@@ -181,8 +181,8 @@ GET /api/state/hash
 { "state_hash": "ddeb4382d5b67d0ea610c86891e43017b548eed02ac65a7219287da1a0aabf8e" }
 ```
 
-It is a deterministic hash of the engine books, ledger balances, open-buy reservations, and core
-sequence. It is not a balance or account identifier.
+It is a deterministic hash of the engine books, ledger balances, open-buy reservations, core
+sequence, and core state version. It is not a balance or account identifier.
 
 ### 2.7 Temporary aliases
 
