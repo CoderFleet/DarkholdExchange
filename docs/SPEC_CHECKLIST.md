@@ -82,19 +82,19 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Owns |
 |---|---|
-| **Teammate 1 — Shraddha Sharma** | Shared message types, command queue/main loop, order book, matching, pre-book checks, escrow switch, live update sender, order/WS/market endpoints, market setup command, replay/recovery helpers, state fingerprint, speed measurements. Frontend: market page, order form, ladder, depth chart, trade list/price chart, open orders, speed panel, shared live worker, market store. |
-| **Teammate 2 — Rudransh Pratap Singh** | Ledger, locking, settlement, safety checks, wallet, escrow, disputes, shared hashing helper, hash-chained log, Merkle-sum solvency, PostgreSQL copy, replay service, private user WebSocket. Frontend: wallet, history/statements, trade/escrow detail, admin disputes, proof page, replay page. |
+| **Teammate 1 — Rudransh Pratap Singh** | Shared message types, command queue/main loop, order book, matching, pre-book checks, escrow switch, live update sender, order/WS/market endpoints, market setup command, replay/recovery helpers, state fingerprint, speed measurements. Frontend: market page, order form, ladder, depth chart, trade list/price chart, open orders, speed panel, shared live worker, market store. |
+| **Teammate 2 — Shraddha Sharma** | Ledger, locking, settlement, safety checks, wallet, escrow, disputes, shared hashing helper, hash-chained log, Merkle-sum solvency, PostgreSQL copy, replay service, private user WebSocket. Frontend: wallet, history/statements, trade/escrow detail, admin disputes, proof page, replay page. |
 | **Teammate 3 — Stuti Agarwal** | Gateway, login/roles, rate limits/PoW, admin setup, Issuer, seed script, timer service, batch auction, Dutch auction, bot simulator, server clock, Docker/proxy, k6/Locust/Playwright. Frontend: app shell, API helper, auth store, login/signup, events list, event room, batch page, Dutch page, admin console, issuer console, bot simulator. |
 
 ### Remaining work by owner
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Shraddha** | Differential reference matcher; Playwright place/match/cancel test; market-setup command integration; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
-| **T2 — Rudransh** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
+| **T1 — Rudransh** | Differential reference matcher; Playwright place/match/cancel test; market-setup command integration; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
+| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
 | **T3 — Stuti** | Admin publishing reaching the engine; Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
-The trust work already landed under **T2**: Merkle-sum solvency and the `/verify` page. The speed panel and market charts landed under **T1**.
+The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work.
 
 ## Known caveats / quick fixes
 
@@ -112,14 +112,14 @@ The trust work already landed under **T2**: Merkle-sum solvency and the `/verify
 
 ## Recommended work queue
 
-1. **Trust finish:** audit-chain records + `GET /api/audit` + browser verification section.
-2. **Escrow:** state machine, ed25519 receipts, timeout refunds.
-3. **Dutch auction:** end-to-end vertical slice.
-4. **Batch auction:** commit-reveal and uniform clearing.
-5. **Fairness:** per-identity/per-IP rate limits + adaptive PoW.
-6. **Verification:** differential matcher, deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage.
-7. **Operations:** wire WAL, wire PostgreSQL projection, Docker/Caddy deployment.
-8. **Admin/issuer:** make publishing create a live market; implement the issuer console.
+1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
+2. **Escrow (T2 — Shraddha, with T1 switch + T3 timer):** state machine, ed25519 receipts, timeout refunds.
+3. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
+4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
+6. **Verification (T1/T2/T3):** differential matcher, deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage.
+7. **Operations (T2 + T3):** wire WAL, wire PostgreSQL projection, Docker/Caddy deployment.
+8. **Admin/issuer (T3 — Stuti, with T1 market setup):** make publishing create a live market; implement the issuer console.
 
 ## Submission honesty
 
