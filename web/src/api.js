@@ -1,5 +1,5 @@
 // @ts-check
-import { getAuthToken } from './authToken.js'
+import { getAuthToken, notifyUnauthorized } from './authToken.js'
 /** @typedef {import('./protocol/generated/Balance').Balance} Balance */
 /** @typedef {import('./protocol/generated/BookSnapshot').BookSnapshot} BookSnapshot */
 /** @typedef {import('./protocol/generated/Command').Command} Command */
@@ -63,6 +63,11 @@ export const request = async (path, options = {}) => {
     // "Try again later" replies say how many seconds to wait.
     const retryAfter = Number(response.headers?.get?.('retry-after'))
     if (retryAfter > 0) error.retryAfter = retryAfter
+    // The server refused the login token we sent: tell the auth store, so the user is logged out.
+    // Compared as text because the shared ReasonCode list does not include the auth codes yet.
+    if (response.status === 401 && String(reason) === 'unauthorized' && getAuthToken()) {
+      notifyUnauthorized()
+    }
     throw error
   }
   return /** @type {T} */ (body)

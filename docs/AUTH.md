@@ -20,7 +20,7 @@ contain a `user_id`; the gateway derives identity from the request.
 | A3 | Sign-up always creates role `user`. `admin` and `issuer` accounts exist only via the seed script | Otherwise anyone could register as admin |
 | A4 | Username + password. The server stores only an Argon2 hash, never the password | Spec requires password hashing; real KYC/email stays out of scope (DECISIONS #11) |
 | A5 | Session token is a JWT sent as `Authorization: Bearer <token>` | Standard; works for every REST call |
-| A6 | JWT claims: `sub` (user id), `role`, `iat`, `exp`. Lifetime 8 hours | Short enough for a demo, long enough for a session |
+| A6 | JWT claims: `sub` (user id), `role`, `iat`, `exp`. Lifetime 2 hours (`DX_JWT_TTL_SECS` overrides it) | Short enough to limit a stolen token, long enough for a session |
 | A7 | WebSocket carries the token as `?token=<jwt>` | Browsers cannot set headers on a WebSocket |
 | A8 | Wrong username and wrong password give the same error | Does not reveal which usernames exist |
 | A9 | Money, ids and quantities keep the existing rules: integers, `<= Number.MAX_SAFE_INTEGER`, no floats | DECISIONS #8, #9 |

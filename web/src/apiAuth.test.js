@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { getMarkets, getOpenOrders } from './api.js'
-import { setAuthToken } from './authToken.js'
+import { setAuthToken, setUnauthorizedHandler } from './authToken.js'
 
 const jsonResponse = (body, status = 200, headers = {}) => ({
   ok: status >= 200 && status < 300,
@@ -11,6 +11,7 @@ const jsonResponse = (body, status = 200, headers = {}) => ({
 
 afterEach(() => {
   setAuthToken(null)
+  setUnauthorizedHandler(null)
   vi.unstubAllGlobals()
 })
 
@@ -66,5 +67,41 @@ describe('request helper', () => {
 
     expect(error.status).toBe(404)
     expect(error).not.toHaveProperty('retryAfter')
+  })
+})
+
+describe('when the server rejects the login token', () => {
+  const rejected = () => jsonResponse({ reason: 'unauthorized' }, 401)
+
+  it('tells the auth store, so it can log out', async () => {
+    const handler = vi.fn()
+    setUnauthorizedHandler(handler)
+    setAuthToken('abc.def')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(rejected()))
+
+    await expect(getMarkets()).rejects.toMatchObject({ status: 401, reason: 'unauthorized' })
+
+    expect(handler).toHaveBeenCalledTimes(1)
+  })
+
+  it('stays quiet when no token was sent', async () => {
+    const handler = vi.fn()
+    setUnauthorizedHandler(handler)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(rejected()))
+
+    await getMarkets().catch(() => {})
+
+    expect(handler).not.toHaveBeenCalled()
+  })
+
+  it('stays quiet for other kinds of 401', async () => {
+    const handler = vi.fn()
+    setUnauthorizedHandler(handler)
+    setAuthToken('abc.def')
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ reason: 'invalid_credentials' }, 401)))
+
+    await getMarkets().catch(() => {})
+
+    expect(handler).not.toHaveBeenCalled()
   })
 })

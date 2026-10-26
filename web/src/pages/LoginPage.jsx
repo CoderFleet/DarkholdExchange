@@ -9,6 +9,7 @@ export function LoginPage() {
   const login = useAuthStore((state) => state.login)
   const submitting = useAuthStore((state) => state.submitting)
   const error = useAuthStore((state) => state.error)
+  const sessionExpired = useAuthStore((state) => state.sessionExpired)
   const clearError = useAuthStore((state) => state.clearError)
   const location = useLocation()
 
@@ -33,7 +34,7 @@ export function LoginPage() {
         mode="login"
         onSubmit={login}
         submitting={submitting}
-        error={error}
+        error={error ?? (sessionExpired ? 'Your session has expired. Please log in again.' : null)}
         footer={
           <>
             No account? <Link to="/signup">Sign up</Link>

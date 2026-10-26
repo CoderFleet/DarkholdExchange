@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 /// Same identity type as `dx_types::UserId`.
 pub type UserId = u64;
 
-/// How long a token stays valid (docs/AUTH.md A6).
-const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(8 * 60 * 60);
+/// How long a token stays valid (docs/AUTH.md A6). `DX_JWT_TTL_SECS` overrides it.
+const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// First id handed to a new sign-up. Lower ids are reserved for seeded accounts.
 const FIRST_SIGNUP_ID: UserId = 200;
 /// Failed logins allowed per username inside `LOGIN_WINDOW`, then `429`.
@@ -229,6 +229,7 @@ impl AuthState {
     ///
     /// * `DX_JWT_SECRET`: signing secret (32+ chars). If unset, a random one is made, so every
     ///   restart logs everybody out. Set it for any real run.
+    /// * `DX_JWT_TTL_SECS`: how long a login lasts, in seconds (default 2 hours).
     /// * `DX_DEV_AUTH`: `0` turns the `x-dev-user` fallback off (real runs). Default on.
     /// * `DX_ADMIN_PASSWORD`, `DX_ISSUER_PASSWORD`: passwords of the seeded `admin` and
     ///   `issuer` accounts. With dev auth on and no value, a demo password is used.
@@ -248,7 +249,13 @@ impl AuthState {
                 bytes.to_vec()
             }
         };
-        let state = Self::new(&secret, DEFAULT_TOKEN_TTL, dev_auth);
+        let ttl = std::env::var("DX_JWT_TTL_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(Duration::from_secs)
+            .unwrap_or(DEFAULT_TOKEN_TTL);
+        let state = Self::new(&secret, ttl, dev_auth);
 
         let seed = |var: &str, demo: &str| -> Option<String> {
             match std::env::var(var) {
