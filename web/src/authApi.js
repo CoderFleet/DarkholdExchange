@@ -1,9 +1,9 @@
 // Calls for the auth endpoints in docs/AUTH.md.
-// While the Rust login does not exist, `isMockAuth` is true in dev and the stand-in in
-// mockAuth.js answers instead. To use the real server, set VITE_MOCK_AUTH=false in web/.env.local.
+// The real login (crates/auth) is the default. The browser-only stand-in in mockAuth.js is used
+// only in dev and only when you ask for it with VITE_MOCK_AUTH=true (for example in web/.env.local).
 import { mockLogin, mockMe, mockSignup } from './mockAuth'
 
-export const isMockAuth = import.meta.env.DEV && import.meta.env.VITE_MOCK_AUTH !== 'false'
+export const isMockAuth = import.meta.env.DEV && import.meta.env.VITE_MOCK_AUTH === 'true'
 
 /**
  * @param {string} path

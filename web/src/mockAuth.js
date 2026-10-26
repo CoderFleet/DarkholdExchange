@@ -3,7 +3,7 @@
 // because this is demo data in your own browser; the real server stores an Argon2 hash.
 
 const USERS_KEY = 'dx-mock-users'
-const TOKEN_LIFETIME_MS = 8 * 60 * 60 * 1000
+const TOKEN_LIFETIME_MS = 2 * 60 * 60 * 1000
 const FIRST_NEW_USER_ID = 200
 
 const SEED_USERS = {

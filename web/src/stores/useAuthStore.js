@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { authErrorText, getMe, login, signup } from '../authApi'
-import { setAuthToken } from '../authToken'
+import { setAuthToken, setUnauthorizedHandler } from '../authToken'
 
 const TOKEN_KEY = 'dx-auth-token'
 
@@ -38,7 +38,7 @@ export const useAuthStore = create((set) => {
     try {
       const { token, user } = await call()
       writeToken(token)
-      set({ token, user, status: 'authenticated', submitting: false })
+      set({ token, user, status: 'authenticated', submitting: false, sessionExpired: false })
     } catch (err) {
       set({ error: authErrorText(err), submitting: false })
     }
@@ -51,6 +51,8 @@ export const useAuthStore = create((set) => {
     status: 'loading',
     error: null,
     submitting: false,
+    // True when the server threw us out because the token expired or was rejected.
+    sessionExpired: false,
 
     restore: async () => {
       const token = readToken()
@@ -73,9 +75,17 @@ export const useAuthStore = create((set) => {
 
     logout: () => {
       writeToken(null)
-      set({ token: null, user: null, status: 'anonymous', error: null })
+      set({ token: null, user: null, status: 'anonymous', error: null, sessionExpired: false })
     },
 
     clearError: () => set({ error: null }),
   }
+})
+
+// If the server rejects our token (it expired, or the server restarted), log out. The protected
+// pages then send the user to the login page instead of showing errors.
+setUnauthorizedHandler(() => {
+  useAuthStore.getState().logout()
+  // Set after logout(), which clears the flag, so the login page can explain what happened.
+  useAuthStore.setState({ sessionExpired: true })
 })

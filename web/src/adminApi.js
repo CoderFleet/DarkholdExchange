@@ -29,7 +29,7 @@ const MESSAGES = {
   not_found: 'That event or tier no longer exists. Reload the page.',
   market_setup_failed: 'The exchange could not create the market. The tier is still a draft, try again.',
   unauthorized:
-    'The server did not accept your login. Log in again. (In dev, the real login needs VITE_MOCK_AUTH=false.)',
+    'The server did not accept your login. Log in again. (The mock login does not work here: VITE_MOCK_AUTH must not be true.)',
   forbidden: 'Only admins can use this page.',
 }
 
