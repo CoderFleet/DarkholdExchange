@@ -49,7 +49,7 @@ const withAuth = (options) => {
  * @param {RequestInit} [options]
  * @returns {Promise<T>}
  */
-const request = async (path, options = {}) => {
+export const request = async (path, options = {}) => {
   const response = await fetch(path, withAuth(options))
   /** @type {ErrorBody | null} */
   const body = await response.json().catch(() => null)
