@@ -90,7 +90,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
+| **T1 — Rudransh** | Escrow switch in the engine; WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
 | **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
@@ -129,7 +129,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 4. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
 5. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
 6. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-7. **Verification (T1/T2/T3):** Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+7. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
 8. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
