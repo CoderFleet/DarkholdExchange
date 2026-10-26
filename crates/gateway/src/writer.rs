@@ -8,16 +8,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::wal::{WalOp, WalSession};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    Asset, Balance, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill, MarketConfig,
-    MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq, UserId,
-    WsServerMessage,
+    Asset, Balance, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill,
+    MarketConfig, MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq,
+    UserId, WsServerMessage,
 };
 use hdrhistogram::Histogram;
 use tokio::sync::{broadcast, oneshot};
@@ -26,6 +27,7 @@ pub(crate) const RECENT_TRADES_LIMIT: usize = 200;
 const BASELINE_TRADES_LIMIT: usize = 20;
 const SNAPSHOT_CACHE_DEPTH: usize = 200;
 const MAX_LATENCY_US: u64 = 60_000_000;
+const MAX_COMMAND_BATCH: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriterError {
@@ -151,6 +153,13 @@ enum WriterRequest {
         config: MarketConfig,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    StateHash {
+        reply: oneshot::Sender<[u8; 32]>,
+    },
+    #[cfg(test)]
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
     Markets {
         reply: oneshot::Sender<Vec<MarketView>>,
     },
@@ -235,6 +244,17 @@ impl WriterHandle {
             Err(WriterError::QueueFull) => Err("queue_full".into()),
             Err(WriterError::Unavailable) => Err("writer_unavailable".into()),
         }
+    }
+
+    pub(crate) async fn state_hash(&self) -> Result<[u8; 32], WriterError> {
+        self.request(|reply| WriterRequest::StateHash { reply })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn shutdown(&self) -> Result<(), WriterError> {
+        self.request(|reply| WriterRequest::Shutdown { reply })
+            .await
     }
 
     pub(crate) async fn markets(&self) -> Result<Vec<MarketView>, WriterError> {
@@ -372,19 +392,34 @@ impl WriterHandle {
 }
 
 /// Start the core writer thread and return its handle plus shared metrics.
+#[cfg(test)]
 pub(crate) fn spawn_writer(
     core: Core,
     tx: broadcast::Sender<WsServerMessage>,
     recent_trades: Vec<Fill>,
     capacity: usize,
 ) -> (WriterHandle, Arc<MetricsState>) {
+    spawn_writer_with_wal(core, tx, recent_trades, capacity, None)
+}
+
+pub(crate) fn spawn_writer_with_wal(
+    core: Core,
+    tx: broadcast::Sender<WsServerMessage>,
+    mut recent_trades: Vec<Fill>,
+    capacity: usize,
+    wal: Option<WalSession>,
+) -> (WriterHandle, Arc<MetricsState>) {
     let metrics = Arc::new(MetricsState::new(core.last_seq()));
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel(capacity.max(1));
     let writer_metrics = metrics.clone();
+    if recent_trades.len() > RECENT_TRADES_LIMIT {
+        let excess = recent_trades.len() - RECENT_TRADES_LIMIT;
+        recent_trades.drain(0..excess);
+    }
 
     std::thread::Builder::new()
         .name("dx-core-writer".into())
-        .spawn(move || writer_loop(core, tx, recent_trades, writer_metrics, job_rx))
+        .spawn(move || writer_loop(core, tx, recent_trades, writer_metrics, job_rx, wal))
         .expect("spawn core writer");
 
     let handle = WriterHandle {
@@ -394,16 +429,199 @@ pub(crate) fn spawn_writer(
     (handle, metrics)
 }
 
+fn append_wal(wal: &mut Option<WalSession>, op: &WalOp, state_hash: [u8; 32]) {
+    if let Some(wal) = wal
+        && let Err(error) = wal.append(op, state_hash)
+    {
+        panic!("WAL append failed: {error}");
+    }
+}
+
+struct PendingCommand {
+    response: CommandResponse,
+    deltas: Vec<BookDelta>,
+    cached: bool,
+    wal_op: Option<WalOp>,
+    reply: oneshot::Sender<CommandResponse>,
+}
+
+fn process_command(
+    core: &mut Core,
+    metrics: &MetricsState,
+    user_id: UserId,
+    command: Command,
+    reply: oneshot::Sender<CommandResponse>,
+    enqueued_at: Instant,
+    wal_enabled: bool,
+) -> PendingCommand {
+    let queue_wait = enqueued_at.elapsed();
+    let core_started = Instant::now();
+    let wal_op = if wal_enabled {
+        Some(WalOp::Command {
+            user_id,
+            command: command.clone(),
+        })
+    } else {
+        None
+    };
+    let outcome = core.process_with_deltas(user_id, command);
+    let core_elapsed = core_started.elapsed();
+    metrics.record_command(queue_wait, core_elapsed);
+
+    let wal_op = if outcome.cached { None } else { wal_op };
+    let rejected = outcome.response.status == OrderStatus::Rejected;
+    metrics.commands_total.fetch_add(1, Ordering::Relaxed);
+    if rejected {
+        metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
+    }
+    metrics.seq.store(core.last_seq(), Ordering::Relaxed);
+
+    PendingCommand {
+        response: outcome.response,
+        deltas: outcome.deltas,
+        cached: outcome.cached,
+        wal_op,
+        reply,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_command_batch(
+    core: &mut Core,
+    tx: &broadcast::Sender<WsServerMessage>,
+    recent_trades: &mut Vec<Fill>,
+    metrics: &MetricsState,
+    snapshot_cache: &mut SnapshotCache,
+    wal: &mut Option<WalSession>,
+    jobs: &Receiver<WriterJob>,
+    stashed_job: &mut Option<WriterJob>,
+    first_enqueued_at: Instant,
+    first_user_id: UserId,
+    first_command: Command,
+    first_reply: oneshot::Sender<CommandResponse>,
+) -> bool {
+    let wal_enabled = wal.is_some();
+    let mut pending = vec![process_command(
+        core,
+        metrics,
+        first_user_id,
+        first_command,
+        first_reply,
+        first_enqueued_at,
+        wal_enabled,
+    )];
+    let mut disconnected = false;
+
+    while pending.len() < MAX_COMMAND_BATCH {
+        match jobs.try_recv() {
+            Ok(job) => {
+                metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                let enqueued_at = job.enqueued_at;
+                match job.request {
+                    WriterRequest::Command {
+                        user_id,
+                        command,
+                        reply,
+                    } => {
+                        pending.push(process_command(
+                            core,
+                            metrics,
+                            user_id,
+                            command,
+                            reply,
+                            enqueued_at,
+                            wal_enabled,
+                        ));
+                    }
+                    request => {
+                        *stashed_job = Some(WriterJob {
+                            enqueued_at,
+                            request,
+                        });
+                        break;
+                    }
+                }
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                disconnected = true;
+                break;
+            }
+        }
+    }
+
+    let wal_ops: Vec<_> = pending
+        .iter()
+        .filter_map(|pending| pending.wal_op.clone())
+        .collect();
+    let checkpoint_due = wal
+        .as_ref()
+        .is_some_and(|wal| wal.checkpoint_due(wal_ops.len()));
+    let state_hash = checkpoint_due.then(|| core.state_hash());
+    if let Some(wal) = wal
+        && !wal_ops.is_empty()
+        && let Err(error) = wal.append_batch(&wal_ops, state_hash)
+    {
+        panic!("WAL append failed: {error}");
+    }
+
+    for pending in pending {
+        let PendingCommand {
+            response,
+            deltas,
+            cached,
+            reply,
+            ..
+        } = pending;
+        if !cached && response.status != OrderStatus::Rejected {
+            for delta in &deltas {
+                snapshot_cache.invalidate(delta.market_id);
+                let _ = tx.send(WsServerMessage::Delta {
+                    delta: delta.clone(),
+                });
+            }
+
+            if !response.fills.is_empty() {
+                recent_trades.extend(response.fills.iter().cloned());
+                if recent_trades.len() > RECENT_TRADES_LIMIT {
+                    let excess = recent_trades.len() - RECENT_TRADES_LIMIT;
+                    recent_trades.drain(0..excess);
+                }
+            }
+
+            for fill in &response.fills {
+                snapshot_cache.invalidate(fill.market_id);
+                let _ = tx.send(WsServerMessage::Trade { fill: fill.clone() });
+            }
+        }
+        let _ = reply.send(response);
+    }
+
+    disconnected
+}
+
 fn writer_loop(
     mut core: Core,
     tx: broadcast::Sender<WsServerMessage>,
     mut recent_trades: Vec<Fill>,
     metrics: Arc<MetricsState>,
     jobs: Receiver<WriterJob>,
+    mut wal: Option<WalSession>,
 ) {
     let mut snapshot_cache = SnapshotCache::default();
-    while let Ok(job) = jobs.recv() {
-        metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+    let mut stashed_job: Option<WriterJob> = None;
+    loop {
+        let job = if let Some(job) = stashed_job.take() {
+            job
+        } else {
+            match jobs.recv() {
+                Ok(job) => {
+                    metrics.queue_depth.fetch_sub(1, Ordering::Relaxed);
+                    job
+                }
+                Err(_) => break,
+            }
+        };
         let enqueued_at = job.enqueued_at;
 
         match job.request {
@@ -412,51 +630,44 @@ fn writer_loop(
                 command,
                 reply,
             } => {
-                let queue_wait = enqueued_at.elapsed();
-                let core_started = Instant::now();
-                let outcome = core.process_with_deltas(user_id, command);
-                let core_elapsed = core_started.elapsed();
-                metrics.record_command(queue_wait, core_elapsed);
-
-                let publish = !outcome.cached && outcome.response.status != OrderStatus::Rejected;
-                if publish {
-                    for delta in &outcome.deltas {
-                        snapshot_cache.invalidate(delta.market_id);
-                        let _ = tx.send(WsServerMessage::Delta {
-                            delta: delta.clone(),
-                        });
-                    }
-
-                    if !outcome.response.fills.is_empty() {
-                        recent_trades.extend(outcome.response.fills.iter().cloned());
-                        if recent_trades.len() > RECENT_TRADES_LIMIT {
-                            let excess = recent_trades.len() - RECENT_TRADES_LIMIT;
-                            recent_trades.drain(0..excess);
-                        }
-                    }
-
-                    for fill in &outcome.response.fills {
-                        snapshot_cache.invalidate(fill.market_id);
-                        let _ = tx.send(WsServerMessage::Trade { fill: fill.clone() });
-                    }
+                let disconnected = process_command_batch(
+                    &mut core,
+                    &tx,
+                    &mut recent_trades,
+                    &metrics,
+                    &mut snapshot_cache,
+                    &mut wal,
+                    &jobs,
+                    &mut stashed_job,
+                    enqueued_at,
+                    user_id,
+                    command,
+                    reply,
+                );
+                if disconnected {
+                    break;
                 }
-
-                let rejected = outcome.response.status == OrderStatus::Rejected;
-                metrics.commands_total.fetch_add(1, Ordering::Relaxed);
-                if rejected {
-                    metrics.rejected_total.fetch_add(1, Ordering::Relaxed);
-                }
-                metrics.seq.store(core.last_seq(), Ordering::Relaxed);
-                let _ = reply.send(outcome.response);
             }
             WriterRequest::CreateMarket { config, reply } => {
                 let market_id = config.id;
+                let wal_op = WalOp::AddMarket {
+                    config: config.clone(),
+                };
                 let result = core.add_market(config);
                 if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
                     snapshot_cache.invalidate(market_id);
                     metrics.seq.store(core.last_seq(), Ordering::Relaxed);
                 }
                 let _ = reply.send(result);
+            }
+            WriterRequest::StateHash { reply } => {
+                let _ = reply.send(core.state_hash());
+            }
+            #[cfg(test)]
+            WriterRequest::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
             }
             WriterRequest::Markets { reply } => {
                 let views = core
@@ -527,7 +738,15 @@ fn writer_loop(
                 client_request_id,
                 reply,
             } => {
+                let wal_op = WalOp::Deposit {
+                    user_id,
+                    amount,
+                    client_request_id,
+                };
                 let result = core.deposit_cash(user_id, amount, client_request_id);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
                 let _ = reply.send(result);
             }
             WriterRequest::Issue {
@@ -537,7 +756,16 @@ fn writer_loop(
                 client_request_id,
                 reply,
             } => {
+                let wal_op = WalOp::Issue {
+                    user_id,
+                    market_id,
+                    qty,
+                    client_request_id,
+                };
                 let result = core.issue_passes(user_id, market_id, qty, client_request_id);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
                 let _ = reply.send(result);
             }
             WriterRequest::Baseline {
@@ -628,6 +856,7 @@ fn recent_trades_for(
 mod tests {
     use super::*;
     use dx_types::{PlaceLimit, PlaceMarket, Side, seed_markets};
+    use tempfile::tempdir;
 
     const MARKET: MarketId = 1;
 
@@ -703,6 +932,61 @@ mod tests {
             writer.snapshot(100, 20).await.unwrap().unwrap().asks[0].qty,
             2
         );
+    }
+
+    #[tokio::test]
+    async fn wal_recovery_restores_the_same_state_hash() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let (tx, _rx) = broadcast::channel(16);
+        let (writer, _metrics) =
+            spawn_writer_with_wal(funded_core(), tx, Vec::new(), 16, Some(wal));
+
+        writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
+        let mut config = seed_markets().into_iter().next().unwrap();
+        config.id = 100;
+        config.event_id = 99;
+        config.name = "WAL market".into();
+        writer.create_market(config).await.unwrap();
+        writer.issue(2, 100, 2, 7).await.unwrap().unwrap();
+        writer
+            .command(
+                2,
+                Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: 100,
+                    side: Side::Sell,
+                    price_ticks: 5_000,
+                    qty: 2,
+                }),
+            )
+            .await
+            .unwrap();
+        writer
+            .command(
+                1,
+                Command::PlaceMarket(PlaceMarket {
+                    client_order_id: 2,
+                    market_id: 100,
+                    side: Side::Buy,
+                    qty: 2,
+                    protect_price_ticks: 5_000,
+                }),
+            )
+            .await
+            .unwrap();
+
+        let expected_hash = writer.state_hash().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut restored = funded_core();
+        let fills = crate::wal::replay(&recovered.replayed_records, &mut restored).unwrap();
+        assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(restored.balance(3, Asset::Cash).available, 1_000_000);
     }
 
     #[test]

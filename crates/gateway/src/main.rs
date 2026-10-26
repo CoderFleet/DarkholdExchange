@@ -5,6 +5,7 @@
 //! comes from the login token (`Authorization: Bearer`, docs/AUTH.md). While `DX_DEV_AUTH` is on
 //! (the default locally), requests without a token may still use `x-dev-user` (default user 1).
 
+mod wal;
 mod writer;
 
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
-use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer};
+use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer_with_wal};
 
 #[derive(Clone)]
 struct AppState {
@@ -178,15 +179,45 @@ struct DevIssue {
     client_request_id: ClientOrderId,
 }
 
+fn seeded_core() -> (Core, Vec<Fill>) {
+    let mut core = Core::new(seed_markets()).expect("valid seed markets");
+    let seed_fills = seed_demo(&mut core);
+    (core, seed_fills)
+}
+
+fn open_state(wal_dir: &str) -> Result<(Core, Vec<Fill>, wal::WalSession), String> {
+    let (mut core, mut recent_trades) = seeded_core();
+    let recovered = dkx_wal::recover(wal_dir).map_err(|error| format!("WAL recovery: {error}"))?;
+    if recovered.snapshot.is_some() {
+        return Err("WAL snapshots are not supported yet".into());
+    }
+
+    let replayed = wal::replay(&recovered.replayed_records, &mut core)?;
+    recent_trades.extend(replayed);
+    core.check_invariants()?;
+    let session = wal::WalSession::open(wal_dir, recovered.last_seq, recovered.last_hash)?;
+    Ok((core, recent_trades, session))
+}
+
 #[tokio::main]
 async fn main() {
     let addr = std::env::var("GATEWAY_ADDR").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let wal_enabled = std::env::var("DX_WAL")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let wal_dir = std::env::var("DX_WAL_DIR").unwrap_or_else(|_| ".".into());
 
-    let mut core = Core::new(seed_markets()).expect("valid seed markets");
-    let seed_fills = seed_demo(&mut core);
+    let (core, seed_fills, wal) = if wal_enabled {
+        let (core, fills, wal) = open_state(&wal_dir).expect("WAL recovery");
+        (core, fills, Some(wal))
+    } else {
+        let (core, fills) = seeded_core();
+        (core, fills, None)
+    };
+    println!("core state hash: {}", hex::encode(core.state_hash()));
 
     let (tx, _) = broadcast::channel(512);
-    let (writer, metrics) = spawn_writer(core, tx, seed_fills, queue_capacity());
+    let (writer, metrics) = spawn_writer_with_wal(core, tx, seed_fills, queue_capacity(), wal);
     // Events and tiers for the admin console. Publishing creates a live market
     // through the same single-writer queue as every other core change.
     let admin = admin_state(writer.clone());
@@ -201,6 +232,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/health", get(health))
+        .route("/api/state/hash", get(state_hash))
         .route("/api/markets", get(markets))
         .route("/api/markets/{market_id}/book", get(book))
         .route("/api/markets/{market_id}/trades", get(trades))
@@ -242,6 +274,18 @@ fn queue_capacity() -> usize {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+#[derive(Serialize)]
+struct StateHashView {
+    state_hash: String,
+}
+
+async fn state_hash(State(state): State<AppState>) -> Result<Json<StateHashView>, ApiError> {
+    let state_hash = state.writer.state_hash().await.map_err(writer_error)?;
+    Ok(Json(StateHashView {
+        state_hash: hex::encode(state_hash),
+    }))
 }
 
 async fn markets(State(state): State<AppState>) -> Result<Json<Vec<MarketView>>, ApiError> {
@@ -1333,7 +1377,9 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::writer::spawn_writer;
     use dx_types::{BookDelta, BookLevel, LevelChange, Ticks};
+    use tempfile::tempdir;
 
     const MARKET: MarketId = 1;
     const PRICE: Ticks = 5_000;
@@ -1360,6 +1406,31 @@ mod tests {
 
     async fn run_command(state: &AppState, user_id: UserId, command: Command) -> CommandResponse {
         execute_command(state, user_id, command).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn wal_open_state_replays_on_the_seeded_baseline() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let wal =
+            wal::WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let (core, seed_fills) = seeded_core();
+        let seed_fill_count = seed_fills.len();
+        let (tx, _rx) = broadcast::channel(16);
+        let (writer, _metrics) = spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal));
+
+        let response = writer
+            .command(1, limit(900001, Side::Sell, 5_200, 1))
+            .await
+            .unwrap();
+        assert_eq!(response.status, OrderStatus::Rested);
+        let expected_hash = writer.state_hash().await.unwrap();
+        writer.shutdown().await.unwrap();
+        drop(writer);
+
+        let (restored, recent_trades, _session) = open_state(dir.path().to_str().unwrap()).unwrap();
+        assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(recent_trades.len(), seed_fill_count);
     }
 
     fn limit(client_order_id: ClientOrderId, side: Side, price_ticks: Ticks, qty: Qty) -> Command {

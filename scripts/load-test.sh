@@ -33,6 +33,7 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 json="$result_dir/${stamp}-${result_suffix}.json"
 markdown="$result_dir/${stamp}-${result_suffix}.md"
 log="$(mktemp "${TMPDIR:-/tmp}/dx-load-gateway.XXXXXX")"
+wal_dir="$(mktemp -d "${TMPDIR:-/tmp}/dx-load-wal.XXXXXX")"
 
 export DX_COMMAND_QUEUE_CAPACITY="$QUEUE_CAPACITY"
 
@@ -49,6 +50,7 @@ cleanup() {
     else
         rm -f "$log"
     fi
+    rm -rf "$wal_dir"
     exit "$status"
 }
 trap cleanup EXIT
@@ -58,6 +60,7 @@ cargo build --release -p dx-gateway -p dx-simulator
 
 GATEWAY_ADDR="$HOST:$PORT" \
     DX_COMMAND_QUEUE_CAPACITY="$QUEUE_CAPACITY" \
+    DX_WAL_DIR="$wal_dir" \
     target/release/dx-gateway >"$log" 2>&1 &
 gateway_pid=$!
 
@@ -107,6 +110,7 @@ fi
         printf -- '- CPU: `%s`\n' "$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
     fi
     printf -- '- Gateway: release build, `DX_COMMAND_QUEUE_CAPACITY=%s`\n' "$QUEUE_CAPACITY"
+    printf -- '- WAL: enabled with a fresh temporary directory\n'
     printf -- '- Command: `target/release/dx-load %s`\n\n' "${load_args[*]}"
     target/release/dx-load "${load_args[@]}"
 } | tee "$markdown"

@@ -612,6 +612,7 @@ name = "dx-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dkx-wal",
  "dx-admin",
  "dx-auth",
  "dx-core",
@@ -623,6 +624,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -1,7 +1,10 @@
 # Load baselines
 
 `just load` starts a fresh release gateway on `127.0.0.1:18080`, seeds 32 isolated load users,
-and runs the `dx-load` harness for 10 seconds at 1,000 placements/s. Each load user rests a
+and runs the `dx-load` harness for 10 seconds at 1,000 placements/s. The runner gives the gateway a
+fresh temporary WAL directory, so the default crash-safe path is exercised without carrying state
+between runs. The writer group-commits a batch of commands with one fsync and writes a state
+checkpoint at least every 256 operations. Each load user rests a
 one-unit buy below the best bid and immediately cancels it, so the run exercises the full REST
 command path, the bounded writer queue, core matching, delta publication, and WebSocket fanout.
 
@@ -78,6 +81,40 @@ headroom run as the sustained fill-throughput result.
 
 ## Baselines
 
+### 2026-10-26 — Apple M2, 1,000 placements/s target, WAL enabled
+
+- Report: [20261026T193846Z-load.md](20261026T193846Z-load.md) /
+  [JSON](20261026T193846Z-load.json)
+- Host: Apple M2 (8 logical CPUs), macOS 25.5, release build
+- Gateway queue capacity: 1,024
+- WAL: enabled, fresh temporary directory, group commit + 256-op state checkpoints
+- Load: 32 users, 4 market WebSockets, 10 seconds, 1,000 placements/s target
+- Achieved: 995.50 placements/s and 2,010.90 accepted commands/s
+- Client p99: 7.54 ms place ack, 7.90 ms cancel ack
+- Probe end-to-end p99: 7.24 ms place, 9.57 ms cancel
+- Gateway p99: 3.00 ms queue wait, 10 us core
+- Errors: 0 rejected, 0 429, 0 503, 0 resyncs, 0 sequence gaps
+- Fanout: 79,648 deltas across 4 connections (7,758.43 deltas/s aggregate)
+- Note: this is the default WAL-on path. The earlier 2026-10-23 runs are the in-memory
+  (`DX_WAL=0`) baseline; compare them separately.
+
+### 2026-10-26 — Apple M2, 1,000 fills/s target, WAL enabled
+
+- Report: [20261026T193748Z-fills.md](20261026T193748Z-fills.md) /
+  [JSON](20261026T193748Z-fills.json)
+- Host: Apple M2 (8 logical CPUs), macOS 25.5, release build
+- Gateway queue capacity: 1,024
+- WAL: enabled, fresh temporary directory, group commit + 256-op state checkpoints
+- Setup: 3,000 makers, 12,000 one-unit asks, rested in 2.41 s
+- Load: 3,000 takers, 32 workers, 4 market WebSockets, 10 seconds, 1,000 fills/s target
+- Achieved: 999.90 fills/s; 10,000 acknowledged fills; 1,019.90 accepted commands/s
+- Fill acknowledgement p99: 8.88 ms (p99.9 10.46 ms; max 12.06 ms)
+- Probe end-to-end p99: 7.40 ms place, 10.57 ms cancel (one low-rate probe outlier)
+- Gateway p99: 5.76 ms queue wait, 9 us core
+- Errors: 0 rejected, 0 429, 0 503, 0 resyncs, 0 sequence gaps
+- Fanout: 10,000 deltas and 10,000 trades per socket; 40,000 of each across 4 connections
+  (3,898.26 deltas/s aggregate); all 10,000 response fills matched WS trades
+
 ### 2026-10-23 — Apple M2, 1,000 placements/s target
 
 - Report: [20261023T025941Z-load.md](20261023T025941Z-load.md) /
@@ -141,6 +178,21 @@ headroom run as the sustained fill-throughput result.
   4 connections (4,291.43 deltas/s aggregate); all 11,000 response fills matched WS trades
 
 ## Spec target comparison
+
+### 2026-10-26 — WAL enabled (current default)
+
+| Target from `docs/spec/README.md` | Measured | Status |
+|---|---|---|
+| 1,000+ order submissions/s sustained | 995.50 placements/s; 2,010.90 accepted commands/s | Met within 1% of the target |
+| 1,000+ fills/s with matching, settlement, and ledger writes | 999.90 fills/s; 10,000 acknowledged fills | Met |
+| Engine p99 in microseconds | 10 us core p99 place-cancel; 9 us core p99 fills | Met |
+| End-to-end p99 < 10 ms at 1,000 orders/s | 7.54 ms place ack; 7.90 ms cancel ack; 8.88 ms fill ack | Met on the main paths |
+| k6/Locust benchmarks | Rust `dx-load` harness | Not met as a named tool |
+
+The low-rate fill probe's cancel path p99 was 10.57 ms, just above 10 ms; the main fill
+acknowledgement p99 was 8.88 ms. All runs had zero rejects, 429s, 503s, resyncs, and sequence gaps.
+
+### 2026-10-23 — in-memory baseline (`DX_WAL=0`)
 
 | Target from `docs/spec/README.md` | Measured | Status |
 |---|---|---|

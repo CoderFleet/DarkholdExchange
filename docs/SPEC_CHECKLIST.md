@@ -27,11 +27,11 @@
 | Order-book replay/scrubber | 🟡 | Core replay is covered by a test; there is no replay API or UI scrubber. |
 | Live metrics/latency panel | ✅ | Gateway histograms + `/api/metrics/latency` + `/speed` panel are merged. |
 | PostgreSQL read models | 🟡 | `dkx-projection` and migrations exist; the gateway does not use them yet. |
-| WAL + crash recovery | 🟡 | `dkx-wal` has records, snapshots, recovery, and tests; it is not wired into the gateway. |
+| WAL + crash recovery | ✅ | Gateway writer group-commits every non-cached command, successful deposit/issuance, and market creation as fsynced operation records with a post-state checkpoint at least every 256 operations. Startup replays and verifies the checkpoints. Live SIGKILL restart preserved the same state hash and book. |
 | Nginx/Caddy + Docker deployment | ❌ | `docker-compose.yml` only starts PostgreSQL. There is no app container, proxy, or one-command deployment. |
-| 1,000+ orders/s, µs engine p99, <10 ms e2e p99 | ✅ | Measured with the Rust load harness and recorded under `bench/results/`. Not enforced in CI. |
+| 1,000+ orders/s, µs engine p99, <10 ms e2e p99 | ✅ | WAL-on 2026-10-26 runs: 995.50 placements/s and 999.90 fills/s; p99 7.54 ms place, 8.88 ms fill. Recorded under `bench/results/`. Not enforced in CI. |
 | Differential testing vs reference matcher | ❌ | Deferred by T1; not planned for the current demo. |
-| Deterministic replay from the log | 🟡 | In-memory core replay test exists; no wired WAL replay through the gateway. |
+| Deterministic replay from the log | ✅ | Gateway recovery replays WAL operations into the seeded core and checks stored post-state checkpoints. Workspace tests and a live SIGKILL restart produce the same final hash. |
 | k6/Locust thresholds | ❌ | `bench/k6` and `bench/locust` are empty; the custom Rust harness is the current substitute. |
 | Playwright E2E | ❌ | `@playwright/test` is installed, but there is no config or E2E suite. |
 | fast-check property tests | ❌ | `fast-check` is installed, but no frontend property tests use it. |
@@ -63,11 +63,11 @@
 | 19 | Order-book replay/scrubber | 🟡 | Core replay test; no live replay API. | Add snapshot + delta replay endpoint and a UI time scrubber. |
 | 20 | Live metrics/latency panel | ✅ | `/api/metrics/latency`, gateway histograms, `/speed`, `latency.*`, `SpeedPanel.jsx`. | Populate it by placing orders during the demo. |
 | 21 | PostgreSQL read models | 🟡 | `crates/dkx-projection`, migrations, SQL queries. Not wired into gateway. | Start the projection worker behind a flag; add integration test. |
-| 22 | WAL + crash recovery | 🟡 | `crates/dkx-wal` records, snapshots, recovery tests. Not wired. | Wire writer/recovery into gateway; verify restart → same state hash. |
+| 22 | WAL + crash recovery | ✅ | `dkx-wal` record/hash-chain/recovery plus gateway `wal.rs`; writer group-commits commands, deposits, issuance, and market creation, with a post-state checkpoint at least every 256 operations. Live check placed 261 commands (crossing a state checkpoint) plus a resting order, `SIGKILL`ed the gateway, restarted, and matched `/api/state/hash` and the book exactly. | Full-log replay is wired; periodic snapshots/compaction are still a follow-up. |
 | 23 | Docker/Caddy/nginx deployment | ❌ | Compose only includes `db`. | Add app image, proxy config, health checks, one-command demo. |
-| 24 | Performance targets | ✅ | `bench/results/` documents measured load. | Add CI thresholds or clearly document the substitute. |
+| 24 | Performance targets | ✅ | `bench/results/` records WAL-on 2026-10-26 runs: 995.50 placements/s, 999.90 fills/s, 7.54 ms place ack p99, 8.88 ms fill ack p99. | Add CI thresholds or clearly document the substitute. |
 | 25 | Differential matcher test | ❌ | No reference matcher. Deferred by T1. | Not planned for the current demo; revisit only if matching correctness needs stronger verification. |
-| 26 | Deterministic WAL replay | 🟡 | Core replay test; WAL recovery tests. | Prove gateway restart produces the same state hash. |
+| 26 | Deterministic WAL replay | ✅ | `wal::replay` rebuilds state and verifies periodic post-state checkpoints; writer recovery tests and the live restart check pass. | — |
 | 27 | k6/Locust load thresholds | ❌ | Empty `bench/k6` and `bench/locust`; Rust harness used instead. | Add k6 or document a justified equivalent. |
 | 28 | Playwright E2E | ❌ | Package installed; no config/tests. | Add smoke flows: login, place order, fill, verify, speed. |
 | 29 | fast-check frontend tests | ❌ | Package installed; no usage in `web/src`. | Add property tests for book rebuild/resync or remove the dependency. |
@@ -91,7 +91,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
-| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
+| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
 | **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work.
@@ -99,10 +99,23 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 ## Known caveats / quick fixes
 
 - **Solvency snapshot `seq`:** it currently uses the core command sequence, but dev deposits/top-ups
-  bypass `next_seq`. Replace it with a real state version when the WAL/state version is wired.
+  bypass `next_seq`. Replace it with a single state version, such as the WAL sequence, when the
+  solvency worker is wired to the log.
+- **WAL snapshots/compaction are not wired:** startup rejects a snapshot and replays the full log.
+  Periodic snapshots remain a follow-up; the current path is correct but grows with the log.
+- **WAL replay baseline is the demo seed:** `seed_demo` is not logged. Changing the seed changes the
+  starting state, so an old log will fail its stored state-hash check and startup will abort. Clear
+  `data/log` after changing the seed in development.
+- **WAL is enabled by default:** records land under `<DX_WAL_DIR>/data/log` (default `./data/log`).
+  Set `DX_WAL=0` for in-memory benchmarks. If append/fsync fails, the writer stops rather than
+  serving unlogged state.
+- **WAL state checkpoints are periodic:** a full core state hash is written at least every 256
+  operations, not after every command. The per-record hash chain still authenticates every WAL
+  record; the checkpoint catches non-deterministic replay at the next boundary. A short run may end
+  with a trailing uncheckpointed batch, which replay accepts.
 - **Admin-published markets need a reload:** publishing creates the market and its book in the
   engine, but there is no WebSocket “market opened” frame yet. The market appears through
-  `/api/markets` on the next load.
+  `/api/markets` on the next load. Issuance is still required before trading.
 - **Issuer page is a placeholder.**
 - **WebSocket identity is unauthenticated:** `WsQuery.user_id` is accepted from the URL.
 - **`web/full-smoke-run.mjs` is not part of the repo:** it has a hard-coded temp path and imports
@@ -113,14 +126,14 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-2. **Escrow (T2 — Shraddha, with T1 switch + T3 timer):** state machine, ed25519 receipts, timeout refunds.
-3. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
-4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-6. **Verification (T1/T2/T3):** deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage. Differential matcher is deferred.
-7. **Operations (T2 + T3):** wire WAL, wire PostgreSQL projection, Docker/Caddy deployment.
-8. **Issuer (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add the issuer console and pass-supply view.
+1. **Issuer console (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add role-checked pass issuance and a supply view so new markets are tradable without dev endpoints.
+2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
+3. **Escrow (T2 — Shraddha, with T1 switch + T3 timer):** state machine, ed25519 receipts, timeout refunds.
+4. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
+5. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+6. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
+7. **Verification (T1/T2/T3):** Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+8. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
 

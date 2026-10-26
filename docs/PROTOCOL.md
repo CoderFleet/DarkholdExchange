@@ -171,6 +171,19 @@ gateway endpoints return `429` with `ReasonCode::QueueFull` and `Retry-After: 1`
 writer returns `503`. Capacity defaults to 1024 and is configurable with
 `DX_COMMAND_QUEUE_CAPACITY`.
 
+The gateway also exposes a public state fingerprint used to verify WAL recovery:
+
+```http
+GET /api/state/hash
+```
+
+```json
+{ "state_hash": "ddeb4382d5b67d0ea610c86891e43017b548eed02ac65a7219287da1a0aabf8e" }
+```
+
+It is a deterministic hash of the engine books, ledger balances, open-buy reservations, and core
+sequence. It is not a balance or account identifier.
+
 ### 2.7 Temporary aliases
 
 These remain available so the current terminal keeps working. New code should use the canonical

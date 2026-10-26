@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use crossbeam_queue::ArrayQueue;
-use dkx_wal::{GENESIS_PREV_HASH, LogRecord, WalWriter, recover};
+use dkx_wal::{GENESIS_PREV_HASH, LogRecord, Wal, WalWriter, recover};
 use tempfile::tempdir;
 
 #[test]
@@ -106,6 +106,56 @@ fn test_torn_final_record_is_dropped() {
     let recovered = recover(dir.path()).expect("recover");
     assert_eq!(recovered.last_seq, 5);
     assert_eq!(recovered.replayed_records.len(), 5);
+}
+
+#[test]
+fn test_torn_first_record_does_not_hide_later_records() {
+    let dir = tempdir().expect("tempdir");
+    let log_dir = dir.path().join("data/log");
+    fs::create_dir_all(&log_dir).expect("log dir");
+    let log_file = log_dir.join("00000000000000000001.log");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file)
+        .expect("open");
+    file.write_all(&[0, 0, 0, 100, 0, 0, 0, 6, 0, 0])
+        .expect("write torn");
+    file.sync_all().expect("sync");
+    drop(file);
+
+    let recovered = recover(dir.path()).expect("recover torn file");
+    assert_eq!(recovered.last_seq, 0);
+    assert_eq!(recovered.replayed_records.len(), 0);
+
+    let mut wal = Wal::open(dir.path(), recovered.last_seq, recovered.last_hash).expect("wal");
+    wal.append(1, b"after-torn".to_vec()).expect("append");
+    drop(wal);
+
+    let recovered = recover(dir.path()).expect("recover new segment");
+    assert_eq!(recovered.last_seq, 1);
+    assert_eq!(recovered.replayed_records.len(), 1);
+    assert_eq!(recovered.replayed_records[0].payload, b"after-torn");
+}
+
+#[test]
+fn test_sync_wal_appends_a_batch_and_recovers() {
+    let dir = tempdir().expect("tempdir");
+    let mut wal = Wal::open(dir.path(), 0, GENESIS_PREV_HASH).expect("wal");
+
+    let records = wal
+        .append_batch(&[(1, b"first".to_vec()), (2, b"second".to_vec())])
+        .expect("append");
+    assert_eq!(records.len(), 2);
+    assert_eq!(wal.last_seq(), 2);
+    assert_eq!(wal.last_hash(), records[1].hash);
+    drop(wal);
+
+    let recovered = recover(dir.path()).expect("recover");
+    assert_eq!(recovered.last_seq, 2);
+    assert_eq!(recovered.last_hash, records[1].hash);
+    assert_eq!(recovered.replayed_records[0].payload, b"first");
+    assert_eq!(recovered.replayed_records[1].payload, b"second");
 }
 
 #[test]

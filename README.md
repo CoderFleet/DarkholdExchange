@@ -9,6 +9,22 @@ High-frequency secondary marketplace with an in-memory limit order book.
     just load     # repeatable gateway load baseline
     just load-fills  # repeatable fill-heavy gateway baseline
 
+## Persistence
+
+The gateway is crash-safe by default. Every non-cached command, successful deposit/issuance, and
+runtime market creation is appended to a hash-chained write-ahead log in group-committed batches,
+then fsynced before the caller gets a reply. A full post-state checkpoint is written at least every
+256 operations. Startup replays the log into the seeded demo state and aborts if any stored
+checkpoint does not match.
+
+- `DX_WAL_DIR` sets the base directory; records land in `<dir>/data/log` (default `./data/log`).
+- `DX_WAL=0` disables the WAL for in-memory benchmarks.
+- `GET /api/state/hash` returns the current core state hash.
+- Full-log replay is wired; periodic snapshot compaction is still a follow-up.
+- State checkpoints are periodic, not per command; the record hash chain authenticates every record.
+- The demo seed is the replay baseline and is not itself logged. Clear `data/log` after changing
+  `seed_demo` in development.
+
 ## Docs
 - [T1 protocol contract](docs/PROTOCOL.md) — frozen REST/WS shapes and delta rules
 - [Development plan](docs/PLAN.md) — build order, sprints, protocol v1, risks

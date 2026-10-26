@@ -132,8 +132,29 @@ impl WalWriter {
             file.sync_all()?;
         }
 
+        // Never reuse an existing segment name. Recovery drops a torn tail, so
+        // appending after those bytes would make the new records unreachable.
+        let mut max_name = 0;
+        for entry in fs::read_dir(self.base_dir.join("data/log"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
+                continue;
+            }
+            if let Some(name) = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok())
+            {
+                max_name = max_name.max(name);
+            }
+        }
+
         self.current_segment_index += 1;
-        let filename = format!("{:020}.log", self.last_seq + 1);
+        let next_name = self
+            .last_seq
+            .saturating_add(1)
+            .max(max_name.saturating_add(1));
+        let filename = format!("{next_name:020}.log");
         let path = self.base_dir.join("data/log").join(filename);
 
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
