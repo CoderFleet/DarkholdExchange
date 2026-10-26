@@ -2,7 +2,8 @@
 //!
 //! REST is command-in / response-out. The WebSocket streams ordered deltas and
 //! trades; snapshots are only baselines and lag-recovery checkpoints. Identity
-//! is simulated for the demo via `x-dev-user` (default user 1).
+//! comes from the login token (`Authorization: Bearer`, docs/AUTH.md). While `DX_DEV_AUTH` is on
+//! (the default locally), requests without a token may still use `x-dev-user` (default user 1).
 
 mod writer;
 
@@ -34,6 +35,7 @@ use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writ
 struct AppState {
     writer: WriterHandle,
     metrics: Arc<MetricsState>,
+    auth: dx_auth::AuthState,
 }
 
 #[derive(Debug)]
@@ -41,11 +43,19 @@ struct ApiError {
     status: StatusCode,
     body: Json<ErrorBody>,
     retry_after: bool,
+    /// Login errors (`unauthorized`, `forbidden`) are not in the shared `ReasonCode` list yet
+    /// (docs/AUTH.md), so they are sent as plain text instead of `body`.
+    raw_reason: Option<&'static str>,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        let mut response = (self.status, self.body).into_response();
+        let mut response = match self.raw_reason {
+            Some(reason) => {
+                (self.status, Json(serde_json::json!({ "reason": reason }))).into_response()
+            }
+            None => (self.status, self.body).into_response(),
+        };
         if self.retry_after {
             response
                 .headers_mut()
@@ -63,7 +73,27 @@ fn api_error(status: StatusCode, reason: ReasonCode) -> ApiError {
             status,
             StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
         ),
+        raw_reason: None,
     }
+}
+
+fn auth_error(status: StatusCode, reason: &'static str) -> ApiError {
+    ApiError {
+        status,
+        body: Json(ErrorBody {
+            reason: ReasonCode::InvalidRequest,
+        }),
+        retry_after: false,
+        raw_reason: Some(reason),
+    }
+}
+
+fn unauthorized() -> ApiError {
+    auth_error(StatusCode::UNAUTHORIZED, "unauthorized")
+}
+
+fn forbidden() -> ApiError {
+    auth_error(StatusCode::FORBIDDEN, "forbidden")
 }
 
 fn writer_error(error: WriterError) -> ApiError {
@@ -145,9 +175,13 @@ async fn main() {
 
     let (tx, _) = broadcast::channel(512);
     let (writer, metrics) = spawn_writer(core, tx, seed_fills, queue_capacity());
-    let state = AppState { writer, metrics };
-    // Login, sign-up and /api/me (docs/AUTH.md).
+    // Login, sign-up and /api/me (docs/AUTH.md), and the check every other endpoint uses.
     let auth = dx_auth::AuthState::from_env();
+    let state = AppState {
+        writer,
+        metrics,
+        auth: auth.clone(),
+    };
     // Events and tiers for the admin console. Publishing does not reach the engine yet.
     let admin = dx_admin::AdminState::without_engine();
 
@@ -265,7 +299,7 @@ async fn command(
     headers: HeaderMap,
     payload: Result<Json<Command>, JsonRejection>,
 ) -> Result<Json<CommandResponse>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let command = json_body(payload)?;
     finish_command(execute_command(&state, user_id, command).await?)
 }
@@ -275,7 +309,7 @@ async fn place_order(
     headers: HeaderMap,
     payload: Result<Json<Command>, JsonRejection>,
 ) -> Result<Json<CommandResponse>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let command = json_body(payload)?;
     if matches!(command, Command::Cancel(_)) {
         return Err(api_error(
@@ -292,7 +326,7 @@ async fn cancel_order(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<CommandResponse>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let client_order_id = query
         .client_order_id
         .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))?;
@@ -306,7 +340,9 @@ async fn cancel_order(
 async fn balances(
     Path(user_id): Path<UserId>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<Balance>>, ApiError> {
+    authorize_user(&state.auth, &headers, user_id)?;
     let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
     Ok(Json(balances))
 }
@@ -326,14 +362,16 @@ async fn open_orders_current(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<OpenOrderView>>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     Ok(Json(open_orders_for(&state, user_id).await?))
 }
 
 async fn open_orders(
     Path(user_id): Path<UserId>,
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> Result<Json<Vec<OpenOrderView>>, ApiError> {
+    authorize_user(&state.auth, &headers, user_id)?;
     Ok(Json(open_orders_for(&state, user_id).await?))
 }
 
@@ -359,6 +397,7 @@ async fn dev_deposit(
     State(state): State<AppState>,
     payload: Result<Json<DevDeposit>, JsonRejection>,
 ) -> Result<Json<JournalResponse>, ApiError> {
+    require_dev_auth(&state.auth)?;
     let body = json_body(payload)?;
     let journal_id = state
         .writer
@@ -373,6 +412,7 @@ async fn dev_issue(
     State(state): State<AppState>,
     payload: Result<Json<DevIssue>, JsonRejection>,
 ) -> Result<Json<JournalResponse>, ApiError> {
+    require_dev_auth(&state.auth)?;
     let body = json_body(payload)?;
     let journal_id = state
         .writer
@@ -388,7 +428,73 @@ async fn dev_issue(
     Ok(Json(JournalResponse { journal_id }))
 }
 
-fn dev_user(headers: &HeaderMap) -> Result<UserId, ApiError> {
+/// Who is calling: a logged-in user (token) or, in dev only, whoever the old header says.
+#[derive(Debug, PartialEq, Eq)]
+enum Caller {
+    Token {
+        user_id: UserId,
+        role: dx_auth::Role,
+    },
+    Dev(UserId),
+}
+
+/// A token, if there is one, always wins and must be valid: a bad token is refused, never
+/// quietly replaced by the dev header. Without a token the dev header works only while
+/// `DX_DEV_AUTH` is on.
+fn identify(auth: &dx_auth::AuthState, headers: &HeaderMap) -> Result<Caller, ApiError> {
+    if let Some(value) = headers.get(header::AUTHORIZATION) {
+        let token = value
+            .to_str()
+            .ok()
+            .and_then(|text| text.strip_prefix("Bearer "))
+            .ok_or_else(unauthorized)?;
+        let user = auth
+            .verify_token(token.trim())
+            .map_err(|_| unauthorized())?;
+        return Ok(Caller::Token {
+            user_id: user.user_id,
+            role: user.role,
+        });
+    }
+    if auth.dev_auth_enabled() {
+        return legacy_dev_user(headers).map(Caller::Dev);
+    }
+    Err(unauthorized())
+}
+
+/// The user id an endpoint should act for.
+fn caller_user(state: &AppState, headers: &HeaderMap) -> Result<UserId, ApiError> {
+    Ok(match identify(&state.auth, headers)? {
+        Caller::Token { user_id, .. } | Caller::Dev(user_id) => user_id,
+    })
+}
+
+/// For endpoints that name a user in the address: a logged-in user may only read their own data
+/// (admins may read anyone's). Dev mode keeps working as before.
+fn authorize_user(
+    auth: &dx_auth::AuthState,
+    headers: &HeaderMap,
+    user_id: UserId,
+) -> Result<(), ApiError> {
+    match identify(auth, headers)? {
+        Caller::Token { user_id: me, role } if me == user_id || role == dx_auth::Role::Admin => {
+            Ok(())
+        }
+        Caller::Token { .. } => Err(forbidden()),
+        Caller::Dev(_) => Ok(()),
+    }
+}
+
+/// The dev money endpoints exist only while dev auth is on.
+fn require_dev_auth(auth: &dx_auth::AuthState) -> Result<(), ApiError> {
+    if auth.dev_auth_enabled() {
+        Ok(())
+    } else {
+        Err(forbidden())
+    }
+}
+
+fn legacy_dev_user(headers: &HeaderMap) -> Result<UserId, ApiError> {
     if let Some(val) = headers
         .get("x-user-id")
         .or_else(|| headers.get("x-dev-user"))
@@ -430,7 +536,7 @@ async fn wallet_current(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<UserWalletView>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
     let markets = state.writer.markets().await.map_err(writer_error)?;
 
@@ -476,7 +582,7 @@ async fn wallet_topup(
     headers: HeaderMap,
     payload: Result<Json<TopupPayload>, JsonRejection>,
 ) -> Result<Json<UserWalletView>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let body = json_body(payload)?;
     if body.amount <= 0 {
         return Err(api_error(
@@ -547,7 +653,7 @@ async fn history_current(
     headers: HeaderMap,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<HistoryResponse>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let markets = state.writer.markets().await.map_err(writer_error)?;
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
 
@@ -633,7 +739,7 @@ async fn statements_current(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<StatementResponse>, ApiError> {
-    let user_id = dev_user(&headers)?;
+    let user_id = caller_user(&state, &headers)?;
     let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1098,6 +1204,7 @@ mod tests {
 
     const MARKET: MarketId = 1;
     const PRICE: Ticks = 5_000;
+    const TEST_SECRET: &[u8] = b"gateway-test-secret-gateway-test-123";
 
     fn test_state() -> (AppState, broadcast::Receiver<WsServerMessage>) {
         let mut core = Core::new(seed_markets()).unwrap();
@@ -1107,7 +1214,15 @@ mod tests {
 
         let (tx, rx) = broadcast::channel(64);
         let (writer, metrics) = spawn_writer(core, tx, Vec::new(), 64);
-        (AppState { writer, metrics }, rx)
+        let auth = dx_auth::AuthState::new(TEST_SECRET, std::time::Duration::from_secs(60), true);
+        (
+            AppState {
+                writer,
+                metrics,
+                auth,
+            },
+            rx,
+        )
     }
 
     async fn run_command(state: &AppState, user_id: UserId, command: Command) -> CommandResponse {
@@ -1421,6 +1536,139 @@ mod tests {
         assert_eq!(
             filter_message(resync, Some(&[1]), 20),
             Some(WsServerMessage::ResyncRequired { market_id: 1 })
+        );
+    }
+
+    // ---- who is calling (docs/AUTH.md) ----
+
+    fn auth_state(dev_auth: bool) -> dx_auth::AuthState {
+        dx_auth::AuthState::new(TEST_SECRET, std::time::Duration::from_secs(60), dev_auth)
+    }
+
+    fn token_for(auth: &dx_auth::AuthState, user_id: UserId, role: dx_auth::Role) -> String {
+        let user = dx_auth::PublicUser {
+            user_id,
+            username: "someone".into(),
+            role,
+        };
+        auth.issue_token(&user).unwrap()
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        map
+    }
+
+    fn refused(result: Result<Caller, ApiError>, status: StatusCode, reason: &str) {
+        let error = result.expect_err("should be refused");
+        assert_eq!(error.status, status);
+        assert_eq!(error.raw_reason, Some(reason));
+    }
+
+    #[test]
+    fn a_token_identifies_the_caller_and_beats_the_dev_header() {
+        let auth = auth_state(true);
+        let token = token_for(&auth, 7, dx_auth::Role::User);
+        let map = headers(&[
+            ("authorization", &format!("Bearer {token}")),
+            ("x-dev-user", "99"),
+        ]);
+        assert_eq!(
+            identify(&auth, &map).unwrap(),
+            Caller::Token {
+                user_id: 7,
+                role: dx_auth::Role::User
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_token_is_refused_even_with_the_dev_header() {
+        let auth = auth_state(true);
+        for value in ["Bearer junk", "Basic abc", "Bearer "] {
+            let map = headers(&[("authorization", value), ("x-dev-user", "1")]);
+            refused(
+                identify(&auth, &map),
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            );
+        }
+        // A token signed with a different secret is a forgery.
+        let other = dx_auth::AuthState::new(
+            b"another-secret-another-secret-12345",
+            std::time::Duration::from_secs(60),
+            true,
+        );
+        let forged = token_for(&other, 1, dx_auth::Role::Admin);
+        let map = headers(&[("authorization", &format!("Bearer {forged}"))]);
+        refused(
+            identify(&auth, &map),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        );
+    }
+
+    #[test]
+    fn without_a_token_the_dev_header_works_only_while_dev_auth_is_on() {
+        let on = auth_state(true);
+        assert_eq!(
+            identify(&on, &headers(&[("x-dev-user", "5")])).unwrap(),
+            Caller::Dev(5)
+        );
+        assert_eq!(identify(&on, &HeaderMap::new()).unwrap(), Caller::Dev(1));
+
+        let off = auth_state(false);
+        refused(
+            identify(&off, &headers(&[("x-dev-user", "5")])),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        );
+        refused(
+            identify(&off, &HeaderMap::new()),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        );
+    }
+
+    #[test]
+    fn logged_in_users_may_only_read_their_own_data() {
+        let auth = auth_state(false);
+        let user = headers(&[(
+            "authorization",
+            &format!("Bearer {}", token_for(&auth, 7, dx_auth::Role::User)),
+        )]);
+        assert!(authorize_user(&auth, &user, 7).is_ok());
+        let error = authorize_user(&auth, &user, 8).unwrap_err();
+        assert_eq!(
+            (error.status, error.raw_reason),
+            (StatusCode::FORBIDDEN, Some("forbidden"))
+        );
+
+        let admin = headers(&[(
+            "authorization",
+            &format!("Bearer {}", token_for(&auth, 100, dx_auth::Role::Admin)),
+        )]);
+        assert!(authorize_user(&auth, &admin, 8).is_ok());
+
+        // No token and no dev auth: refused.
+        assert!(authorize_user(&auth, &HeaderMap::new(), 7).is_err());
+        // Dev mode keeps working as before.
+        assert!(authorize_user(&auth_state(true), &HeaderMap::new(), 7).is_ok());
+    }
+
+    #[test]
+    fn the_dev_money_endpoints_need_dev_auth() {
+        assert!(require_dev_auth(&auth_state(true)).is_ok());
+        let error = require_dev_auth(&auth_state(false)).unwrap_err();
+        assert_eq!(
+            (error.status, error.raw_reason),
+            (StatusCode::FORBIDDEN, Some("forbidden"))
         );
     }
 }

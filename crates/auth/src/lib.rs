@@ -8,7 +8,7 @@
 //! handler can ask for the caller with the [`AuthUser`] extractor.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use argon2::password_hash::rand_core::{OsRng, RngCore};
@@ -149,7 +149,7 @@ struct Inner {
     store: Mutex<Store>,
     /// A real hash of a throwaway password. Checked when the username does not exist, so an
     /// unknown user takes as long as a wrong password (no username guessing by timing).
-    dummy_hash: String,
+    dummy_hash: OnceLock<String>,
     failed_logins: Mutex<HashMap<String, Vec<Instant>>>,
     /// When true, `x-dev-user` may still be used by the gateway (`DX_DEV_AUTH`, default on).
     dev_auth: bool,
@@ -210,7 +210,6 @@ fn valid_password(password: &str) -> bool {
 impl AuthState {
     /// `secret` signs every token: at least 32 bytes, kept out of git.
     pub fn new(secret: &[u8], ttl: Duration, dev_auth: bool) -> Self {
-        let dummy_hash = hash_password("not-a-real-password").expect("hash the dummy password");
         Self(Arc::new(Inner {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
@@ -219,7 +218,7 @@ impl AuthState {
                 next_id: FIRST_SIGNUP_ID,
                 ..Store::default()
             }),
-            dummy_hash,
+            dummy_hash: OnceLock::new(),
             failed_logins: Mutex::new(HashMap::new()),
             dev_auth,
         }))
@@ -270,6 +269,8 @@ impl AuthState {
         if let Some(password) = seed("DX_ISSUER_PASSWORD", "issuer-pass-1") {
             state.seed_user(101, "issuer", &password, Role::Issuer);
         }
+        // Make the dummy hash now, so the first login with an unknown name is not slower.
+        state.dummy_hash();
         if dev_auth {
             // The demo trader the simulator and the market page already use.
             state.seed_user(1, "trader1", "trader-pass-1", Role::User);
@@ -298,7 +299,8 @@ impl AuthState {
         self.0.dev_auth
     }
 
-    fn issue_token(&self, user: &PublicUser) -> Result<String, AuthError> {
+    /// Signs a token for a user. The login handlers use it; tests in other crates can too.
+    pub fn issue_token(&self, user: &PublicUser) -> Result<String, AuthError> {
         let iat = now_secs();
         let claims = Claims {
             sub: user.user_id,
@@ -320,6 +322,13 @@ impl AuthState {
             user_id: data.claims.sub,
             role: data.claims.role,
         })
+    }
+
+    /// The hash used when the username does not exist. It is made once, on first use.
+    fn dummy_hash(&self) -> &str {
+        self.0
+            .dummy_hash
+            .get_or_init(|| hash_password("not-a-real-password").expect("hash the dummy password"))
     }
 
     fn login_blocked(&self, username: &str) -> Option<u64> {
@@ -470,14 +479,15 @@ async fn login(
         .get(&username)
         .cloned();
     // Always do one hash check, real or dummy, so the time does not reveal if the user exists.
-    let hash_to_check = record
-        .as_ref()
-        .map(|r| r.password_hash.clone())
-        .unwrap_or_else(|| state.0.dummy_hash.clone());
+    let real_hash = record.as_ref().map(|r| r.password_hash.clone());
     let password = credentials.password;
-    let matched = tokio::task::spawn_blocking(move || password_matches(&password, &hash_to_check))
-        .await
-        .map_err(|_| AuthError::internal())?;
+    let checker = state.clone();
+    let matched = tokio::task::spawn_blocking(move || {
+        let hash = real_hash.as_deref().unwrap_or_else(|| checker.dummy_hash());
+        password_matches(&password, hash)
+    })
+    .await
+    .map_err(|_| AuthError::internal())?;
 
     match record {
         Some(record) if matched => {

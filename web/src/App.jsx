@@ -21,6 +21,7 @@ import {
   marketBounds,
   statusText,
 } from './format'
+import { useAuthStore } from './stores/useAuthStore'
 import { useWalletStore } from './stores/useWalletStore'
 import { useMarketFeedStore } from './stores/useMarketFeedStore'
 import { WalletView } from './components/WalletView'
@@ -50,7 +51,10 @@ function App({ initialView = 'trade' }) {
   const [balances, setBalances] = useState([])
   const [openOrders, setOpenOrders] = useState([])
   const [selectedMarketId, setSelectedMarketId] = useState(null)
-  const [userId, setUserId] = useState(1)
+  // Logged in: you are who you logged in as. Not logged in (dev only): the Identity dropdown picks.
+  const authUser = useAuthStore((state) => state.user)
+  const [devUserId, setDevUserId] = useState(1)
+  const userId = authUser ? authUser.user_id : devUserId
   const [toast, setToast] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(null)
@@ -105,6 +109,12 @@ function App({ initialView = 'trade' }) {
     return () => {
       cancelled = true
     }
+  }, [userId])
+
+  // Runs on first load and whenever who we are changes (log in, log out, dropdown).
+  // Points the wallet and history pages at that user and loads their wallet.
+  useEffect(() => {
+    useWalletStore.getState().setUserId(userId)
   }, [userId])
 
   useEffect(() => {
@@ -197,7 +207,7 @@ function App({ initialView = 'trade' }) {
 
   const handleUserChange = (event) => {
     const nextId = Number(event.target.value)
-    setUserId(nextId)
+    setDevUserId(nextId)
     wallet.setUserId(nextId)
     setBalances([])
     setOpenOrders([])
@@ -209,6 +219,7 @@ function App({ initialView = 'trade' }) {
         connection={feedStatus}
         resyncing={resyncing}
         userId={userId}
+        account={authUser}
         onUserChange={handleUserChange}
       />
 
@@ -278,7 +289,7 @@ function App({ initialView = 'trade' }) {
   )
 }
 
-function Header({ connection, resyncing, userId, onUserChange }) {
+function Header({ connection, resyncing, userId, account, onUserChange }) {
   const label = resyncing
     ? 'Resyncing'
     : connection === 'live'
@@ -310,16 +321,20 @@ function Header({ connection, resyncing, userId, onUserChange }) {
           <span className="dot" />
           {label}
         </div>
-        <label className="identity">
-          Identity
-          <select value={userId} onChange={onUserChange}>
-            {TRADER_IDS.map((id) => (
-              <option key={id} value={id}>
-                Trader #{id}
-              </option>
-            ))}
-          </select>
-        </label>
+        {account ? (
+          <span className="identity">Signed in as {account.username}</span>
+        ) : (
+          <label className="identity">
+            Identity
+            <select value={userId} onChange={onUserChange}>
+              {TRADER_IDS.map((id) => (
+                <option key={id} value={id}>
+                  Trader #{id}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
       </div>
     </header>
   )
