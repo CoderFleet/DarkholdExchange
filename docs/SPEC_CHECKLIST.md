@@ -76,6 +76,26 @@
 | 32 | Admin publishing reaches the engine | ❌ | Gateway uses `AdminState::without_engine()`; publish locks the tier but creates no market. | Add runtime market creation and wire the publisher. |
 | 33 | Issuer console | ❌ | `web/src/pages/IssuerPage.jsx` says “Coming soon.” | Add role-checked pass issuance + supply view. |
 
+## Work ownership
+
+Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
+
+| Owner | Owns |
+|---|---|
+| **Teammate 1 — Shraddha Sharma** | Shared message types, command queue/main loop, order book, matching, pre-book checks, escrow switch, live update sender, order/WS/market endpoints, market setup command, replay/recovery helpers, state fingerprint, speed measurements. Frontend: market page, order form, ladder, depth chart, trade list/price chart, open orders, speed panel, shared live worker, market store. |
+| **Teammate 2 — Rudransh Pratap Singh** | Ledger, locking, settlement, safety checks, wallet, escrow, disputes, shared hashing helper, hash-chained log, Merkle-sum solvency, PostgreSQL copy, replay service, private user WebSocket. Frontend: wallet, history/statements, trade/escrow detail, admin disputes, proof page, replay page. |
+| **Teammate 3 — Stuti Agarwal** | Gateway, login/roles, rate limits/PoW, admin setup, Issuer, seed script, timer service, batch auction, Dutch auction, bot simulator, server clock, Docker/proxy, k6/Locust/Playwright. Frontend: app shell, API helper, auth store, login/signup, events list, event room, batch page, Dutch page, admin console, issuer console, bot simulator. |
+
+### Remaining work by owner
+
+| Owner | Remaining checklist items |
+|---|---|
+| **T1 — Shraddha** | Differential reference matcher; Playwright place/match/cancel test; market-setup command integration; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
+| **T2 — Rudransh** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
+| **T3 — Stuti** | Admin publishing reaching the engine; Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+
+The trust work already landed under **T2**: Merkle-sum solvency and the `/verify` page. The speed panel and market charts landed under **T1**.
+
 ## Known caveats / quick fixes
 
 - **Solvency snapshot `seq`:** it currently uses the core command sequence, but dev deposits/top-ups
