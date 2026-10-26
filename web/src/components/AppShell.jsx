@@ -37,6 +37,7 @@ export function AppShell() {
         <Route path="/market" element={<App initialView="trade" />} />
         <Route path="/wallet" element={<App initialView="wallet" />} />
         <Route path="/history" element={<App initialView="history" />} />
+        <Route path="/speed" element={<App initialView="speed" />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route
