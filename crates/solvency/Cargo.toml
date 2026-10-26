@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+dkx-hash = { version = "0.1.0", path = "../hash" }
 dx-types = { version = "0.1.0", path = "../types" }
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2.0"

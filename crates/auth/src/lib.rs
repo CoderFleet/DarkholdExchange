@@ -299,6 +299,15 @@ impl AuthState {
         self.0.dev_auth
     }
 
+    /// Every known user id, sorted ascending. Solvency snapshots use this to
+    /// include zero-balance users, so every signed-up user can obtain a proof.
+    pub fn user_ids(&self) -> Vec<UserId> {
+        let store = self.0.store.lock().expect("auth store");
+        let mut ids: Vec<_> = store.name_by_id.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// Signs a token for a user. The login handlers use it; tests in other crates can too.
     pub fn issue_token(&self, user: &PublicUser) -> Result<String, AuthError> {
         let iat = now_secs();
@@ -575,6 +584,14 @@ mod tests {
             builder = builder.header("authorization", format!("Bearer {token}"));
         }
         builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn user_ids_are_sorted_for_solvency_snapshots() {
+        let state = state();
+        assert_eq!(state.user_ids(), vec![100]);
+        state.seed_user(7, "seven", "password-123", Role::User);
+        assert_eq!(state.user_ids(), vec![7, 100]);
     }
 
     #[tokio::test]

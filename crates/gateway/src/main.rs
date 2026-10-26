@@ -19,6 +19,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use dx_core::Core;
+use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
     Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody, Fill,
     JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
@@ -196,6 +197,8 @@ async fn main() {
         .route("/api/orders/open", get(open_orders_current))
         .route("/api/orders/{order_id}", delete(cancel_order))
         .route("/api/metrics/latency", get(latency_metrics))
+        .route("/api/solvency", get(solvency_roots))
+        .route("/api/me/solvency", get(solvency_current))
         .route("/api/users/{user_id}/balances", get(balances))
         .route("/api/users/{user_id}/orders", get(open_orders))
         .route("/api/wallet", get(wallet_current))
@@ -391,6 +394,124 @@ fn metrics_snapshot(state: &AppState) -> MetricsSnapshot {
 
 async fn latency_metrics(State(state): State<AppState>) -> Json<MetricsSnapshot> {
     Json(metrics_snapshot(&state))
+}
+
+#[derive(Serialize)]
+struct SolvencyRootView {
+    asset: dx_types::Asset,
+    root_hash: String,
+    total_liabilities: u64,
+    leaf_count: usize,
+}
+
+#[derive(Serialize)]
+struct SolvencySnapshotView {
+    seq: u64,
+    roots: Vec<SolvencyRootView>,
+}
+
+#[derive(Serialize)]
+struct SolvencyProofStepView {
+    sibling_hash: String,
+    sibling_sum: u64,
+    sibling_direction: &'static str,
+}
+
+#[derive(Serialize)]
+struct SolvencyProofView {
+    asset: dx_types::Asset,
+    snapshot_seq: u64,
+    user_id: UserId,
+    salt: String,
+    balance: u64,
+    path: Vec<SolvencyProofStepView>,
+    root_hash: String,
+    total_liabilities: u64,
+}
+
+#[derive(Serialize)]
+struct MySolvencyView {
+    seq: u64,
+    roots: Vec<SolvencyRootView>,
+    proofs: Vec<SolvencyProofView>,
+}
+
+fn root_view(root: SolvencyRoot) -> SolvencyRootView {
+    SolvencyRootView {
+        asset: root.asset,
+        root_hash: hex::encode(root.root_hash),
+        total_liabilities: root.total_liabilities,
+        leaf_count: root.leaf_count,
+    }
+}
+
+fn snapshot_view(snapshot: &SolvencySnapshot) -> SolvencySnapshotView {
+    SolvencySnapshotView {
+        seq: snapshot.seq,
+        roots: snapshot.roots().into_iter().map(root_view).collect(),
+    }
+}
+
+fn proof_view(proof: SolvencyProof) -> SolvencyProofView {
+    SolvencyProofView {
+        asset: proof.asset,
+        snapshot_seq: proof.snapshot_seq,
+        user_id: proof.user_id,
+        salt: hex::encode(proof.salt),
+        balance: proof.balance,
+        path: proof
+            .path
+            .into_iter()
+            .map(|step| SolvencyProofStepView {
+                sibling_hash: hex::encode(step.sibling_hash),
+                sibling_sum: step.sibling_sum,
+                sibling_direction: match step.sibling_direction {
+                    PathDirection::Left => "Left",
+                    PathDirection::Right => "Right",
+                },
+            })
+            .collect(),
+        root_hash: hex::encode(proof.root_hash),
+        total_liabilities: proof.total_liabilities,
+    }
+}
+
+async fn solvency_roots(
+    State(state): State<AppState>,
+) -> Result<Json<SolvencySnapshotView>, ApiError> {
+    let users = state.auth.user_ids();
+    let snapshot = state.writer.solvency(users).await.map_err(writer_error)?;
+    Ok(Json(snapshot_view(&snapshot)))
+}
+
+async fn solvency_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<MySolvencyView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let mut users = state.auth.user_ids();
+    if !users.contains(&user_id) {
+        users.push(user_id);
+    }
+    let snapshot = state.writer.solvency(users).await.map_err(writer_error)?;
+    let roots: Vec<_> = snapshot.roots().into_iter().map(root_view).collect();
+    let proofs = snapshot
+        .roots()
+        .into_iter()
+        .map(|root| {
+            snapshot
+                .proof(user_id, root.asset)
+                .map(proof_view)
+                .map_err(|_| {
+                    api_error(StatusCode::INTERNAL_SERVER_ERROR, ReasonCode::InternalError)
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(MySolvencyView {
+        seq: snapshot.seq,
+        roots,
+        proofs,
+    }))
 }
 
 async fn dev_deposit(

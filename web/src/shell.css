@@ -104,6 +104,137 @@
   color: var(--text-strong);
 }
 
+/* Proof-of-solvency verification page */
+.verify-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.verify-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.verify-heading h2 {
+  margin: 4px 0 0;
+  color: var(--text-strong);
+}
+
+.verify-intro {
+  max-width: 780px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.verify-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.verify-stat {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.verify-stat strong {
+  color: var(--text-strong);
+  font-family: var(--mono);
+  font-size: 22px;
+}
+
+.verify-stat span:last-child {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.verify-stat.good {
+  border-color: rgba(67, 217, 139, 0.4);
+}
+
+.verify-stat.good strong,
+.verify-status.good {
+  color: var(--green);
+}
+
+.verify-stat.bad {
+  border-color: rgba(255, 135, 149, 0.4);
+}
+
+.verify-stat.bad strong,
+.verify-status.bad {
+  color: #ff8795;
+}
+
+.verify-card {
+  padding: 16px;
+}
+
+.verify-table-wrap {
+  overflow-x: auto;
+  margin-top: 10px;
+}
+
+.verify-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.verify-table th {
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.verify-table td {
+  padding: 9px 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.verify-hash {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.verify-status {
+  font-family: var(--mono);
+  white-space: nowrap;
+}
+
+.verify-empty {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@media (max-width: 760px) {
+  .verify-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .verify-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}
+
 /* Admin console */
 .admin-page {
   display: flex;

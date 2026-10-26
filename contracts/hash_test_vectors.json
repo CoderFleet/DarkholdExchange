@@ -24,6 +24,14 @@
     "balance": 1500000,
     "expected_hash": "f1de47fc6fac8fc9e848e68ded6f0f5fe99e47d62238121111288e6dfb58080f"
   },
+  "merkle_leaf_asset": {
+    "salt_hex": "000102030405060708090a0b0c0d0e0f",
+    "user_id": 42,
+    "asset_kind": 1,
+    "market_id": 101,
+    "balance": 1500000,
+    "expected_hash": "2681220a82da507dc8a4d9f8d2e092157106b53ed49d0674a8ef1b356cbd96eb"
+  },
   "merkle_node": {
     "left_hash": "0000000000000000000000000000000000000000000000000000000000000001",
     "left_sum": 1000,

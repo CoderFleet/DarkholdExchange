@@ -191,6 +191,45 @@ export async function hashMerkleLeaf(
 }
 
 /**
+ * Asset-aware Merkle leaf = SHA256( 0x00 | salt 16B | user_id u64 |
+ * asset_kind u8 | market_id u32 | balance u64 )
+ * All integers big-endian. Cash uses asset_kind 0 and market_id 0.
+ */
+export async function hashMerkleLeafWithAsset(
+  salt: Uint8Array,
+  userId: bigint,
+  assetKind: number,
+  marketId: number,
+  balance: bigint
+): Promise<Uint8Array> {
+  if (salt.length !== 16) {
+    throw new Error(`Expected salt to be 16 bytes, got ${salt.length}`);
+  }
+  const buffer = new Uint8Array(1 + 16 + 8 + 1 + 4 + 8);
+  const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+
+  let offset = 0;
+  view.setUint8(offset, MERKLE_LEAF_PREFIX);
+  offset += 1;
+
+  buffer.set(salt, offset);
+  offset += 16;
+
+  view.setBigUint64(offset, userId, false);
+  offset += 8;
+
+  view.setUint8(offset, assetKind);
+  offset += 1;
+
+  view.setUint32(offset, marketId, false);
+  offset += 4;
+
+  view.setBigUint64(offset, balance, false);
+
+  return sha256(buffer);
+}
+
+/**
  * Node = SHA256( 0x01 | left_hash 32B | left_sum u64 | right_hash 32B | right_sum u64 )
  * node sum = left_sum + right_sum (check overflow).
  * All integers big-endian.

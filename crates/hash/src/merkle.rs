@@ -1,8 +1,14 @@
 use crate::error::HashError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
 pub const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+/// Asset tag used by the asset-aware solvency leaf.
+pub const MERKLE_ASSET_CASH: u8 = 0;
+/// Asset tag used by the asset-aware solvency leaf.
+pub const MERKLE_ASSET_PASS: u8 = 1;
 
 /// Empty node constants: 32 zero bytes hash, sum 0
 pub const EMPTY_NODE_HASH: [u8; 32] = [0u8; 32];
@@ -14,13 +20,13 @@ pub struct MerkleNode {
     pub sum: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PathDirection {
     Left,
     Right,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MerklePathStep {
     pub sibling_hash: [u8; 32],
     pub sibling_sum: u64,
@@ -35,6 +41,32 @@ pub fn hash_merkle_leaf(salt: &[u8; 16], user_id: u64, balance: u64) -> [u8; 32]
     hasher.update([MERKLE_LEAF_PREFIX]);
     hasher.update(salt);
     hasher.update(user_id.to_be_bytes());
+    hasher.update(balance.to_be_bytes());
+
+    let output = hasher.finalize();
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&output);
+    hash
+}
+
+/// Compute an asset-aware Merkle leaf hash:
+/// SHA256( 0x00 | salt 16B | user_id u64 | asset_kind u8 | market_id u32 | balance u64 )
+///
+/// `asset_kind` is [`MERKLE_ASSET_CASH`] or [`MERKLE_ASSET_PASS`].
+/// `market_id` is zero for cash. All integers big-endian.
+pub fn hash_merkle_leaf_with_asset(
+    salt: &[u8; 16],
+    user_id: u64,
+    asset_kind: u8,
+    market_id: u32,
+    balance: u64,
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update([MERKLE_LEAF_PREFIX]);
+    hasher.update(salt);
+    hasher.update(user_id.to_be_bytes());
+    hasher.update([asset_kind]);
+    hasher.update(market_id.to_be_bytes());
     hasher.update(balance.to_be_bytes());
 
     let output = hasher.finalize();
