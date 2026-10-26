@@ -14,6 +14,7 @@ High-frequency secondary marketplace with an in-memory limit order book.
 - [Development plan](docs/PLAN.md) — build order, sprints, protocol v1, risks
 - [Decision log](docs/DECISIONS.md) — locked technical decisions and open questions
 - [Source spec](docs/spec/README.md) — PDF, architecture diagram, class diagram
+- [Spec checklist](docs/SPEC_CHECKLIST.md) — current implementation status vs. the Webster spec
 - [Load baselines](bench/results/README.md) — repeatable gateway benchmark and recorded runs
 
 ## Layout
