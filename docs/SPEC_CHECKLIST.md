@@ -30,7 +30,7 @@
 | WAL + crash recovery | 🟡 | `dkx-wal` has records, snapshots, recovery, and tests; it is not wired into the gateway. |
 | Nginx/Caddy + Docker deployment | ❌ | `docker-compose.yml` only starts PostgreSQL. There is no app container, proxy, or one-command deployment. |
 | 1,000+ orders/s, µs engine p99, <10 ms e2e p99 | ✅ | Measured with the Rust load harness and recorded under `bench/results/`. Not enforced in CI. |
-| Differential testing vs reference matcher | ❌ | Not implemented. |
+| Differential testing vs reference matcher | ❌ | Deferred by T1; not planned for the current demo. |
 | Deterministic replay from the log | 🟡 | In-memory core replay test exists; no wired WAL replay through the gateway. |
 | k6/Locust thresholds | ❌ | `bench/k6` and `bench/locust` are empty; the custom Rust harness is the current substitute. |
 | Playwright E2E | ❌ | `@playwright/test` is installed, but there is no config or E2E suite. |
@@ -66,7 +66,7 @@
 | 22 | WAL + crash recovery | 🟡 | `crates/dkx-wal` records, snapshots, recovery tests. Not wired. | Wire writer/recovery into gateway; verify restart → same state hash. |
 | 23 | Docker/Caddy/nginx deployment | ❌ | Compose only includes `db`. | Add app image, proxy config, health checks, one-command demo. |
 | 24 | Performance targets | ✅ | `bench/results/` documents measured load. | Add CI thresholds or clearly document the substitute. |
-| 25 | Differential matcher test | ❌ | No reference matcher. | Build a deliberately simple sorted-Vec matcher and compare streams. |
+| 25 | Differential matcher test | ❌ | No reference matcher. Deferred by T1. | Not planned for the current demo; revisit only if matching correctness needs stronger verification. |
 | 26 | Deterministic WAL replay | 🟡 | Core replay test; WAL recovery tests. | Prove gateway restart produces the same state hash. |
 | 27 | k6/Locust load thresholds | ❌ | Empty `bench/k6` and `bench/locust`; Rust harness used instead. | Add k6 or document a justified equivalent. |
 | 28 | Playwright E2E | ❌ | Package installed; no config/tests. | Add smoke flows: login, place order, fill, verify, speed. |
@@ -90,7 +90,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | Differential reference matcher; Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
+| **T1 — Rudransh** | Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
 | **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
@@ -118,7 +118,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 3. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
 4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
 5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-6. **Verification (T1/T2/T3):** differential matcher, deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage.
+6. **Verification (T1/T2/T3):** deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage. Differential matcher is deferred.
 7. **Operations (T2 + T3):** wire WAL, wire PostgreSQL projection, Docker/Caddy deployment.
 8. **Issuer (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add the issuer console and pass-supply view.
 
