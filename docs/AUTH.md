@@ -107,6 +107,9 @@ regenerated `web/src/protocol/generated/ReasonCode.ts` (`just types`) and a fixt
 the same PR. The change only adds values, so existing code keeps compiling and existing codes keep
 their meaning. `rate_limited` already exists.
 
+**Status:** not done yet. Until it is, the gateway sends `unauthorized` and `forbidden` as plain
+text in the same `{"reason": ...}` shape, so the website reads them the same way.
+
 ---
 
 ## 4. Rollout without breaking anyone
@@ -115,11 +118,17 @@ Rule: follow the work-distribution document. Where it assigns a file or feature 
 it. Each change is small, backward compatible, in its own PR, and passes CI before it merges.
 
 1. **Auth endpoints:** a new crate, added to the gateway router with one `.merge(...)` line.
-2. **`dev_user()` in the gateway:** becomes "read the JWT; if there is none, fall back to
-   `x-dev-user`". The fallback is on by default (`DX_DEV_AUTH=1`), so the load simulator, the k6
-   scripts and every existing request keep working unchanged.
+2. **`dev_user()` in the gateway (done):** it is now `identify()` in `crates/gateway/src/main.rs`.
+   If an `Authorization: Bearer` header is present it must hold a valid token, otherwise the answer
+   is 401 and the dev header is never used instead. With no token, `x-dev-user` still works while
+   `DX_DEV_AUTH=1` (the default), so the load simulator, the k6 scripts and every existing request
+   keep working unchanged. Endpoints that name a user in the address (`/api/users/{id}/balances`
+   and `/api/users/{id}/orders`) let a logged-in user read only their own data (admins may read
+   anyone's). `/api/dev/deposit` and `/api/dev/issue` answer 403 when `DX_DEV_AUTH=0`.
 3. **`web/src/api.js` `request()`:** if a saved token exists, add `Authorization: Bearer <token>`;
    otherwise behave exactly as today. The existing `x-dev-user` headers stay until the switch-over.
 4. **Login, signup, role-protected routes, auth store:** new files.
-5. **Switch-over** (when the backend login is working): `/market` and the wallet store move to the
-   logged-in user, and `DX_DEV_AUTH=0` is used for real runs. Until then, nothing depends on login.
+5. **Switch-over (done):** `/market`, the wallet and the history pages use the logged-in user. The
+   Identity dropdown shows only while nobody is logged in (dev). Real runs set `DX_DEV_AUTH=0`.
+   Still open: the WebSocket does not check the token yet, and in a real run `/market` shows
+   errors, instead of redirecting to the login page, when nobody is logged in.
