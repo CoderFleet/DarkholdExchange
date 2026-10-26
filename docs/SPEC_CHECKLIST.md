@@ -73,7 +73,7 @@
 | 29 | fast-check frontend tests | ❌ | Package installed; no usage in `web/src`. | Add property tests for book rebuild/resync or remove the dependency. |
 | 30 | TypeScript frontend | 🚫 | JavaScript decision recorded in `docs/DECISIONS.md`. | Keep the decision documented; do not half-migrate. |
 | 31 | Comlink worker RPC | 🚫 | Package installed; worker uses raw `postMessage`. | Either adopt it or remove the unused dependency. |
-| 32 | Admin publishing reaches the engine | ❌ | Gateway uses `AdminState::without_engine()`; publish locks the tier but creates no market. | Add runtime market creation and wire the publisher. |
+| 32 | Admin publishing reaches the engine | ✅ | Admin publish → writer `CreateMarket` → `Core::add_market` → engine book; tested at engine, core, writer, and gateway. Live check published market 100 and `/api/markets` returned it `Open` with book seq 0. | New markets appear via `/api/markets` on reload; no WS market-opened frame yet. |
 | 33 | Issuer console | ❌ | `web/src/pages/IssuerPage.jsx` says “Coming soon.” | Add role-checked pass issuance + supply view. |
 
 ## Work ownership
@@ -90,9 +90,9 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | Differential reference matcher; Playwright place/match/cancel test; market-setup command integration; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
+| **T1 — Rudransh** | Differential reference matcher; Playwright place/match/cancel test; escrow switch in the engine; replay/state-fingerprint helpers; WS endpoint auth (with T3). |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL wiring + crash recovery; PostgreSQL projection; replay service/page; private user WS; solvency `seq` caveat. |
-| **T3 — Stuti** | Admin publishing reaching the engine; Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work.
 
@@ -100,8 +100,9 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 - **Solvency snapshot `seq`:** it currently uses the core command sequence, but dev deposits/top-ups
   bypass `next_seq`. Replace it with a real state version when the WAL/state version is wired.
-- **Admin publishing is a no-op:** `AdminState::without_engine()` means the admin UI can create and
-  lock tiers but the engine never receives a new market.
+- **Admin-published markets need a reload:** publishing creates the market and its book in the
+  engine, but there is no WebSocket “market opened” frame yet. The market appears through
+  `/api/markets` on the next load.
 - **Issuer page is a placeholder.**
 - **WebSocket identity is unauthenticated:** `WsQuery.user_id` is accepted from the URL.
 - **`web/full-smoke-run.mjs` is not part of the repo:** it has a hard-coded temp path and imports
@@ -119,7 +120,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
 6. **Verification (T1/T2/T3):** differential matcher, deterministic WAL replay, Playwright E2E, k6 or documented substitute, fast-check usage.
 7. **Operations (T2 + T3):** wire WAL, wire PostgreSQL projection, Docker/Caddy deployment.
-8. **Admin/issuer (T3 — Stuti, with T1 market setup):** make publishing create a live market; implement the issuer console.
+8. **Issuer (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add the issuer console and pass-supply view.
 
 ## Submission honesty
 

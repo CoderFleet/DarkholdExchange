@@ -16,18 +16,29 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(configs: Vec<MarketConfig>) -> Result<Self, String> {
-        let mut books = HashMap::with_capacity(configs.len());
-        for config in configs {
-            config.validate()?;
-            if books.insert(config.id, OrderBook::new(config)).is_some() {
-                return Err("duplicate market id".into());
-            }
-        }
-        Ok(Self {
-            books,
+        let mut engine = Self {
+            books: HashMap::with_capacity(configs.len()),
             next_order_id: 1,
             next_trade_id: 1,
-        })
+        };
+        for config in configs {
+            engine.add_market(config)?;
+        }
+        Ok(engine)
+    }
+
+    /// Create one market's book while the engine is running.
+    ///
+    /// The admin publisher calls this through the single-writer queue, so the new
+    /// book is inserted at the same point in the commit order as every other
+    /// state change.
+    pub fn add_market(&mut self, config: MarketConfig) -> Result<(), String> {
+        config.validate()?;
+        if self.books.contains_key(&config.id) {
+            return Err("duplicate market id".into());
+        }
+        self.books.insert(config.id, OrderBook::new(config));
+        Ok(())
     }
 
     pub fn place_limit(

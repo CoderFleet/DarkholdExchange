@@ -400,6 +400,54 @@ fn maker_partial_fill_then_cancel_keeps_books_and_ledger_in_sync() {
 }
 
 #[test]
+fn runtime_market_is_tradable_and_consumes_a_sequence() {
+    let mut core = core();
+    let mut config = seed_markets().into_iter().next().unwrap();
+    config.id = 100;
+    config.event_id = 99;
+    config.name = "Runtime market".into();
+
+    core.add_market(config.clone()).unwrap();
+    assert_eq!(core.last_seq(), 1);
+    assert_eq!(
+        core.config(100).unwrap().status,
+        dx_types::MarketStatus::Open
+    );
+    assert!(core.issue_passes(2, 100, 2, 1).is_ok());
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+
+    let ask = core.process(
+        2,
+        Command::PlaceLimit(PlaceLimit {
+            client_order_id: 1,
+            market_id: 100,
+            side: Side::Sell,
+            price_ticks: PRICE,
+            qty: 2,
+        }),
+    );
+    assert_eq!(ask.status, OrderStatus::Rested);
+
+    let buy = core.process(
+        1,
+        Command::PlaceMarket(PlaceMarket {
+            client_order_id: 2,
+            market_id: 100,
+            side: Side::Buy,
+            qty: 2,
+            protect_price_ticks: PRICE,
+        }),
+    );
+    assert_eq!(buy.status, OrderStatus::Filled);
+    assert_eq!(
+        core.snapshot(100, 10).unwrap().last_trade_price,
+        Some(PRICE)
+    );
+    assert!(core.add_market(config).is_err());
+    core.check_invariants().unwrap();
+}
+
+#[test]
 fn state_hash_is_deterministic_and_changes_with_state() {
     let mut a = core();
     let mut b = core();

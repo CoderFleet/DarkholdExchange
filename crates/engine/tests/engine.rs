@@ -46,6 +46,24 @@ fn apply_delta(snapshot: &mut BookSnapshot, delta: &BookDelta) {
 }
 
 #[test]
+fn runtime_market_gets_a_fresh_book_and_rejects_duplicates() {
+    let mut engine = engine();
+    let mut config = seed_markets().into_iter().next().unwrap();
+    config.id = 100;
+    config.event_id = 99;
+    config.name = "Runtime market".into();
+
+    engine.add_market(config.clone()).unwrap();
+
+    assert_eq!(engine.config(100).unwrap().id, 100);
+    let snapshot = engine.snapshot(100, 10).unwrap();
+    assert_eq!(snapshot.book_seq, 0);
+    assert!(snapshot.bids.is_empty());
+    assert!(snapshot.asks.is_empty());
+    assert!(engine.add_market(config).is_err());
+}
+
+#[test]
 fn limit_order_rests_and_updates_best_bid() {
     let mut engine = engine();
     let outcome = engine.place_limit(1, MARKET, Side::Buy, 5_000, 3).unwrap();

@@ -147,6 +147,10 @@ enum WriterRequest {
         command: Command,
         reply: oneshot::Sender<CommandResponse>,
     },
+    CreateMarket {
+        config: MarketConfig,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Markets {
         reply: oneshot::Sender<Vec<MarketView>>,
     },
@@ -220,6 +224,17 @@ impl WriterHandle {
             reply,
         })
         .await
+    }
+
+    pub(crate) async fn create_market(&self, config: MarketConfig) -> Result<(), String> {
+        let result = self
+            .request(|reply| WriterRequest::CreateMarket { config, reply })
+            .await;
+        match result {
+            Ok(result) => result,
+            Err(WriterError::QueueFull) => Err("queue_full".into()),
+            Err(WriterError::Unavailable) => Err("writer_unavailable".into()),
+        }
     }
 
     pub(crate) async fn markets(&self) -> Result<Vec<MarketView>, WriterError> {
@@ -434,6 +449,15 @@ fn writer_loop(
                 metrics.seq.store(core.last_seq(), Ordering::Relaxed);
                 let _ = reply.send(outcome.response);
             }
+            WriterRequest::CreateMarket { config, reply } => {
+                let market_id = config.id;
+                let result = core.add_market(config);
+                if result.is_ok() {
+                    snapshot_cache.invalidate(market_id);
+                    metrics.seq.store(core.last_seq(), Ordering::Relaxed);
+                }
+                let _ = reply.send(result);
+            }
             WriterRequest::Markets { reply } => {
                 let views = core
                     .engine()
@@ -642,6 +666,43 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, WriterError::QueueFull);
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn create_market_reaches_the_writer_and_is_tradable() {
+        let core = funded_core();
+        let (tx, _rx) = broadcast::channel(16);
+        let (writer, metrics) = spawn_writer(core, tx, Vec::new(), 8);
+        let mut config = seed_markets().into_iter().next().unwrap();
+        config.id = 100;
+        config.event_id = 99;
+        config.name = "Runtime market".into();
+
+        writer.create_market(config.clone()).await.unwrap();
+        assert_eq!(metrics.seq.load(Ordering::Relaxed), 1);
+        assert!(writer.market_exists(100).await.unwrap());
+        assert_eq!(writer.snapshot(100, 20).await.unwrap().unwrap().book_seq, 0);
+        assert!(writer.create_market(config).await.is_err());
+
+        writer.issue(2, 100, 2, 99).await.unwrap().unwrap();
+        let response = writer
+            .command(
+                2,
+                Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: 100,
+                    side: Side::Sell,
+                    price_ticks: 5_000,
+                    qty: 2,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, OrderStatus::Rested);
+        assert_eq!(
+            writer.snapshot(100, 20).await.unwrap().unwrap().asks[0].qty,
+            2
+        );
     }
 
     #[test]

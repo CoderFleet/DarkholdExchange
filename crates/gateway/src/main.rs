@@ -97,6 +97,17 @@ fn forbidden() -> ApiError {
     auth_error(StatusCode::FORBIDDEN, "forbidden")
 }
 
+fn market_publisher(writer: WriterHandle) -> dx_admin::Publisher {
+    Arc::new(move |config| {
+        let writer = writer.clone();
+        Box::pin(async move { writer.create_market(config).await })
+    })
+}
+
+fn admin_state(writer: WriterHandle) -> dx_admin::AdminState {
+    dx_admin::AdminState::new(market_publisher(writer))
+}
+
 fn writer_error(error: WriterError) -> ApiError {
     match error {
         WriterError::QueueFull => api_error(StatusCode::TOO_MANY_REQUESTS, ReasonCode::QueueFull),
@@ -176,6 +187,9 @@ async fn main() {
 
     let (tx, _) = broadcast::channel(512);
     let (writer, metrics) = spawn_writer(core, tx, seed_fills, queue_capacity());
+    // Events and tiers for the admin console. Publishing creates a live market
+    // through the same single-writer queue as every other core change.
+    let admin = admin_state(writer.clone());
     // Login, sign-up and /api/me (docs/AUTH.md), and the check every other endpoint uses.
     let auth = dx_auth::AuthState::from_env();
     let state = AppState {
@@ -183,8 +197,6 @@ async fn main() {
         metrics,
         auth: auth.clone(),
     };
-    // Events and tiers for the admin console. Publishing does not reach the engine yet.
-    let admin = dx_admin::AdminState::without_engine();
 
     let app = Router::new()
         .route("/health", get(health))
@@ -1407,6 +1419,30 @@ mod tests {
             }
         }
         snapshot.book_seq = delta.book_seq;
+    }
+
+    #[tokio::test]
+    async fn admin_publisher_creates_a_live_market() {
+        let (state, _rx) = test_state();
+        let publisher = market_publisher(state.writer.clone());
+        let mut config = seed_markets().into_iter().next().unwrap();
+        config.id = 100;
+        config.event_id = 99;
+        config.name = "Published market".into();
+        config.status = dx_types::MarketStatus::Open;
+
+        publisher(config.clone()).await.unwrap();
+
+        assert!(state.writer.market_exists(100).await.unwrap());
+        assert_eq!(state.metrics.seq.load(Ordering::Relaxed), 1);
+        let markets = state.writer.markets().await.unwrap();
+        let market = markets
+            .iter()
+            .find(|market| market.config.id == 100)
+            .expect("published market is visible");
+        assert_eq!(market.config.name, "Published market");
+        assert_eq!(market.snapshot.book_seq, 0);
+        assert!(publisher(config).await.is_err());
     }
 
     #[tokio::test]

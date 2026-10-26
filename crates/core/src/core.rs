@@ -100,6 +100,26 @@ impl Core {
         })
     }
 
+    /// Create one market's engine book and make it visible to command validation.
+    ///
+    /// The admin publisher calls this through the single-writer queue, so the new
+    /// market is inserted at the same point in the commit order as every other
+    /// state change. This is a state change, so it consumes a core sequence.
+    pub fn add_market(&mut self, config: MarketConfig) -> Result<(), String> {
+        if self.poisoned {
+            return Err("core is poisoned".into());
+        }
+        config.validate()?;
+        if self.markets.contains_key(&config.id) {
+            return Err("duplicate market id".into());
+        }
+
+        self.engine.add_market(config.clone())?;
+        self.markets.insert(config.id, config);
+        self.alloc_seq();
+        Ok(())
+    }
+
     /// Process one authenticated command. The caller supplies identity; the wire
     /// command never carries a user id.
     ///

@@ -87,12 +87,6 @@ impl AdminState {
             publisher,
         }
     }
-
-    /// For use until the engine can create markets while it runs: publishing locks the tier
-    /// and marks it published, but nothing is sent to the engine.
-    pub fn without_engine() -> Self {
-        Self::new(Arc::new(|_config| Box::pin(async { Ok(()) })))
-    }
 }
 
 #[derive(Clone)]
