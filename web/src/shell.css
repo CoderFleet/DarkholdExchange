@@ -211,3 +211,40 @@
   border-color: rgba(67, 217, 139, 0.4);
   color: var(--green);
 }
+
+/* Show/hide button inside the password box */
+.password-field {
+  position: relative;
+}
+
+.password-field .field input {
+  padding-right: 46px;
+}
+
+.password-toggle {
+  position: absolute;
+  right: 4px;
+  bottom: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 42px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.password-toggle:hover,
+.password-toggle:focus-visible {
+  color: var(--text-strong);
+}
+
+/* A problem with one box, shown under it */
+.field-error {
+  margin: 6px 0 0;
+  color: #ffb3bf;
+  font-size: 12px;
+}
