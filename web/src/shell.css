@@ -103,3 +103,111 @@
 .shell-logout:hover {
   color: var(--text-strong);
 }
+
+/* Admin console */
+.admin-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 880px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.admin-page h2 {
+  margin: 0;
+  color: var(--text-strong);
+}
+
+.admin-intro {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.admin-card {
+  padding: 20px;
+}
+
+.admin-card h3 {
+  margin: 0 0 4px;
+  color: var(--text-strong);
+}
+
+.admin-venue {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.admin-fields,
+.admin-tier-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0 16px;
+  align-items: end;
+}
+
+.admin-tier-form {
+  margin-top: 16px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.admin-collar {
+  grid-column: 1 / -1;
+  min-height: 18px;
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.admin-collar strong {
+  color: var(--green);
+  font-family: var(--mono);
+}
+
+.admin-button {
+  width: auto;
+  min-width: 140px;
+  padding: 0 16px;
+}
+
+.admin-table {
+  width: 100%;
+  margin-top: 12px;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.admin-table th {
+  padding: 6px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  text-align: left;
+  text-transform: uppercase;
+}
+
+.admin-table td {
+  padding: 8px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.admin-empty {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.admin-badge {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--amber);
+  font-size: 11px;
+}
+
+.admin-badge.published {
+  border-color: rgba(67, 217, 139, 0.4);
+  color: var(--green);
+}
