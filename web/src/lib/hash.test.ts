@@ -6,6 +6,7 @@ import {
   hashLogEntry,
   hashAuditEntry,
   hashMerkleLeaf,
+  hashMerkleLeafWithAsset,
   hashMerkleNode,
   pairWithEmpty,
   verifyMerklePath,
@@ -61,6 +62,20 @@ describe('hash helper (Web / TypeScript)', () => {
     );
 
     expect(bytesToHex(hash)).toBe(vectors.merkle_leaf.expected_hash);
+  });
+
+  it('matches golden vector for hashMerkleLeafWithAsset', async () => {
+    const salt = hexToBytes(vectors.merkle_leaf_asset.salt_hex);
+
+    const hash = await hashMerkleLeafWithAsset(
+      salt,
+      BigInt(vectors.merkle_leaf_asset.user_id),
+      vectors.merkle_leaf_asset.asset_kind,
+      vectors.merkle_leaf_asset.market_id,
+      BigInt(vectors.merkle_leaf_asset.balance)
+    );
+
+    expect(bytesToHex(hash)).toBe(vectors.merkle_leaf_asset.expected_hash);
   });
 
   it('matches golden vector for hashMerkleNode', async () => {

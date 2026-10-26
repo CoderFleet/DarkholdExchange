@@ -5,6 +5,7 @@ import { AdminPage } from '../pages/AdminPage'
 import { IssuerPage } from '../pages/IssuerPage'
 import { LoginPage } from '../pages/LoginPage'
 import { SignupPage } from '../pages/SignupPage'
+import { VerifyPage } from '../pages/VerifyPage'
 import { useAuthStore } from '../stores/useAuthStore'
 import {Navbar} from './Navbar'
 import { RequireRole } from './RequireRole'
@@ -37,6 +38,7 @@ export function AppShell() {
         <Route path="/market" element={<App initialView="trade" />} />
         <Route path="/wallet" element={<App initialView="wallet" />} />
         <Route path="/history" element={<App initialView="history" />} />
+        <Route path="/verify" element={<VerifyPage />} />
         <Route path="/login" element={<LoginPage />} />
         <Route path="/signup" element={<SignupPage />} />
         <Route

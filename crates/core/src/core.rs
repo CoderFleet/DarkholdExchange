@@ -794,6 +794,27 @@ impl Core {
         self.ledger.balances(user_id)
     }
 
+    /// Per-user total liabilities by asset (`available + held`) for solvency
+    /// snapshots. System accounts and `Mint` are excluded: the published root
+    /// covers user claims, not the backing accounts.
+    pub fn solvency_balances(&self) -> Result<Vec<(UserId, Asset, u64)>, String> {
+        let mut balances = Vec::new();
+        for (key, account) in self.ledger.accounts() {
+            let Owner::User(user_id) = key.owner else {
+                continue;
+            };
+            let total = account
+                .available
+                .checked_add(account.held)
+                .ok_or_else(|| format!("balance overflow for user {user_id}"))?;
+            let total =
+                u64::try_from(total).map_err(|_| format!("negative balance for user {user_id}"))?;
+            balances.push((user_id, key.asset, total));
+        }
+        balances.sort_by_key(|(user_id, asset, _)| (*user_id, *asset));
+        Ok(balances)
+    }
+
     pub fn snapshot(&self, market_id: MarketId, depth: usize) -> Option<BookSnapshot> {
         self.engine.snapshot(market_id, depth)
     }

@@ -1,7 +1,7 @@
 use dkx_hash::{
     AuditRecord, GENESIS_PREV_HASH, MerklePathStep, PathDirection, hash_audit_entry,
-    hash_log_entry, hash_merkle_leaf, hash_merkle_node, pair_with_empty, verify_audit_chain,
-    verify_merkle_path,
+    hash_log_entry, hash_merkle_leaf, hash_merkle_leaf_with_asset, hash_merkle_node,
+    pair_with_empty, verify_audit_chain, verify_merkle_path,
 };
 use serde::Deserialize;
 
@@ -12,6 +12,7 @@ struct TestVectors {
     log_entry: LogEntryVector,
     audit_entry: AuditEntryVector,
     merkle_leaf: MerkleLeafVector,
+    merkle_leaf_asset: MerkleLeafAssetVector,
     merkle_node: MerkleNodeVector,
 }
 
@@ -41,6 +42,16 @@ struct AuditEntryVector {
 struct MerkleLeafVector {
     salt_hex: String,
     user_id: u64,
+    balance: u64,
+    expected_hash: String,
+}
+
+#[derive(Deserialize)]
+struct MerkleLeafAssetVector {
+    salt_hex: String,
+    user_id: u64,
+    asset_kind: u8,
+    market_id: u32,
     balance: u64,
     expected_hash: String,
 }
@@ -128,6 +139,24 @@ fn test_hash_merkle_leaf_matches_golden() {
     );
 
     assert_eq!(hex::encode(hash), vectors.merkle_leaf.expected_hash);
+}
+
+#[test]
+fn test_hash_merkle_leaf_with_asset_matches_golden() {
+    let json_str = include_str!("../../../contracts/hash_test_vectors.json");
+    let vectors: TestVectors = serde_json::from_str(json_str).expect("parse json");
+
+    let salt = decode_16_bytes(&vectors.merkle_leaf_asset.salt_hex);
+
+    let hash = hash_merkle_leaf_with_asset(
+        &salt,
+        vectors.merkle_leaf_asset.user_id,
+        vectors.merkle_leaf_asset.asset_kind,
+        vectors.merkle_leaf_asset.market_id,
+        vectors.merkle_leaf_asset.balance,
+    );
+
+    assert_eq!(hex::encode(hash), vectors.merkle_leaf_asset.expected_hash);
 }
 
 #[test]

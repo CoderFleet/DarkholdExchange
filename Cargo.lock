@@ -615,9 +615,11 @@ dependencies = [
  "dx-admin",
  "dx-auth",
  "dx-core",
+ "dx-solvency",
  "dx-types",
  "futures-util",
  "hdrhistogram",
+ "hex",
  "rmp-serde",
  "serde",
  "serde_json",
@@ -652,7 +654,11 @@ dependencies = [
 name = "dx-solvency"
 version = "0.1.0"
 dependencies = [
+ "dkx-hash",
  "dx-types",
+ "serde",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]

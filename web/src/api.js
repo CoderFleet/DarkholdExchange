@@ -103,6 +103,13 @@ export const getBook = (marketId, depth = 20) =>
 export const getLatencyMetrics = () => request('/api/metrics/latency')
 
 /**
+ * The caller's Merkle-sum inclusion proofs plus the published per-asset roots.
+ *
+ * @returns {Promise<{ seq: number, roots: any[], proofs: any[] }>}
+ */
+export const getMySolvency = () => request('/api/me/solvency')
+
+/**
  * @param {number} marketId
  * @param {number} [limit]
  * @returns {Promise<Fill[]>}

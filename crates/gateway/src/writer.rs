@@ -6,16 +6,18 @@
 //! queue order the commit order and keeps snapshots synchronized with the event
 //! stream without a core mutex.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use dx_core::Core;
+use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    Balance, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill, MarketConfig, MarketId,
-    MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq, UserId, WsServerMessage,
+    Asset, Balance, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill, MarketConfig,
+    MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq, UserId,
+    WsServerMessage,
 };
 use hdrhistogram::Histogram;
 use tokio::sync::{broadcast, oneshot};
@@ -166,6 +168,10 @@ enum WriterRequest {
         user_id: UserId,
         reply: oneshot::Sender<Vec<Balance>>,
     },
+    Solvency {
+        extra_users: Vec<UserId>,
+        reply: oneshot::Sender<Result<SolvencySnapshot, String>>,
+    },
     OpenOrders {
         user_id: UserId,
         reply: oneshot::Sender<Vec<OpenOrderView>>,
@@ -254,6 +260,16 @@ impl WriterHandle {
     pub(crate) async fn balances(&self, user_id: UserId) -> Result<Vec<Balance>, WriterError> {
         self.request(|reply| WriterRequest::Balances { user_id, reply })
             .await
+    }
+
+    pub(crate) async fn solvency(
+        &self,
+        extra_users: Vec<UserId>,
+    ) -> Result<SolvencySnapshot, WriterError> {
+        let result = self
+            .request(|reply| WriterRequest::Solvency { extra_users, reply })
+            .await?;
+        result.map_err(|_| WriterError::Unavailable)
     }
 
     pub(crate) async fn open_orders(
@@ -457,6 +473,9 @@ fn writer_loop(
             WriterRequest::Balances { user_id, reply } => {
                 let _ = reply.send(core.balances(user_id));
             }
+            WriterRequest::Solvency { extra_users, reply } => {
+                let _ = reply.send(build_solvency_snapshot(&core, &extra_users));
+            }
             WriterRequest::OpenOrders { user_id, reply } => {
                 let mut orders = Vec::new();
                 for market_id in core.engine().market_ids() {
@@ -531,6 +550,40 @@ fn writer_loop(
     }
 }
 
+/// Build the per-asset liability tree from the core's current balances.
+///
+/// Auth users are passed in so zero-balance users are still leaves; otherwise a
+/// new sign-up could not produce an inclusion proof until their first deposit.
+fn build_solvency_snapshot(
+    core: &Core,
+    extra_users: &[UserId],
+) -> Result<SolvencySnapshot, String> {
+    let mut balances = core.solvency_balances()?;
+    let mut seen: HashSet<(UserId, Asset)> = balances
+        .iter()
+        .map(|(user_id, asset, _)| (*user_id, *asset))
+        .collect();
+
+    let mut assets = Vec::with_capacity(1 + core.engine().market_ids().len());
+    assets.push(Asset::Cash);
+    assets.extend(
+        core.engine()
+            .market_ids()
+            .into_iter()
+            .map(|market_id| Asset::Pass { market_id }),
+    );
+
+    for &user_id in extra_users {
+        for &asset in &assets {
+            if seen.insert((user_id, asset)) {
+                balances.push((user_id, asset, 0));
+            }
+        }
+    }
+
+    SolvencySnapshot::from_balances(core.last_seq(), balances).map_err(|error| error.to_string())
+}
+
 fn recent_trades_for(
     recent_trades: &[Fill],
     market_filter: Option<&[MarketId]>,
@@ -589,6 +642,21 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, WriterError::QueueFull);
         assert_eq!(metrics.queue_depth.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn solvency_snapshot_includes_zero_balance_users_and_verifies() {
+        let core = funded_core();
+        let snapshot = build_solvency_snapshot(&core, &[99]).unwrap();
+
+        let cash = snapshot.tree(Asset::Cash).unwrap();
+        assert!(cash.proof(1).unwrap().verify().unwrap());
+        assert_eq!(cash.proof(99).unwrap().balance, 0);
+        assert!(cash.proof(99).unwrap().verify().unwrap());
+
+        let pass_asset = Asset::Pass { market_id: MARKET };
+        assert!(snapshot.proof(2, pass_asset).unwrap().verify().unwrap());
+        assert!(snapshot.proof(99, pass_asset).is_ok());
     }
 
     #[test]
