@@ -14,8 +14,10 @@
   },
   "include": [
     "src/api.js",
+    "src/charts/chartData.js",
     "src/feed/marketFeed.js",
     "src/feed/marketFeedClient.js",
+    "src/lib/latency.js",
     "src/protocol/index.js",
     "src/protocol/generated/**/*.ts",
     "src/stores/useMarketFeedStore.js"

@@ -26,9 +26,14 @@ import { useWalletStore } from './stores/useWalletStore'
 import { useMarketFeedStore } from './stores/useMarketFeedStore'
 import { WalletView } from './components/WalletView'
 import { HistoryView } from './components/HistoryView'
+import { DepthChart, PriceChart } from './components/MarketCharts'
+import { SpeedPanel } from './components/SpeedPanel'
+import { createLatencySample } from './lib/latency'
 import './App.css'
 
 const TRADER_IDS = [1, 2, 3, 4, 5, 6]
+const MAX_LATENCY_SAMPLES = 50
+const BOOK_LEVELS = 14
 
 function App({ initialView = 'trade' }) {
   const activeView = initialView
@@ -59,6 +64,21 @@ function App({ initialView = 'trade' }) {
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(null)
   const [bootError, setBootError] = useState(null)
+  const [latencySamples, setLatencySamples] = useState([])
+  const [lastLatency, setLastLatency] = useState(null)
+
+  const recordLatency = useCallback((sample) => {
+    setLastLatency(sample)
+    setLatencySamples((current) => [
+      ...current.slice(-(MAX_LATENCY_SAMPLES - 1)),
+      sample,
+    ])
+  }, [])
+
+  const clearLatency = useCallback(() => {
+    setLastLatency(null)
+    setLatencySamples([])
+  }, [])
 
   const loadAccount = useCallback(async (id) => {
     const [nextBalances, nextOrders] = await Promise.all([
@@ -167,8 +187,10 @@ function App({ initialView = 'trade' }) {
     : []
 
   const runCommand = async (request) => {
+    const sentAt = performance.now()
     try {
       const response = await request()
+      const acknowledgedAt = performance.now()
       setToast({
         kind: response.status === 'Rejected' ? 'error' : 'success',
         text: statusText(response),
@@ -178,6 +200,14 @@ function App({ initialView = 'trade' }) {
       }
       await loadAccount(userId)
       if (selectedMarketId != null) await loadTrades(selectedMarketId)
+
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          recordLatency(
+            createLatencySample(sentAt, acknowledgedAt, performance.now()),
+          )
+        })
+      })
       return response
     } catch (error) {
       setToast({ kind: 'error', text: error.message })
@@ -225,7 +255,13 @@ function App({ initialView = 'trade' }) {
 
       {bootError && <div className="banner error">{bootError}</div>}
 
-      {activeView === 'wallet' ? (
+      {activeView === 'speed' ? (
+        <SpeedView
+          samples={latencySamples}
+          lastSample={lastLatency}
+          onClear={clearLatency}
+        />
+      ) : activeView === 'wallet' ? (
         <WalletView
           wallet={wallet}
           onTopup={(amt) => wallet.topup(amt)}
@@ -248,31 +284,41 @@ function App({ initialView = 'trade' }) {
           {selectedMarket ? (
             <>
               <MarketHeader market={selectedMarket} snapshot={selectedSnapshot} />
-              <div className="terminal-grid">
+
+              <div className="market-main-grid">
                 <OrderBook market={selectedMarket} snapshot={selectedSnapshot} />
-                <div className="column-stack">
-                  <TradeTape market={selectedMarket} trades={selectedTrades} />
-                  <OpenOrders
-                    market={selectedMarket}
-                    orders={openOrders}
-                    cancelling={cancelling}
-                    onCancel={handleCancel}
-                  />
+
+                <div className="market-chart-stack">
+                  <PriceChart market={selectedMarket} trades={selectedTrades} />
+                  <DepthChart market={selectedMarket} snapshot={selectedSnapshot} />
                 </div>
-                <div className="column-stack">
-                  <OrderTicket
-                    key={selectedMarket.id}
-                    market={selectedMarket}
-                    snapshot={selectedSnapshot}
-                    submitting={submitting}
-                    onSubmit={submit}
-                  />
-                  <Balances
-                    market={selectedMarket}
-                    balances={balances}
-                    userId={userId}
-                  />
-                </div>
+
+                <OrderTicket
+                  key={selectedMarket.id}
+                  market={selectedMarket}
+                  snapshot={selectedSnapshot}
+                  submitting={submitting}
+                  onSubmit={submit}
+                />
+                <Balances
+                  market={selectedMarket}
+                  balances={balances}
+                  userId={userId}
+                />
+                <OpenOrders
+                  market={selectedMarket}
+                  orders={openOrders}
+                  cancelling={cancelling}
+                  onCancel={handleCancel}
+                />
+              </div>
+
+              <div className="market-secondary-grid">
+                <TradeTape market={selectedMarket} trades={selectedTrades} />
+                <SpeedPanel
+                  samples={latencySamples}
+                  lastSample={lastLatency}
+                />
               </div>
             </>
           ) : (
@@ -437,8 +483,8 @@ function Stat({ label, value, className = '' }) {
 }
 
 function OrderBook({ market, snapshot }) {
-  const bids = snapshot?.bids?.slice(0, 12) ?? []
-  const asks = snapshot?.asks?.slice(0, 12) ?? []
+  const bids = snapshot?.bids?.slice(0, BOOK_LEVELS) ?? []
+  const asks = snapshot?.asks?.slice(0, BOOK_LEVELS) ?? []
   const maxQty = Math.max(
     1,
     ...bids.map((level) => Number(level.qty)),
@@ -447,6 +493,13 @@ function OrderBook({ market, snapshot }) {
   const bestBid = bids[0]?.price_ticks
   const bestAsk = asks[0]?.price_ticks
   const spread = bestAsk != null && bestBid != null ? bestAsk - bestBid : null
+  const askRows = [...asks].reverse()
+  const askFillers = Array.from({
+    length: Math.max(0, BOOK_LEVELS - askRows.length),
+  })
+  const bidFillers = Array.from({
+    length: Math.max(0, BOOK_LEVELS - bids.length),
+  })
 
   return (
     <section className="panel order-book">
@@ -459,8 +512,17 @@ function OrderBook({ market, snapshot }) {
         <span>Qty</span>
       </div>
       <div className="book-side asks">
-        {asks.length === 0 && <EmptyRow text="No asks resting" />}
-        {[...asks].reverse().map((level) => (
+        {asks.length === 0 && (
+          <span className="book-empty-note">No asks resting</span>
+        )}
+        {askFillers.map((_, index) => (
+          <div
+            className="book-row placeholder"
+            aria-hidden="true"
+            key={`ask-filler-${index}`}
+          />
+        ))}
+        {askRows.map((level) => (
           <BookRow
             key={`ask-${level.price_ticks}`}
             market={market}
@@ -480,7 +542,9 @@ function OrderBook({ market, snapshot }) {
         </span>
       </div>
       <div className="book-side bids">
-        {bids.length === 0 && <EmptyRow text="No bids resting" />}
+        {bids.length === 0 && (
+          <span className="book-empty-note">No bids resting</span>
+        )}
         {bids.map((level) => (
           <BookRow
             key={`bid-${level.price_ticks}`}
@@ -488,6 +552,13 @@ function OrderBook({ market, snapshot }) {
             level={level}
             maxQty={maxQty}
             side="bid"
+          />
+        ))}
+        {bidFillers.map((_, index) => (
+          <div
+            className="book-row placeholder"
+            aria-hidden="true"
+            key={`bid-filler-${index}`}
           />
         ))}
       </div>
@@ -808,8 +879,34 @@ function PanelHeader({ title, meta }) {
   )
 }
 
-function EmptyRow({ text }) {
-  return <div className="empty-row">{text}</div>
+function SpeedView({ samples, lastSample, onClear }) {
+  return (
+    <div className="speed-view">
+      <section className="panel speed-overview">
+        <div>
+          <span className="eyebrow">T1 · Live telemetry</span>
+          <h2>Speed and latency</h2>
+          <p>
+            Every order is measured from the browser send to the REST
+            acknowledgement, then to the painted result. The gateway adds its own
+            queue and matching-core histograms.
+          </p>
+        </div>
+        <div className="speed-overview-tags">
+          <span>performance.now()</span>
+          <span>single-writer core</span>
+          <span>p50 / p99</span>
+        </div>
+      </section>
+
+      <SpeedPanel
+        variant="page"
+        samples={samples}
+        lastSample={lastSample}
+        onClear={onClear}
+      />
+    </div>
+  )
 }
 
 function Footer() {
