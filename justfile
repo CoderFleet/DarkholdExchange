@@ -23,6 +23,10 @@ api:
 
 web:
     npm --prefix web run dev
+    
+# create demo traders and credit their wallets and passes through the real endpoints
+seed:
+    node scripts/seed.mjs
 
 # regenerate the TypeScript declarations from the Rust wire types
 types:

@@ -232,3 +232,36 @@ The issuer console is the `/issuer` page (only the `issuer` role can open it). I
 (username, market, quantity) and a table of the supply. If the connection drops while a request is
 in flight, pressing the button again for the same user, market and quantity reuses the same
 `client_request_id`, so the passes cannot be credited twice.
+
+## 7. Seed script
+
+`node scripts/seed.mjs` (or `just seed`) sets up demo traders through the real endpoints, so a real
+run does not need `/api/dev/*`. The gateway must be running and at least one market must be
+published (an admin publishes a tier first).
+
+In order, it:
+1. logs in as the issuer;
+2. for each trader, signs up (or logs in if the account already exists);
+3. tops the trader's wallet up to a target amount (the trader's own `/api/wallet/topup`; the issuer
+   never creates cash);
+4. credits passes of every market through `POST /api/issuer/issue`.
+
+Settings are environment variables. The defaults suit a dev run:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DX_API` | `http://localhost:8080` | Where the gateway is |
+| `DX_ISSUER_USER` / `DX_ISSUER_PASSWORD` | `issuer` / `issuer-pass-1` | Issuer login. The same variable the gateway reads: set it to the real one in a real run |
+| `DX_SEED_USERS` | `demo1,demo2,demo3` | Trader usernames, comma separated |
+| `DX_DEMO_PASSWORD` | `demo-pass-123` | Their password (a demo value: change it for anything shared) |
+| `DX_SEED_CASH` | `10000` | Wallet target in rupees (0 to 100000) |
+| `DX_SEED_PASSES` | `2` | Passes per market per trader (1 to 1000) |
+| `DX_SEED_ROUND` | `1` | Raise it to give everyone more passes (see below) |
+
+**Safe to run again.** The wallet is only topped up to the target, never past it, and the passes use
+a fixed request number per market and round, so the server credits them once. Running it again
+changes nothing. To give everybody more passes, run it with the next round, for example
+`DX_SEED_ROUND=2`.
+
+If it stops, it says why: the gateway is not running, the issuer login was refused, a trader
+already exists with another password, or there are no markets yet.
