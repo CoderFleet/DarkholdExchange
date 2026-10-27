@@ -10,15 +10,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wal::{WalOp, WalSession};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    Asset, Balance, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, Fill,
-    MarketConfig, MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq,
-    UserId, WsServerMessage,
+    Asset, Balance, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, EscrowRecord,
+    Fill, MarketConfig, MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode,
+    Seq, TradeId, UserId, WsServerMessage,
 };
 use hdrhistogram::Histogram;
 use tokio::sync::{broadcast, oneshot};
@@ -28,6 +28,13 @@ const BASELINE_TRADES_LIMIT: usize = 20;
 const SNAPSHOT_CACHE_DEPTH: usize = 200;
 const MAX_LATENCY_US: u64 = 60_000_000;
 const MAX_COMMAND_BATCH: usize = 256;
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WriterError {
@@ -147,6 +154,7 @@ enum WriterRequest {
     Command {
         user_id: UserId,
         command: Command,
+        now_ms: u64,
         reply: oneshot::Sender<CommandResponse>,
     },
     CreateMarket {
@@ -202,6 +210,33 @@ enum WriterRequest {
         client_request_id: ClientOrderId,
         reply: oneshot::Sender<Result<u64, ReasonCode>>,
     },
+    RegisterPublicKey {
+        user_id: UserId,
+        public_key: [u8; 32],
+        reply: oneshot::Sender<Result<(), ReasonCode>>,
+    },
+    PublicKey {
+        user_id: UserId,
+        reply: oneshot::Sender<Option<[u8; 32]>>,
+    },
+    Escrows {
+        user_id: UserId,
+        reply: oneshot::Sender<Vec<EscrowRecord>>,
+    },
+    ReleaseEscrow {
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        delivered_at_ms: u64,
+        signature: Vec<u8>,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<EscrowRecord, ReasonCode>>,
+    },
+    RefundEscrow {
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<EscrowRecord, ReasonCode>>,
+    },
     Baseline {
         market_filter: Option<Vec<MarketId>>,
         depth: usize,
@@ -230,6 +265,7 @@ impl WriterHandle {
         self.request(|reply| WriterRequest::Command {
             user_id,
             command,
+            now_ms: unix_time_ms(),
             reply,
         })
         .await
@@ -347,6 +383,66 @@ impl WriterHandle {
         .await
     }
 
+    pub(crate) async fn register_public_key(
+        &self,
+        user_id: UserId,
+        public_key: [u8; 32],
+    ) -> Result<Result<(), ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::RegisterPublicKey {
+            user_id,
+            public_key,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn public_key(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<[u8; 32]>, WriterError> {
+        self.request(|reply| WriterRequest::PublicKey { user_id, reply })
+            .await
+    }
+
+    pub(crate) async fn escrows(&self, user_id: UserId) -> Result<Vec<EscrowRecord>, WriterError> {
+        self.request(|reply| WriterRequest::Escrows { user_id, reply })
+            .await
+    }
+
+    pub(crate) async fn release_escrow(
+        &self,
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        delivered_at_ms: u64,
+        signature: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<Result<EscrowRecord, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::ReleaseEscrow {
+            actor_user_id,
+            trade_id,
+            delivered_at_ms,
+            signature,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn refund_escrow(
+        &self,
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        now_ms: u64,
+    ) -> Result<Result<EscrowRecord, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::RefundEscrow {
+            actor_user_id,
+            trade_id,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
     pub(crate) async fn baseline(
         &self,
         market_filter: Option<Vec<MarketId>>,
@@ -445,11 +541,13 @@ struct PendingCommand {
     reply: oneshot::Sender<CommandResponse>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_command(
     core: &mut Core,
     metrics: &MetricsState,
     user_id: UserId,
     command: Command,
+    now_ms: u64,
     reply: oneshot::Sender<CommandResponse>,
     enqueued_at: Instant,
     wal_enabled: bool,
@@ -460,10 +558,12 @@ fn process_command(
         Some(WalOp::Command {
             user_id,
             command: command.clone(),
+            now_ms,
         })
     } else {
         None
     };
+    core.set_current_time_ms(now_ms);
     let outcome = core.process_with_deltas(user_id, command);
     let core_elapsed = core_started.elapsed();
     metrics.record_command(queue_wait, core_elapsed);
@@ -498,6 +598,7 @@ fn process_command_batch(
     first_enqueued_at: Instant,
     first_user_id: UserId,
     first_command: Command,
+    first_now_ms: u64,
     first_reply: oneshot::Sender<CommandResponse>,
 ) -> bool {
     let wal_enabled = wal.is_some();
@@ -506,6 +607,7 @@ fn process_command_batch(
         metrics,
         first_user_id,
         first_command,
+        first_now_ms,
         first_reply,
         first_enqueued_at,
         wal_enabled,
@@ -521,6 +623,7 @@ fn process_command_batch(
                     WriterRequest::Command {
                         user_id,
                         command,
+                        now_ms,
                         reply,
                     } => {
                         pending.push(process_command(
@@ -528,6 +631,7 @@ fn process_command_batch(
                             metrics,
                             user_id,
                             command,
+                            now_ms,
                             reply,
                             enqueued_at,
                             wal_enabled,
@@ -628,6 +732,7 @@ fn writer_loop(
             WriterRequest::Command {
                 user_id,
                 command,
+                now_ms,
                 reply,
             } => {
                 let disconnected = process_command_batch(
@@ -642,6 +747,7 @@ fn writer_loop(
                     enqueued_at,
                     user_id,
                     command,
+                    now_ms,
                     reply,
                 );
                 if disconnected {
@@ -763,6 +869,71 @@ fn writer_loop(
                     client_request_id,
                 };
                 let result = core.issue_passes(user_id, market_id, qty, client_request_id);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::RegisterPublicKey {
+                user_id,
+                public_key,
+                reply,
+            } => {
+                let wal_op = WalOp::RegisterPublicKey {
+                    user_id,
+                    public_key,
+                };
+                let result = core.register_public_key(user_id, public_key);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::PublicKey { user_id, reply } => {
+                let _ = reply.send(core.public_key(user_id));
+            }
+            WriterRequest::Escrows { user_id, reply } => {
+                let _ = reply.send(core.escrow_records(user_id));
+            }
+            WriterRequest::ReleaseEscrow {
+                actor_user_id,
+                trade_id,
+                delivered_at_ms,
+                signature,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::ReleaseEscrow {
+                    actor_user_id,
+                    trade_id,
+                    delivered_at_ms,
+                    signature: signature.clone(),
+                    now_ms,
+                };
+                let result = core.release_escrow(
+                    actor_user_id,
+                    trade_id,
+                    delivered_at_ms,
+                    &signature,
+                    now_ms,
+                );
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::RefundEscrow {
+                actor_user_id,
+                trade_id,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::RefundEscrow {
+                    actor_user_id,
+                    trade_id,
+                    now_ms,
+                };
+                let result = core.refund_escrow(actor_user_id, trade_id, now_ms);
                 if result.is_ok() {
                     append_wal(&mut wal, &wal_op, core.state_hash());
                 }

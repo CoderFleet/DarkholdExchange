@@ -91,6 +91,9 @@ function App({ initialView = 'trade' }) {
       nextBalances,
       useMarketFeedStore.getState().markets,
     )
+    // The balances endpoint does not include escrow cash or pending escrow
+    // passes, so refresh the wallet projection after a fill.
+    await useWalletStore.getState().fetchWallet()
   }, [updateWalletFromBalances])
 
   const loadTrades = useCallback(async (marketId) => {

@@ -231,6 +231,70 @@ export const getStatements = (userId, query = {}) => {
 }
 
 /**
+ * The caller's registered ed25519 seller key, if any.
+ *
+ * @param {number} userId
+ * @returns {Promise<{ public_key: string | null }>}
+ */
+export const getEscrowPublicKey = (userId) =>
+  request('/api/me/public-key', { headers: authHeaders(userId) })
+
+/**
+ * Register the public half of the seller's delivery-signing key.
+ *
+ * @param {number} userId
+ * @param {string} publicKeyHex
+ * @returns {Promise<{ public_key: string | null }>}
+ */
+export const registerEscrowPublicKey = (userId, publicKeyHex) =>
+  request('/api/me/public-key', {
+    method: 'POST',
+    headers: jsonHeaders(userId),
+    body: JSON.stringify({ public_key: publicKeyHex }),
+  })
+
+/**
+ * Escrows where the caller is buyer or seller.
+ *
+ * @param {number} userId
+ * @returns {Promise<{ items: any[], now_ms: number }>}
+ */
+export const getMyEscrow = (userId) =>
+  request('/api/me/escrow', { headers: authHeaders(userId) })
+
+/**
+ * Submit the seller's signed delivery receipt.
+ *
+ * @param {number} userId
+ * @param {number} tradeId
+ * @param {number} deliveredAtMs
+ * @param {string} signatureHex
+ * @returns {Promise<any>}
+ */
+export const releaseEscrow = (userId, tradeId, deliveredAtMs, signatureHex) =>
+  request(`/api/escrow/${tradeId}/receipt`, {
+    method: 'POST',
+    headers: jsonHeaders(userId),
+    body: JSON.stringify({
+      delivered_at_ms: deliveredAtMs,
+      signature: signatureHex,
+    }),
+  })
+
+/**
+ * Refund an escrow after its deadline.
+ *
+ * @param {number} userId
+ * @param {number} tradeId
+ * @returns {Promise<any>}
+ */
+export const refundEscrow = (userId, tradeId) =>
+  request(`/api/escrow/${tradeId}/refund`, {
+    method: 'POST',
+    headers: authHeaders(userId),
+  })
+
+/**
  * @param {number} userId
  * @returns {string}
  */

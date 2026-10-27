@@ -24,6 +24,7 @@ Status: **locked for Sprint 0** unless explicitly superseded. Each decision shou
 | 15 | Database | PostgreSQL only for read models/projections; never on the hot path | Keeps matching latency predictable; satisfies history/statements | Never on hot path |
 | 16 | Durability | Custom append-only, hash-chained WAL + periodic snapshots | Spec requires replay and tamper-evident audit | If a proven library fits better |
 | 17 | Deployment | Docker Compose locally first; Caddy/Nginx in front; cloud optional | One-command demo and reproducible load tests | When hosting is chosen |
+| 18 | Escrow | Opt-in per market. Fills move buyer cash and seller passes into system escrow accounts; a seller ed25519 receipt releases them, or either party can refund after a five-minute deadline | Demonstrates the spec's escrow state machine without making every market slower; per-fill key capture keeps replay deterministic | If production needs per-market timeouts, automatic refunds, or dispute arbitration |
 
 ## JavaScript type-safety strategy (no TypeScript migration)
 

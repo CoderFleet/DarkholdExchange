@@ -19,7 +19,7 @@
 | Live L2 ladder, depth chart, trade tape, WS diffs + resync | ✅ | Live market terminal is working, including charts and WebSocket rebuild/resync. |
 | Dutch-auction liquidation engine | ❌ | No auction types, state, command, settlement, gateway route, or UI. |
 | Frequent batch auctions with commit-reveal | ❌ | Not implemented. |
-| Escrow with signed delivery receipts and timeout refunds | ❌ | Ledger explicitly rejects escrow settlement; no ed25519 receipt flow. |
+| Escrow with signed delivery receipts and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
 | Hash-chained public audit log + browser verification | 🟡 | Hash primitives and browser verifier exist and are tested, but no audit records are produced or exposed, and there is no audit UI. |
 | Per-identity/per-IP rate limits + adaptive proof-of-work | ❌ | Only login throttling exists. Command admission has no token buckets or PoW. |
@@ -44,7 +44,7 @@
 |---|---|---|---|---|
 | 1 | FIFO price-time priority, limit/market/cancel, STP | ✅ | `crates/engine`, `crates/core`, engine/core tests. | — |
 | 2 | Server-enforced collars from face value | ✅ | Core rejects out-of-collar orders; UI shows the collar. | Optional: add a cheap gateway pre-check if the spec wording requires it. |
-| 3 | Per-identity holding limits | ✅ | Core tracks open buys and held passes. | — |
+| 3 | Per-identity holding limits | ✅ | Core tracks open buys, held passes, and pending escrow passes for the buyer. | — |
 | 4 | Double-entry ledger, reservations before matching | ✅ | `crates/ledger`, atomic settlement, conservation and negative-balance tests. | — |
 | 5 | Idempotency keys and replay-safe retries | ✅ | Core idempotency cache + tests. | — |
 | 6 | JWT auth + roles | 🟡 | Real login/signup/JWT and admin/issuer roles. Users are in memory. | Check WS handshake auth; decide whether durable users are in scope. |
@@ -53,8 +53,8 @@
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
 | 10 | Dutch auction | ❌ | Nothing in `crates/types`, core, ledger, gateway, or web. | Implement linear decay, `Accept`, CAS quantity, settlement, expiry/refund, UI. |
 | 11 | Batch auction + commit-reveal | ❌ | Nothing implemented. | Defer until P1 items are complete, unless the submission needs it. |
-| 12 | Escrow state machine | ❌ | Ledger returns `escrow_not_ready`; demo markets have `escrow_enabled: false`. | Implement `Filled → PendingDelivery → Delivered/TimedOut → Refunded` if claimed. |
-| 13 | ed25519 signed delivery receipts | ❌ | No receipt types, key registry, or signature verification. | Add with escrow. |
+| 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered` on a valid receipt, or `Refunded` after the deadline. Ledger hold/release/refund journals and core escrow invariants are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. Refund is triggered manually by either party after the deadline; there is no background timer yet. | Optional T3 timer service to auto-submit refunds. |
+| 13 | ed25519 signed delivery receipts | ✅ | `dx-types` canonical bytes, core seller-key registry, `ed25519-dalek` verification, WAL-logged key registration/release, and browser Web Crypto seller signing. | — |
 | 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
 | 15 | Hash-chained audit log | 🟡 | `crates/hash/src/audit.rs` + `web/src/lib/hash.ts` + golden vectors. No records/endpoint/UI. | Record sequenced commands, expose `GET /api/audit`, verify the chain on `/verify`. |
 | 16 | Per-user/per-IP rate limits | ❌ | Only login has a throttle (`crates/auth`). | Add token buckets at command admission; return 429 + `Retry-After`. |
@@ -90,9 +90,9 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | Escrow switch in the engine; WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
-| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow state machine/receipts/disputes; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T1 — Rudransh** | WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
+| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow disputes/arbitration; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
+| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -114,6 +114,13 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
   engine, but there is no WebSocket “market opened” frame yet. The market appears through
   `/api/markets` on the next load. Issuance is still required before trading.
 - **Issuer page is a placeholder.**
+- **Escrow timeout is 5 minutes and manual:** either party can trigger the refund after the deadline;
+  there is no background timer service yet. Disputes/arbitration are out of scope for v1.
+- **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
+  core/WAL, but the private key is browser-local and is not a production key-management story.
+- **Market 3 is the seeded escrow market:** it starts with an empty book and seeded pass inventory.
+  Old WALs from before the market-3 seed change fail their state-hash checkpoint; clear `data/log`
+  in development.
 - **WebSocket identity is unauthenticated:** `WsQuery.user_id` is accepted from the URL.
 - **`web/full-smoke-run.mjs` is not part of the repo:** it has a hard-coded temp path and imports
   `playwright` instead of the declared `@playwright/test`. Keep it untracked or rewrite it as a real
@@ -125,7 +132,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 1. **Issuer console (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add role-checked pass issuance and a supply view so new markets are tradable without dev endpoints.
 2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-3. **Escrow (T2 — Shraddha, with T1 switch + T3 timer):** state machine, ed25519 receipts, timeout refunds.
+3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
 4. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
 5. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
 6. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
@@ -135,9 +142,9 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 ## Submission honesty
 
 The PDF abstract names a Dutch-auction engine, escrow, and a cryptographic proof of solvency. The
-solvency proof is now real. Dutch auction, batch auction, and escrow are still missing. Before the
-deadline, either implement them or explicitly mark them as **not delivered** in the final README and
-demo script. Do not let the abstract imply that a running feature exists when it does not.
+solvency proof and escrow v1 are now real. Dutch auction and batch auction are still missing. Before
+the deadline, either implement them or explicitly mark them as **not delivered** in the final README
+and demo script. Do not let the abstract imply that a running feature exists when it does not.
 
 ## Verification commands
 

@@ -11,9 +11,10 @@ High-frequency secondary marketplace with an in-memory limit order book.
 
 ## Persistence
 
-The gateway is crash-safe by default. Every non-cached command, successful deposit/issuance, and
-runtime market creation is appended to a hash-chained write-ahead log in group-committed batches,
-then fsynced before the caller gets a reply. A full post-state checkpoint is written at least every
+The gateway is crash-safe by default. Every non-cached command, successful deposit/issuance,
+runtime market creation, seller-key registration, and escrow release/refund is appended to a
+hash-chained write-ahead log in group-committed batches, then fsynced before the caller gets a
+reply. A full post-state checkpoint is written at least every
 256 operations. Startup replays the log into the seeded demo state and aborts if any stored
 checkpoint does not match.
 

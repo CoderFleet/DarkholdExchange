@@ -32,8 +32,14 @@ export const useAdminStore = create((set) => {
     },
 
     addEvent: (name, venue) => run(() => createEvent(name, venue || undefined)),
-    addTier: (eventId, name, faceValueMinor) =>
-      run(() => createTier(eventId, { name, face_value_minor: faceValueMinor })),
+    addTier: (eventId, name, faceValueMinor, escrowEnabled = false) =>
+      run(() =>
+        createTier(eventId, {
+          name,
+          face_value_minor: faceValueMinor,
+          ...(escrowEnabled ? { escrow_enabled: true } : {}),
+        }),
+      ),
     publish: (marketId) => run(() => publishTier(marketId)),
     clearError: () => set({ error: null }),
   }

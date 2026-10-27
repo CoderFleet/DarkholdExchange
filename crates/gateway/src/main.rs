@@ -22,10 +22,10 @@ use axum::{Json, Router};
 use dx_core::Core;
 use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
-    Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody, Fill,
-    JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
-    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, UserId, WsClientMessage,
-    WsServerMessage, seed_markets,
+    Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody,
+    EscrowRecord, EscrowState, Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor,
+    OpenOrderView, OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, TradeId,
+    UserId, WsClientMessage, WsServerMessage, seed_markets,
 };
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -144,6 +144,13 @@ fn writer_error(error: WriterError) -> ApiError {
 
 /// Transport mapping for a sequenced business rejection. The core still returns
 /// the original `CommandResponse`; the gateway translates it once at the edge.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
 fn status_for_reason(reason: ReasonCode) -> StatusCode {
     use ReasonCode::*;
     match reason {
@@ -272,6 +279,13 @@ async fn main() {
         .route("/api/users/{user_id}/orders", get(open_orders))
         .route("/api/wallet", get(wallet_current))
         .route("/api/wallet/topup", post(wallet_topup))
+        .route(
+            "/api/me/public-key",
+            get(public_key_current).post(register_public_key),
+        )
+        .route("/api/me/escrow", get(escrow_current))
+        .route("/api/escrow/{trade_id}/receipt", post(escrow_receipt))
+        .route("/api/escrow/{trade_id}/refund", post(escrow_refund))
         .route("/api/history", get(history_current))
         .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
@@ -741,6 +755,19 @@ async fn wallet_current(
     let user_id = caller_user(&state, &headers)?;
     let balances = state.writer.balances(user_id).await.map_err(writer_error)?;
     let markets = state.writer.markets().await.map_err(writer_error)?;
+    let escrows = state.writer.escrows(user_id).await.map_err(writer_error)?;
+    let escrow_cash = escrows
+        .iter()
+        .filter(|record| record.state == EscrowState::PendingDelivery && record.buyer_id == user_id)
+        .map(|record| {
+            record.notional
+                + if record.fee_payer == record.buyer_id {
+                    record.fee
+                } else {
+                    0
+                }
+        })
+        .sum();
 
     let mut cash_avail = 0;
     let mut cash_locked = 0;
@@ -770,11 +797,39 @@ async fn wallet_current(
         }
     }
 
+    for record in escrows.iter().filter(|record| {
+        record.state == EscrowState::PendingDelivery
+            && (record.buyer_id == user_id || record.seller_id == user_id)
+    }) {
+        let entry = if let Some(entry) = passes
+            .iter_mut()
+            .find(|pass| pass.market_id == record.market_id)
+        {
+            entry
+        } else {
+            let market_name = markets
+                .iter()
+                .find(|market| market.config.id == record.market_id)
+                .map(|market| market.config.name.clone())
+                .unwrap_or_else(|| format!("Market #{}", record.market_id));
+            passes.push(PassWalletView {
+                market_id: record.market_id,
+                event_name: market_name,
+                tier_name: "General".into(),
+                avail: 0,
+                locked: 0,
+                held: 0,
+            });
+            passes.last_mut().expect("escrow pass row")
+        };
+        entry.held = entry.held.saturating_add(record.qty);
+    }
+
     Ok(Json(UserWalletView {
         user_id,
         cash_avail,
         cash_locked,
-        escrow_cash: 0,
+        escrow_cash,
         passes,
     }))
 }
@@ -807,6 +862,209 @@ async fn wallet_topup(
     wallet_current(State(state), headers).await
 }
 
+#[derive(Serialize)]
+struct PublicKeyView {
+    public_key: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PublicKeyPayload {
+    public_key: String,
+}
+
+async fn public_key_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PublicKeyView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let public_key = state
+        .writer
+        .public_key(user_id)
+        .await
+        .map_err(writer_error)?;
+    Ok(Json(PublicKeyView {
+        public_key: public_key.map(hex::encode),
+    }))
+}
+
+async fn register_public_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<PublicKeyPayload>, JsonRejection>,
+) -> Result<Json<PublicKeyView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let bytes = hex::decode(body.public_key.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))?;
+    let public_key: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))?;
+    state
+        .writer
+        .register_public_key(user_id, public_key)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(PublicKeyView {
+        public_key: Some(hex::encode(public_key)),
+    }))
+}
+
+#[derive(Serialize)]
+struct EscrowView {
+    trade_id: TradeId,
+    market_id: MarketId,
+    market_name: String,
+    buyer_id: UserId,
+    seller_id: UserId,
+    qty: Qty,
+    notional: Minor,
+    fee: Minor,
+    fee_payer: UserId,
+    state: EscrowState,
+    created_at_ms: u64,
+    deadline_ms: u64,
+    delivered_at_ms: Option<u64>,
+    role: &'static str,
+    buyer_cash: Minor,
+    seller_cash: Minor,
+}
+
+#[derive(Serialize)]
+struct EscrowResponse {
+    items: Vec<EscrowView>,
+    now_ms: u64,
+}
+
+fn escrow_view(record: EscrowRecord, user_id: UserId, market_name: String) -> EscrowView {
+    let buyer_fee = if record.fee_payer == record.buyer_id {
+        record.fee
+    } else {
+        0
+    };
+    let seller_fee = if record.fee_payer == record.seller_id {
+        record.fee
+    } else {
+        0
+    };
+    EscrowView {
+        trade_id: record.trade_id,
+        market_id: record.market_id,
+        market_name,
+        buyer_id: record.buyer_id,
+        seller_id: record.seller_id,
+        qty: record.qty,
+        notional: record.notional,
+        fee: record.fee,
+        fee_payer: record.fee_payer,
+        state: record.state,
+        created_at_ms: record.created_at_ms,
+        deadline_ms: record.deadline_ms,
+        delivered_at_ms: record.delivered_at_ms,
+        role: if record.buyer_id == user_id {
+            "buyer"
+        } else {
+            "seller"
+        },
+        buyer_cash: record.notional.saturating_add(buyer_fee),
+        seller_cash: record.notional.saturating_sub(seller_fee),
+    }
+}
+
+async fn escrow_current(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EscrowResponse>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let records = state.writer.escrows(user_id).await.map_err(writer_error)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    let names: std::collections::HashMap<_, _> = markets
+        .into_iter()
+        .map(|market| (market.config.id, market.config.name))
+        .collect();
+    let items = records
+        .into_iter()
+        .map(|record| {
+            let name = names
+                .get(&record.market_id)
+                .cloned()
+                .unwrap_or_else(|| format!("Market #{}", record.market_id));
+            escrow_view(record, user_id, name)
+        })
+        .collect();
+    Ok(Json(EscrowResponse {
+        items,
+        now_ms: now_ms(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReceiptPayload {
+    delivered_at_ms: u64,
+    signature: String,
+}
+
+#[derive(Serialize)]
+struct EscrowActionView {
+    trade_id: TradeId,
+    state: EscrowState,
+    delivered_at_ms: Option<u64>,
+}
+
+async fn escrow_receipt(
+    Path(trade_id): Path<TradeId>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<ReceiptPayload>, JsonRejection>,
+) -> Result<Json<EscrowActionView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    if body.delivered_at_ms == 0 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidReceipt,
+        ));
+    }
+    let signature = hex::decode(body.signature.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))?;
+    if signature.len() != 64 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidReceipt,
+        ));
+    }
+    let record = state
+        .writer
+        .release_escrow(user_id, trade_id, body.delivered_at_ms, signature, now_ms())
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(EscrowActionView {
+        trade_id: record.trade_id,
+        state: record.state,
+        delivered_at_ms: record.delivered_at_ms,
+    }))
+}
+
+async fn escrow_refund(
+    Path(trade_id): Path<TradeId>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EscrowActionView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let record = state
+        .writer
+        .refund_escrow(user_id, trade_id, now_ms())
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(EscrowActionView {
+        trade_id: record.trade_id,
+        state: record.state,
+        delivered_at_ms: record.delivered_at_ms,
+    }))
+}
+
 #[derive(Deserialize)]
 struct HistoryQuery {
     market_id: Option<MarketId>,
@@ -826,6 +1084,7 @@ struct HistoryItem {
     fee: Minor,
     total_paise: Minor,
     ts: u64,
+    escrowed: bool,
 }
 
 #[derive(Serialize)]
@@ -865,6 +1124,14 @@ async fn history_current(
         markets.iter().map(|m| m.config.id).collect()
     };
 
+    let escrow_trades: std::collections::HashSet<_> = state
+        .writer
+        .escrows(user_id)
+        .await
+        .map_err(writer_error)?
+        .into_iter()
+        .map(|record| record.trade_id)
+        .collect();
     let mut items = Vec::new();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -920,6 +1187,7 @@ async fn history_current(
                         fee: fee_paise,
                         total_paise,
                         ts: now.saturating_sub(f.seq.saturating_mul(1000)),
+                        escrowed: escrow_trades.contains(&f.trade_id),
                     });
                 }
             }
@@ -1339,10 +1607,6 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
         (3, 2, Side::Buy, 9_700, 1),
         (2, 2, Side::Sell, 10_200, 1),
         (4, 2, Side::Sell, 10_300, 1),
-        (1, 3, Side::Buy, 4_800, 2),
-        (3, 3, Side::Buy, 4_700, 2),
-        (2, 3, Side::Sell, 5_200, 2),
-        (4, 3, Side::Sell, 5_300, 2),
     ];
 
     for (user_id, market_id, side, price_ticks, qty) in seed_orders {

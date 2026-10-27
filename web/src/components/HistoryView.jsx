@@ -4,17 +4,58 @@ import { formatMoney, formatQty } from '../format'
 export function HistoryView({ wallet, onRefresh }) {
   const [activeTab, setActiveTab] = useState('trades')
   const [sideFilter, setSideFilter] = useState('all')
+  const [now, setNow] = useState(0)
+  const [escrowBusy, setEscrowBusy] = useState(null)
+  const [escrowError, setEscrowError] = useState(null)
 
-  const { historyItems, statementItems, fetchHistory, fetchStatements } = wallet
+  const {
+    historyItems,
+    statementItems,
+    escrowItems,
+    escrowPublicKey,
+    escrowLoading,
+    fetchHistory,
+    fetchStatements,
+    fetchEscrow,
+    registerSigningKey,
+    deliverEscrow,
+    refundEscrowAction,
+  } = wallet
 
   useEffect(() => {
     if (activeTab === 'trades') {
       const filter = sideFilter === 'all' ? {} : { side: sideFilter }
       fetchHistory(filter)
-    } else {
+    } else if (activeTab === 'statements') {
       fetchStatements()
+    } else {
+      fetchEscrow()
+      const timer = setInterval(() => setNow(Date.now()), 1000)
+      return () => clearInterval(timer)
     }
-  }, [activeTab, sideFilter, fetchHistory, fetchStatements])
+  }, [activeTab, sideFilter, fetchHistory, fetchStatements, fetchEscrow])
+
+  const refresh = () => {
+    if (activeTab === 'escrow') {
+      fetchEscrow()
+    } else if (activeTab === 'statements') {
+      fetchStatements()
+    } else {
+      onRefresh()
+    }
+  }
+
+  const runEscrowAction = async (tradeId, action) => {
+    setEscrowBusy(tradeId)
+    setEscrowError(null)
+    try {
+      await action(tradeId)
+    } catch (err) {
+      setEscrowError(err.message)
+    } finally {
+      setEscrowBusy(null)
+    }
+  }
 
   const formatTime = (ts) => {
     if (!ts) return '—'
@@ -39,6 +80,13 @@ export function HistoryView({ wallet, onRefresh }) {
           </button>
           <button
             type="button"
+            className={activeTab === 'escrow' ? 'active' : ''}
+            onClick={() => setActiveTab('escrow')}
+          >
+            Escrow
+          </button>
+          <button
+            type="button"
             className={activeTab === 'statements' ? 'active' : ''}
             onClick={() => setActiveTab('statements')}
           >
@@ -50,7 +98,7 @@ export function HistoryView({ wallet, onRefresh }) {
           <button
             type="button"
             className="ghost-button"
-            onClick={onRefresh}
+            onClick={refresh}
             title="Refresh history records"
           >
             ↻ Refresh
@@ -71,7 +119,128 @@ export function HistoryView({ wallet, onRefresh }) {
         </div>
       </div>
 
-      {activeTab === 'trades' ? (
+      {activeTab === 'escrow' ? (
+        <section className="panel history-table-panel">
+          <div className="panel-header">
+            <h3>Escrow Handoffs</h3>
+            <span className="panel-meta">
+              {escrowItems.length} record{escrowItems.length === 1 ? '' : 's'}
+            </span>
+          </div>
+
+          <div className="escrow-toolbar">
+            <span className="muted">
+              {escrowPublicKey
+                ? `Seller key registered · ${escrowPublicKey.slice(0, 12)}…`
+                : 'No seller signing key registered yet.'}
+            </span>
+            <button
+              type="button"
+              className="ghost-button"
+              disabled={escrowLoading}
+              onClick={async () => {
+                setEscrowError(null)
+                try {
+                  await registerSigningKey()
+                } catch (err) {
+                  setEscrowError(err.message)
+                }
+              }}
+            >
+              {escrowPublicKey ? 'Rotate signing key' : 'Register signing key'}
+            </button>
+          </div>
+
+          {escrowError && <div className="banner error">{escrowError}</div>}
+
+          {escrowItems.length === 0 ? (
+            <div className="empty-row">No escrow handoffs for this account.</div>
+          ) : (
+            <div className="table-responsive">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Trade</th>
+                    <th>Market</th>
+                    <th>Role</th>
+                    <th>Qty</th>
+                    <th>Escrow Value</th>
+                    <th>State</th>
+                    <th>Deadline</th>
+                    <th>Action</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {escrowItems.map((item) => {
+                    const pending = item.state === 'pending_delivery'
+                    const expired = pending && now >= item.deadline_ms
+                    const busy = escrowBusy === item.trade_id
+                    const value = item.role === 'buyer' ? item.buyer_cash : item.seller_cash
+                    return (
+                      <tr key={`escrow-${item.trade_id}`}>
+                        <td className="mono text-purple">#{item.trade_id}</td>
+                        <td>
+                          <span className="market-badge">{item.market_name}</span>
+                        </td>
+                        <td>
+                          <span className={`side-tag ${item.role === 'buyer' ? 'buy' : 'sell'}`}>
+                            {item.role.toUpperCase()}
+                          </span>
+                        </td>
+                        <td className="mono">{formatQty(item.qty)}</td>
+                        <td className="mono font-bold">{formatMoney(value)}</td>
+                        <td>
+                          <span className="kind-badge">
+                            {item.state.replaceAll('_', ' ')}
+                          </span>
+                        </td>
+                        <td className="mono muted">
+                          {pending ? formatTime(item.deadline_ms) : '—'}
+                        </td>
+                        <td>
+                          {pending && item.role === 'seller' && !expired && (
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={busy || !escrowPublicKey}
+                              onClick={() =>
+                                runEscrowAction(item.trade_id, deliverEscrow)
+                              }
+                              title={
+                                escrowPublicKey
+                                  ? 'Sign the delivery receipt'
+                                  : 'Register a signing key first'
+                              }
+                            >
+                              {busy ? 'Signing…' : 'Mark delivered'}
+                            </button>
+                          )}
+                          {pending && expired && (
+                            <button
+                              type="button"
+                              className="ghost-button"
+                              disabled={busy}
+                              onClick={() =>
+                                runEscrowAction(item.trade_id, refundEscrowAction)
+                              }
+                            >
+                              {busy ? 'Refunding…' : 'Refund'}
+                            </button>
+                          )}
+                          {pending && item.role === 'buyer' && !expired && (
+                            <span className="muted">Waiting for seller</span>
+                          )}
+                          {!pending && <span className="muted">Closed</span>}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </section>
+      ) : activeTab === 'trades' ? (
         <section className="panel history-table-panel">
           <div className="panel-header">
             <h3>Trade Executions</h3>
@@ -116,7 +285,7 @@ export function HistoryView({ wallet, onRefresh }) {
                       </td>
                       <td>
                         <span className="status-pill settled">
-                          {item.escrow_id ? 'Escrowed' : 'Settled'}
+                          {item.escrowed ? 'Escrow' : 'Settled'}
                         </span>
                       </td>
                     </tr>

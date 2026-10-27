@@ -388,16 +388,17 @@ System/mint accounts may be negative (they represent issuance/liabilities); user
 Per-market `escrow_enabled`. For an escrow fill:
 
 ```
-Filled → PendingDelivery → Delivered/Released
-                        ↘ TimedOut → Refunded
+Filled → PendingDelivery → Delivered
+                        ↘ Refunded (after deadline)
 ```
 
-- Buyer cash and seller passes remain held in reservation accounts.
+- Buyer cash and seller passes move from reservation accounts into shared escrow system accounts;
+  the seller is paid only on release.
 - Seller submits an ed25519-signed receipt over
   `(trade_id, market_id, qty, buyer_id, seller_id, delivered_at_ms)`.
-- Gateway verifies the signature against the seller's registered public key; the core releases funds
+- The core verifies the signature against the seller key captured at fill time, then releases funds
   and passes atomically.
-- On timeout, a refund command releases both sides' reservations.
+- On timeout, either party can submit a refund command that returns both sides.
 - Disputes/admin resolution are out of scope for v1 (documented as a stretch).
 
 ### 5.7 Dutch auction

@@ -181,10 +181,99 @@ GET /api/state/hash
 { "state_hash": "ddeb4382d5b67d0ea610c86891e43017b548eed02ac65a7219287da1a0aabf8e" }
 ```
 
-It is a deterministic hash of the engine books, ledger balances, open-buy reservations, core
-sequence, and core state version. It is not a balance or account identifier.
+It is a deterministic hash of the engine books, ledger balances, open-buy reservations, escrow
+records, registered seller keys, core sequence, and core state version. It is not a balance or
+account identifier.
 
-### 2.7 Temporary aliases
+### 2.7 Escrow
+
+Escrow is opt-in per market. In an escrow market a fill moves the buyer's cash and the seller's
+passes into system escrow accounts instead of paying the seller immediately. The trade starts as
+`pending_delivery` with a five-minute deadline.
+
+A seller must register an ed25519 public key before listing a sell in an escrow market:
+
+```http
+POST /api/me/public-key
+Content-Type: application/json
+x-dev-user: 2
+```
+
+```json
+{ "public_key": "a4105dc2613e47b086303a27c8e9f10af2a2c9004b65d187b0792496fcdfc9cd" }
+```
+
+`GET /api/me/public-key` returns `{ "public_key": "<hex>" }` or `null`.
+
+The caller's escrows are available at:
+
+```http
+GET /api/me/escrow
+```
+
+```json
+{
+  "items": [
+    {
+      "trade_id": 2,
+      "market_id": 3,
+      "market_name": "Relic: Obsidian Sigil",
+      "buyer_id": 1,
+      "seller_id": 2,
+      "qty": 2,
+      "notional": 400000,
+      "fee": 6000,
+      "fee_payer": 1,
+      "state": "pending_delivery",
+      "created_at_ms": 1793083525399,
+      "deadline_ms": 1793083825399,
+      "delivered_at_ms": null,
+      "role": "buyer",
+      "buyer_cash": 406000,
+      "seller_cash": 400000
+    }
+  ],
+  "now_ms": 1793083525413
+}
+```
+
+The seller releases escrow with a signature over the canonical receipt bytes:
+
+```text
+"darkhold-escrow-receipt-v1"
+|| trade_id u64 BE
+|| market_id u64 BE
+|| qty u64 BE
+|| buyer_id u64 BE
+|| seller_id u64 BE
+|| delivered_at_ms u64 BE
+```
+
+```http
+POST /api/escrow/{trade_id}/receipt
+Content-Type: application/json
+x-dev-user: 2
+```
+
+```json
+{
+  "delivered_at_ms": 1793083525413,
+  "signature": "<128 hex characters>"
+}
+```
+
+After the deadline either party can refund:
+
+```http
+POST /api/escrow/{trade_id}/refund
+x-dev-user: 1
+```
+
+Both actions return `{ "trade_id": 2, "state": "delivered" | "refunded", "delivered_at_ms": ... }`.
+Escrow is also included in the wallet response: `escrow_cash` is the buyer's pending cash and
+`passes[].held` is the quantity in escrow.
+
+### 2.8 Temporary aliases
 
 These remain available so the current terminal keeps working. New code should use the canonical
 paths above.
@@ -210,11 +299,11 @@ All gateway errors use:
 
 | HTTP | Meaning | Examples |
 |---|---|---|
-| `400` | Malformed body/query, invalid enum, invalid quantity/price/tick, missing `client_order_id` | `invalid_request`, `invalid_quantity`, `price_not_tick_aligned` |
+| `400` | Malformed body/query, invalid enum, invalid quantity/price/tick, bad receipt/signature, missing `client_order_id` | `invalid_request`, `invalid_quantity`, `price_not_tick_aligned`, `invalid_receipt`, `receipt_expired` |
 | `403` | Authenticated user does not own the order | `not_order_owner` |
 | `404` | Unknown market or order | `unknown_market`, `order_not_found` |
 | `405` | Wrong method for the operation (cancel sent to `POST /api/orders`) | `cancel_not_allowed` |
-| `409` | Conflicting lifecycle state | `duplicate_client_order_id`, `market_closed`, `cancel_not_allowed` |
+| `409` | Conflicting lifecycle state | `duplicate_client_order_id`, `market_closed`, `cancel_not_allowed`, `escrow_not_ready` |
 | `422` | Sequenced business rejection | `outside_collar`, `insufficient_funds`, `self_trade` |
 | `429` | Command queue full; includes `Retry-After: 1` | `queue_full` |
 | `500` | Internal engine failure | `internal_error` |
