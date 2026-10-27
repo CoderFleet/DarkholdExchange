@@ -1922,6 +1922,10 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
             .expect("seed market 2 passes");
         core.issue_passes(user_id, 3, 2, 1)
             .expect("seed market 3 passes");
+        let dummy_key = ed25519_dalek::SigningKey::from_bytes(&[user_id as u8 + 1; 32])
+            .verifying_key()
+            .to_bytes();
+        let _ = core.register_public_key(user_id, dummy_key);
     }
 
     let seed_orders = [
