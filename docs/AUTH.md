@@ -172,6 +172,12 @@ saves the tier as published. If the server crashes between the two, the tier is 
 while the engine already has the market, and publishing it again fails. This needs a manual fix
 for now.
 
+**Resetting in development.** The write-ahead log (the `data` folder) and the database describe the
+same world: the log holds the engine's money and markets, the database holds who the accounts are
+and which tiers are published. Reset them together. Deleting only one leaves them disagreeing (for
+example a tier saved as published whose market is no longer in the engine). A log written by an
+older version of the engine can also fail its state-hash check at start; the fix in development is
+to clear both.
 
 ## 6. Issuer: creating passes
 
@@ -219,3 +225,10 @@ Response `200`: a list, one row per market, sorted by market id:
 
 `passes_held` is how many passes users hold now (available and reserved). Passes are never
 destroyed, so this is also how many were issued so far.
+
+### 6.3 Console
+
+The issuer console is the `/issuer` page (only the `issuer` role can open it). It has a form
+(username, market, quantity) and a table of the supply. If the connection drops while a request is
+in flight, pressing the button again for the same user, market and quantity reuses the same
+`client_request_id`, so the passes cannot be credited twice.
