@@ -153,6 +153,7 @@ struct NewTier {
     tick_size_minor: Option<Minor>,
     holding_limit: Option<u32>,
     taker_fee_bps: Option<u16>,
+    escrow_enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,6 +182,7 @@ struct TierView {
     tick_size_minor: Minor,
     holding_limit: u32,
     taker_fee_bps: u16,
+    escrow_enabled: bool,
     #[serde(flatten)]
     collar: CollarView,
     status: TierStatus,
@@ -220,6 +222,7 @@ fn tier_view(tier: &TierRec) -> TierView {
         tick_size_minor: tier.config.tick_size_minor,
         holding_limit: tier.config.holding_limit,
         taker_fee_bps: tier.config.taker_fee_bps,
+        escrow_enabled: tier.config.escrow_enabled,
         collar: collar_view(&tier.config),
         status: tier.status,
     }
@@ -249,6 +252,14 @@ fn clean_name(raw: &str) -> Result<String, AdminError> {
     Ok(name.to_string())
 }
 
+#[derive(Debug, Default)]
+struct MarketOptions {
+    tick_size_minor: Option<Minor>,
+    holding_limit: Option<u32>,
+    taker_fee_bps: Option<u16>,
+    escrow_enabled: Option<bool>,
+}
+
 /// Builds a market from the admin's numbers and the collar policy, and validates it with the
 /// shared `MarketConfig::validate` rules.
 fn build_config(
@@ -256,12 +267,10 @@ fn build_config(
     event_id: u32,
     name: String,
     face_value_minor: Minor,
-    tick_size_minor: Option<Minor>,
-    holding_limit: Option<u32>,
-    taker_fee_bps: Option<u16>,
+    options: MarketOptions,
 ) -> Result<MarketConfig, AdminError> {
-    let holding_limit = holding_limit.unwrap_or(DEFAULT_HOLDING_LIMIT);
-    let taker_fee_bps = taker_fee_bps.unwrap_or(DEFAULT_TAKER_FEE_BPS);
+    let holding_limit = options.holding_limit.unwrap_or(DEFAULT_HOLDING_LIMIT);
+    let taker_fee_bps = options.taker_fee_bps.unwrap_or(DEFAULT_TAKER_FEE_BPS);
     if face_value_minor > MAX_FACE_VALUE_MINOR
         || holding_limit > MAX_HOLDING_LIMIT
         || taker_fee_bps > MAX_TAKER_FEE_BPS
@@ -273,12 +282,12 @@ fn build_config(
         event_id,
         name,
         face_value_minor,
-        tick_size_minor: tick_size_minor.unwrap_or(DEFAULT_TICK_MINOR),
+        tick_size_minor: options.tick_size_minor.unwrap_or(DEFAULT_TICK_MINOR),
         collar_floor_bps: COLLAR_FLOOR_BPS,
         collar_cap_bps: COLLAR_CAP_BPS,
         holding_limit,
         taker_fee_bps,
-        escrow_enabled: false,
+        escrow_enabled: options.escrow_enabled.unwrap_or(false),
         // A draft cannot trade. Publishing switches it to `Open`.
         status: MarketStatus::Closed,
     };
@@ -387,9 +396,12 @@ async fn create_tier(
         event_id,
         format!("{} {}", event.name, tier_name),
         request.face_value_minor,
-        request.tick_size_minor,
-        request.holding_limit,
-        request.taker_fee_bps,
+        MarketOptions {
+            tick_size_minor: request.tick_size_minor,
+            holding_limit: request.holding_limit,
+            taker_fee_bps: request.taker_fee_bps,
+            escrow_enabled: request.escrow_enabled,
+        },
     )?;
     let tier = TierRec {
         tier_name,
@@ -413,9 +425,10 @@ async fn collar_preview(
         0,
         "preview".into(),
         request.face_value_minor,
-        request.tick_size_minor,
-        None,
-        None,
+        MarketOptions {
+            tick_size_minor: request.tick_size_minor,
+            ..MarketOptions::default()
+        },
     )?;
     Ok(Json(collar_view(&config)))
 }

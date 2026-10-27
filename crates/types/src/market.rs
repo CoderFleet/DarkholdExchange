@@ -143,7 +143,7 @@ pub fn seed_markets() -> Vec<MarketConfig> {
             collar_cap_bps: 15_000,
             holding_limit: 5,
             taker_fee_bps: 150,
-            escrow_enabled: false,
+            escrow_enabled: true,
             status: MarketStatus::Open,
         },
     ]

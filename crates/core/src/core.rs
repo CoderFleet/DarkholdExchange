@@ -15,11 +15,17 @@ use std::collections::HashMap;
 use dx_engine::{Engine, PlaceOutcome};
 use dx_ledger::{Ledger, LedgerError, Owner, TradeSettlement};
 use dx_types::{
-    Asset, Balance, BookDelta, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, Fill,
-    MarketConfig, MarketId, MarketStatus, Minor, OrderStatus, PlaceLimit, PlaceMarket, Qty,
-    ReasonCode, Seq, Side, Ticks, UserId,
+    Asset, Balance, BookDelta, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse,
+    DeliveryReceipt, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId, MarketStatus, Minor,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Seq, Side, Ticks, TradeId, UserId,
 };
+use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
+
+/// How long a buyer's cash and a seller's passes stay in escrow before a refund
+/// can be requested. Kept short for the demo; production would use a market-level
+/// policy.
+pub const ESCROW_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandKind {
@@ -47,6 +53,13 @@ pub struct Core {
     idempotency: HashMap<(UserId, ClientOrderId), CachedCommand>,
     /// Sum of open buy quantities per identity/market, for the holding limit.
     open_buy_qty: HashMap<(UserId, MarketId), Qty>,
+    /// Trades waiting for a signed delivery receipt, or already closed.
+    escrow: HashMap<TradeId, EscrowRecord>,
+    /// Seller signing keys. Registered explicitly so escrow release is replayable.
+    public_keys: HashMap<UserId, [u8; 32]>,
+    /// Wall-clock time supplied by the gateway for the current command. Not hashed;
+    /// replay supplies the same value from the WAL operation.
+    current_time_ms: u64,
     poisoned: bool,
 }
 
@@ -103,6 +116,9 @@ impl Core {
             state_version: 0,
             idempotency: HashMap::new(),
             open_buy_qty: HashMap::new(),
+            escrow: HashMap::new(),
+            public_keys: HashMap::new(),
+            current_time_ms: 0,
             poisoned: false,
         })
     }
@@ -215,6 +231,12 @@ impl Core {
         }
         if !market.price_in_collar(place.price_ticks) {
             return CommandResponse::rejected(seq, ReasonCode::OutsideCollar);
+        }
+        if market.escrow_enabled
+            && place.side == Side::Sell
+            && !self.public_keys.contains_key(&user_id)
+        {
+            return CommandResponse::rejected(seq, ReasonCode::EscrowNotReady);
         }
 
         let pass_asset = Asset::Pass {
@@ -355,6 +377,12 @@ impl Core {
         }
         if !market.price_in_collar(place.protect_price_ticks) {
             return CommandResponse::rejected(seq, ReasonCode::OutsideCollar);
+        }
+        if market.escrow_enabled
+            && place.side == Side::Sell
+            && !self.public_keys.contains_key(&user_id)
+        {
+            return CommandResponse::rejected(seq, ReasonCode::EscrowNotReady);
         }
 
         let pass_asset = Asset::Pass {
@@ -577,7 +605,34 @@ impl Core {
                 fee,
                 fee_payer: taker_user,
             };
-            if self.ledger.settle_trade(settlement).is_err() {
+            if market.escrow_enabled {
+                let Some(seller_public_key) = self.public_keys.get(&seller_id).copied() else {
+                    self.poisoned = true;
+                    return Err(ReasonCode::EscrowNotReady);
+                };
+                if self.ledger.hold_escrow(settlement).is_err() {
+                    self.poisoned = true;
+                    return Err(ReasonCode::InternalError);
+                }
+                self.escrow.insert(
+                    fill.trade_id,
+                    EscrowRecord {
+                        trade_id: fill.trade_id,
+                        market_id: market.id,
+                        buyer_id,
+                        seller_id,
+                        qty: fill.qty,
+                        notional,
+                        fee,
+                        fee_payer: taker_user,
+                        state: EscrowState::PendingDelivery,
+                        created_at_ms: self.current_time_ms,
+                        deadline_ms: self.current_time_ms.saturating_add(ESCROW_TIMEOUT_MS),
+                        delivered_at_ms: None,
+                        seller_public_key,
+                    },
+                );
+            } else if self.ledger.settle_trade(settlement).is_err() {
                 self.poisoned = true;
                 return Err(ReasonCode::InternalError);
             }
@@ -672,7 +727,22 @@ impl Core {
             .get(&(user_id, market_id))
             .copied()
             .unwrap_or(0);
-        let projected = available.saturating_add(held).saturating_add(open);
+        // Passes bought through escrow are in the system escrow account, not the
+        // buyer's wallet yet, but they still consume the identity's holding limit.
+        let escrowed: u64 = self
+            .escrow
+            .values()
+            .filter(|record| {
+                record.market_id == market_id
+                    && record.buyer_id == user_id
+                    && record.state == EscrowState::PendingDelivery
+            })
+            .map(|record| record.qty)
+            .sum();
+        let projected = available
+            .saturating_add(held)
+            .saturating_add(open)
+            .saturating_add(escrowed);
         // A sell moves an already-owned pass into an order; it does not add a new
         // pass to the identity's exposure. Only buys consume new holding capacity.
         let projected = match side {
@@ -830,6 +900,136 @@ impl Core {
         Ok(journal_id)
     }
 
+    /// Register the seller key used to verify delivery receipts. A key rotation
+    /// only affects future fills; each escrow record keeps the key captured at fill.
+    pub fn register_public_key(
+        &mut self,
+        user_id: UserId,
+        public_key: [u8; 32],
+    ) -> Result<(), ReasonCode> {
+        if public_key == [0u8; 32] || VerifyingKey::from_bytes(&public_key).is_err() {
+            return Err(ReasonCode::InvalidReceipt);
+        }
+        if self.public_keys.get(&user_id) == Some(&public_key) {
+            return Ok(());
+        }
+        self.public_keys.insert(user_id, public_key);
+        self.bump_state_version();
+        Ok(())
+    }
+
+    pub fn public_key(&self, user_id: UserId) -> Option<[u8; 32]> {
+        self.public_keys.get(&user_id).copied()
+    }
+
+    pub fn escrow_record(&self, trade_id: TradeId) -> Option<&EscrowRecord> {
+        self.escrow.get(&trade_id)
+    }
+
+    /// Escrow records where `user_id` is the buyer or seller, oldest first.
+    pub fn escrow_records(&self, user_id: UserId) -> Vec<EscrowRecord> {
+        let mut records: Vec<_> = self
+            .escrow
+            .values()
+            .filter(|record| record.buyer_id == user_id || record.seller_id == user_id)
+            .cloned()
+            .collect();
+        records.sort_by_key(|record| record.trade_id);
+        records
+    }
+
+    /// Release escrow after verifying the seller's signed delivery receipt.
+    pub fn release_escrow(
+        &mut self,
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        delivered_at_ms: u64,
+        signature: &[u8],
+        now_ms: u64,
+    ) -> Result<EscrowRecord, ReasonCode> {
+        let mut record = self
+            .escrow
+            .get(&trade_id)
+            .cloned()
+            .ok_or(ReasonCode::OrderNotFound)?;
+        if record.seller_id != actor_user_id {
+            return Err(ReasonCode::NotOrderOwner);
+        }
+        if record.state != EscrowState::PendingDelivery {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        if delivered_at_ms < record.created_at_ms
+            || delivered_at_ms > record.deadline_ms
+            || now_ms > record.deadline_ms
+        {
+            return Err(ReasonCode::ReceiptExpired);
+        }
+
+        let receipt = DeliveryReceipt {
+            trade_id: record.trade_id,
+            market_id: record.market_id,
+            qty: record.qty,
+            buyer_id: record.buyer_id,
+            seller_id: record.seller_id,
+            delivered_at_ms,
+        };
+        let verifying_key = VerifyingKey::from_bytes(&record.seller_public_key)
+            .map_err(|_| ReasonCode::InvalidReceipt)?;
+        let signature = Signature::from_slice(signature).map_err(|_| ReasonCode::InvalidReceipt)?;
+        verifying_key
+            .verify_strict(&receipt.canonical_bytes(), &signature)
+            .map_err(|_| ReasonCode::InvalidReceipt)?;
+
+        if self
+            .ledger
+            .release_escrow(escrow_settlement(&record))
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(ReasonCode::InternalError);
+        }
+        record.state = EscrowState::Delivered;
+        record.delivered_at_ms = Some(delivered_at_ms);
+        self.escrow.insert(trade_id, record.clone());
+        self.bump_state_version();
+        Ok(record)
+    }
+
+    /// Refund an escrow after its deadline. Either the buyer or seller may trigger it.
+    pub fn refund_escrow(
+        &mut self,
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        now_ms: u64,
+    ) -> Result<EscrowRecord, ReasonCode> {
+        let mut record = self
+            .escrow
+            .get(&trade_id)
+            .cloned()
+            .ok_or(ReasonCode::OrderNotFound)?;
+        if actor_user_id != record.buyer_id && actor_user_id != record.seller_id {
+            return Err(ReasonCode::NotOrderOwner);
+        }
+        if record.state != EscrowState::PendingDelivery {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        if now_ms < record.deadline_ms {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        if self
+            .ledger
+            .refund_escrow(escrow_settlement(&record))
+            .is_err()
+        {
+            self.poisoned = true;
+            return Err(ReasonCode::InternalError);
+        }
+        record.state = EscrowState::Refunded;
+        self.escrow.insert(trade_id, record.clone());
+        self.bump_state_version();
+        Ok(record)
+    }
+
     pub fn balance(&self, user_id: UserId, asset: Asset) -> Balance {
         self.ledger.balance(user_id, asset)
     }
@@ -891,6 +1091,12 @@ impl Core {
         self.state_version
     }
 
+    /// Set the gateway timestamp used for new escrow deadlines. The WAL stores the
+    /// same value with each command, so replay produces the same deadlines.
+    pub fn set_current_time_ms(&mut self, now_ms: u64) {
+        self.current_time_ms = now_ms;
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -918,6 +1124,41 @@ impl Core {
             hasher.update(user_id.to_le_bytes());
             hasher.update(market_id.to_le_bytes());
             hasher.update(qty.to_le_bytes());
+        }
+
+        let mut escrow: Vec<_> = self.escrow.values().collect();
+        escrow.sort_by_key(|record| record.trade_id);
+        for record in escrow {
+            hasher.update(record.trade_id.to_le_bytes());
+            hasher.update(record.market_id.to_le_bytes());
+            hasher.update(record.buyer_id.to_le_bytes());
+            hasher.update(record.seller_id.to_le_bytes());
+            hasher.update(record.qty.to_le_bytes());
+            hasher.update(record.notional.to_le_bytes());
+            hasher.update(record.fee.to_le_bytes());
+            hasher.update(record.fee_payer.to_le_bytes());
+            hasher.update([match record.state {
+                EscrowState::PendingDelivery => 0,
+                EscrowState::Delivered => 1,
+                EscrowState::Refunded => 2,
+            }]);
+            hasher.update(record.created_at_ms.to_le_bytes());
+            hasher.update(record.deadline_ms.to_le_bytes());
+            match record.delivered_at_ms {
+                Some(ts) => {
+                    hasher.update([1]);
+                    hasher.update(ts.to_le_bytes());
+                }
+                None => hasher.update([0]),
+            }
+            hasher.update(record.seller_public_key);
+        }
+
+        let mut public_keys: Vec<_> = self.public_keys.iter().collect();
+        public_keys.sort_by_key(|(user_id, _)| **user_id);
+        for (user_id, key) in public_keys {
+            hasher.update(user_id.to_le_bytes());
+            hasher.update(key);
         }
         hasher.update(self.next_seq.to_le_bytes());
         hasher.update(self.state_version.to_le_bytes());
@@ -1028,7 +1269,73 @@ impl Core {
             }
         }
 
+        let mut expected_escrow_cash: Minor = 0;
+        let mut expected_escrow_pass: HashMap<MarketId, i64> = HashMap::new();
+        for record in self
+            .escrow
+            .values()
+            .filter(|record| record.state == EscrowState::PendingDelivery)
+        {
+            let buyer_fee = if record.fee_payer == record.buyer_id {
+                record.fee
+            } else {
+                0
+            };
+            expected_escrow_cash = expected_escrow_cash
+                .checked_add(record.notional)
+                .and_then(|value| value.checked_add(buyer_fee))
+                .ok_or_else(|| "expected escrow cash overflow".to_string())?;
+            let qty = i64::try_from(record.qty)
+                .map_err(|_| "escrow pass quantity overflow".to_string())?;
+            let entry = expected_escrow_pass.entry(record.market_id).or_default();
+            *entry = entry
+                .checked_add(qty)
+                .ok_or_else(|| "expected escrow pass overflow".to_string())?;
+        }
+        let escrow_cash = self.ledger.system_balance(Owner::Escrow, Asset::Cash);
+        if escrow_cash != expected_escrow_cash {
+            return Err(format!(
+                "escrow cash mismatch: ledger {escrow_cash} expected {expected_escrow_cash}"
+            ));
+        }
+        for (key, account) in self.ledger.accounts() {
+            if key.owner != Owner::Escrow {
+                continue;
+            }
+            let Asset::Pass { market_id } = key.asset else {
+                // Cash is checked above.
+                continue;
+            };
+            let actual = account.available.saturating_add(account.held);
+            let expected = expected_escrow_pass.remove(&market_id).unwrap_or(0);
+            if actual != expected {
+                return Err(format!(
+                    "escrow pass mismatch for market {market_id}: ledger {actual} expected {expected}"
+                ));
+            }
+        }
+        for (market_id, expected) in expected_escrow_pass {
+            if expected != 0 {
+                return Err(format!(
+                    "escrow pass mismatch for market {market_id}: ledger 0 expected {expected}"
+                ));
+            }
+        }
+
         Ok(())
+    }
+}
+
+fn escrow_settlement(record: &EscrowRecord) -> TradeSettlement {
+    TradeSettlement {
+        trade_id: record.trade_id,
+        market_id: record.market_id,
+        buyer_id: record.buyer_id,
+        seller_id: record.seller_id,
+        qty: record.qty,
+        notional: record.notional,
+        fee: record.fee,
+        fee_payer: record.fee_payer,
     }
 }
 

@@ -155,6 +155,12 @@ export function WalletView({ wallet, onTopup, onRefresh }) {
                         <strong>{formatQty(p.locked)}</strong>
                       </div>
                     )}
+                    {p.held > 0 && (
+                      <div className="number-block locked">
+                        <span className="label">In Escrow</span>
+                        <strong>{formatQty(p.held)}</strong>
+                      </div>
+                    )}
                   </div>
                 </div>
               ))}

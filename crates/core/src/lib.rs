@@ -2,4 +2,4 @@
 
 mod core;
 
-pub use core::{CommandOutcome, Core};
+pub use core::{CommandOutcome, Core, ESCROW_TIMEOUT_MS};

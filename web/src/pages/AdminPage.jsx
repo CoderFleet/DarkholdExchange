@@ -47,6 +47,7 @@ function TierForm({ eventId }) {
   const busy = useAdminStore((state) => state.busy)
   const [name, setName] = useState('')
   const [face, setFace] = useState('')
+  const [escrowEnabled, setEscrowEnabled] = useState(false)
   // The server's answer is stored together with the amount it was asked about, so an old answer
   // is never shown next to a newer amount.
   const [preview, setPreview] = useState(null)
@@ -76,9 +77,10 @@ function TierForm({ eventId }) {
   const handleSubmit = async (event) => {
     event.preventDefault()
     if (faceMinor === null) return
-    if (await addTier(eventId, name.trim(), faceMinor)) {
+    if (await addTier(eventId, name.trim(), faceMinor, escrowEnabled)) {
       setName('')
       setFace('')
+      setEscrowEnabled(false)
     }
   }
 
@@ -91,6 +93,14 @@ function TierForm({ eventId }) {
       <label className="field">
         <span>Face value (₹)</span>
         <input value={face} onChange={(e) => setFace(e.target.value)} inputMode="decimal" required />
+      </label>
+      <label className="field admin-checkbox">
+        <input
+          type="checkbox"
+          checked={escrowEnabled}
+          onChange={(e) => setEscrowEnabled(e.target.checked)}
+        />
+        <span>Hold fills in escrow until the seller signs delivery</span>
       </label>
       <p className="admin-collar" aria-live="polite">
         {faceMinor === null && face !== '' && 'Enter an amount like 5000 or 5000.50.'}
@@ -115,6 +125,7 @@ function TierRow({ tier }) {
       <td className="mono">{formatMoney(tier.face_value_minor)}</td>
       <td className="mono">{rangeText(tier)}</td>
       <td className="mono">{tier.holding_limit}</td>
+      <td>{tier.escrow_enabled ? 'On' : 'Off'}</td>
       <td>
         <span className={`admin-badge ${tier.status}`}>{STATUS_TEXT[tier.status] ?? tier.status}</span>
       </td>
@@ -146,6 +157,7 @@ function EventCard({ event }) {
               <th>Face value</th>
               <th>Price range</th>
               <th>Holding limit</th>
+              <th>Escrow</th>
               <th>Status</th>
               <th />
             </tr>

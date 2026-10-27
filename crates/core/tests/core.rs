@@ -1,11 +1,15 @@
 use dx_core::{CommandOutcome, Core};
 use dx_types::{
-    Asset, Balance, BookDelta, BookLevel, BookSnapshot, Cancel, Command, LevelChange, OrderStatus,
-    PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, seed_markets,
+    Asset, Balance, BookDelta, BookLevel, BookSnapshot, Cancel, Command, DeliveryReceipt,
+    EscrowState, LevelChange, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks,
+    seed_markets,
 };
+use ed25519_dalek::{Signer, SigningKey};
 
 const MARKET: u32 = 1;
 const PRICE: Ticks = 5_000;
+const ESCROW_MARKET: u32 = 3;
+const ESCROW_PRICE: Ticks = 4_000;
 
 fn core() -> Core {
     Core::new(seed_markets()).unwrap()
@@ -72,6 +76,32 @@ fn limit(client_order_id: u64, side: Side, price_ticks: Ticks, qty: Qty) -> Comm
         price_ticks,
         qty,
     })
+}
+
+fn escrow_limit(client_order_id: u64, side: Side, price_ticks: Ticks, qty: Qty) -> Command {
+    Command::PlaceLimit(PlaceLimit {
+        client_order_id,
+        market_id: ESCROW_MARKET,
+        side,
+        price_ticks,
+        qty,
+    })
+}
+
+fn signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[7u8; 32])
+}
+
+fn receipt_for(core: &Core, trade_id: u64, delivered_at_ms: u64) -> DeliveryReceipt {
+    let record = core.escrow_record(trade_id).expect("escrow record");
+    DeliveryReceipt {
+        trade_id: record.trade_id,
+        market_id: record.market_id,
+        qty: record.qty,
+        buyer_id: record.buyer_id,
+        seller_id: record.seller_id,
+        delivered_at_ms,
+    }
 }
 
 fn market_order(client_order_id: u64, side: Side, qty: Qty, protect: Ticks) -> Command {
@@ -680,4 +710,195 @@ fn replay_produces_identical_responses_and_deltas() {
     assert_eq!(a.state_hash(), b.state_hash());
     a.check_invariants().unwrap();
     b.check_invariants().unwrap();
+}
+
+#[test]
+fn escrow_sell_requires_a_registered_seller_key() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 2, 1).unwrap();
+
+    let rejected = core.process(2, escrow_limit(1, Side::Sell, ESCROW_PRICE, 2));
+    assert_rejected(&rejected, ReasonCode::EscrowNotReady);
+
+    core.register_public_key(2, signing_key().verifying_key().to_bytes())
+        .unwrap();
+    let rested = core.process(2, escrow_limit(2, Side::Sell, ESCROW_PRICE, 2));
+    assert_eq!(rested.status, OrderStatus::Rested);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn escrow_fill_holds_cash_and_passes_until_receipt() {
+    let mut core = core();
+    let key = signing_key();
+    core.register_public_key(2, key.verifying_key().to_bytes())
+        .unwrap();
+    core.set_current_time_ms(10_000);
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 2, 1).unwrap();
+
+    let sell = core.process(2, escrow_limit(1, Side::Sell, ESCROW_PRICE, 2));
+    assert_eq!(sell.status, OrderStatus::Rested);
+    let buy = core.process(1, escrow_limit(1, Side::Buy, ESCROW_PRICE, 2));
+    assert_eq!(buy.status, OrderStatus::Filled);
+    let trade_id = buy.fills[0].trade_id;
+
+    // 400,000 notional + 6,000 taker fee is in escrow, not paid to the seller.
+    assert_eq!(core.balance(1, Asset::Cash), cash(1_594_000, 0));
+    assert_eq!(core.balance(2, Asset::Cash), cash(0, 0));
+    assert_eq!(
+        core.balance(
+            1,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 0, 0)
+    );
+    assert_eq!(
+        core.balance(
+            2,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 0, 0)
+    );
+    let record = core.escrow_record(trade_id).unwrap();
+    assert_eq!(record.state, EscrowState::PendingDelivery);
+    assert_eq!(record.deadline_ms, 10_000 + dx_core::ESCROW_TIMEOUT_MS);
+    core.check_invariants().unwrap();
+
+    let receipt = receipt_for(&core, trade_id, 20_000);
+    let signature = key.sign(&receipt.canonical_bytes()).to_bytes();
+    let released = core
+        .release_escrow(2, trade_id, 20_000, &signature, 21_000)
+        .unwrap();
+    assert_eq!(released.state, EscrowState::Delivered);
+    assert_eq!(
+        core.balance(
+            1,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 2, 0)
+    );
+    assert_eq!(core.balance(2, Asset::Cash), cash(400_000, 0));
+    assert_eq!(core.balance(1, Asset::Cash), cash(1_594_000, 0));
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn escrow_release_rejects_wrong_signature_and_expired_receipt() {
+    let mut core = core();
+    let key = signing_key();
+    core.register_public_key(2, key.verifying_key().to_bytes())
+        .unwrap();
+    core.set_current_time_ms(1_000);
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 2, 1).unwrap();
+    core.process(2, escrow_limit(1, Side::Sell, ESCROW_PRICE, 2));
+    let buy = core.process(1, escrow_limit(1, Side::Buy, ESCROW_PRICE, 2));
+    let trade_id = buy.fills[0].trade_id;
+    let receipt = receipt_for(&core, trade_id, 2_000);
+
+    let wrong_key = SigningKey::from_bytes(&[9u8; 32]);
+    let wrong_signature = wrong_key.sign(&receipt.canonical_bytes()).to_bytes();
+    assert_eq!(
+        core.release_escrow(2, trade_id, 2_000, &wrong_signature, 3_000),
+        Err(ReasonCode::InvalidReceipt)
+    );
+
+    let signature = key.sign(&receipt.canonical_bytes()).to_bytes();
+    assert_eq!(
+        core.release_escrow(
+            2,
+            trade_id,
+            1_000 + dx_core::ESCROW_TIMEOUT_MS + 1,
+            &signature,
+            1_000 + dx_core::ESCROW_TIMEOUT_MS + 2,
+        ),
+        Err(ReasonCode::ReceiptExpired)
+    );
+    assert_eq!(
+        core.escrow_record(trade_id).unwrap().state,
+        EscrowState::PendingDelivery
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn escrow_refund_waits_for_deadline_and_returns_both_sides() {
+    let mut core = core();
+    let key = signing_key();
+    core.register_public_key(2, key.verifying_key().to_bytes())
+        .unwrap();
+    core.set_current_time_ms(1_000);
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 2, 1).unwrap();
+    core.process(2, escrow_limit(1, Side::Sell, ESCROW_PRICE, 2));
+    let buy = core.process(1, escrow_limit(1, Side::Buy, ESCROW_PRICE, 2));
+    let trade_id = buy.fills[0].trade_id;
+
+    assert_eq!(
+        core.refund_escrow(1, trade_id, 2_000),
+        Err(ReasonCode::EscrowNotReady)
+    );
+    let refunded = core
+        .refund_escrow(1, trade_id, 1_000 + dx_core::ESCROW_TIMEOUT_MS)
+        .unwrap();
+    assert_eq!(refunded.state, EscrowState::Refunded);
+    assert_eq!(core.balance(1, Asset::Cash), cash(2_000_000, 0));
+    assert_eq!(
+        core.balance(
+            1,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 0, 0)
+    );
+    assert_eq!(
+        core.balance(
+            2,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 2, 0)
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn pending_escrow_passes_count_toward_the_buyer_holding_limit() {
+    let mut core = core();
+    let key = signing_key();
+    core.register_public_key(2, key.verifying_key().to_bytes())
+        .unwrap();
+    core.set_current_time_ms(10_000);
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 6, 1).unwrap();
+
+    core.process(2, escrow_limit(1, Side::Sell, ESCROW_PRICE, 2));
+    let first = core.process(1, escrow_limit(1, Side::Buy, ESCROW_PRICE, 2));
+    assert_eq!(first.status, OrderStatus::Filled);
+    assert_eq!(first.fills[0].qty, 2);
+
+    core.process(2, escrow_limit(2, Side::Sell, ESCROW_PRICE, 4));
+    let over_limit = core.process(1, escrow_limit(2, Side::Buy, ESCROW_PRICE, 4));
+    assert_rejected(&over_limit, ReasonCode::HoldingLimitExceeded);
+
+    let fills_limit = core.process(1, escrow_limit(3, Side::Buy, ESCROW_PRICE, 3));
+    assert_eq!(fills_limit.status, OrderStatus::Filled);
+    let pending: Qty = core
+        .escrow_records(1)
+        .iter()
+        .filter(|record| record.state == EscrowState::PendingDelivery)
+        .map(|record| record.qty)
+        .sum();
+    assert_eq!(pending, 5);
+    core.check_invariants().unwrap();
 }

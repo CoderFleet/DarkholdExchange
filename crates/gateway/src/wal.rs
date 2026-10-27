@@ -9,7 +9,7 @@ use std::path::Path;
 
 use dkx_wal::{LogRecord, Wal};
 use dx_core::Core;
-use dx_types::{ClientOrderId, Command, Fill, MarketConfig, MarketId, Minor, Qty, UserId};
+use dx_types::{ClientOrderId, Command, Fill, MarketConfig, MarketId, Minor, Qty, TradeId, UserId};
 use serde::{Deserialize, Serialize};
 
 const KIND_OP: u8 = 1;
@@ -25,6 +25,10 @@ pub(crate) enum WalOp {
     Command {
         user_id: UserId,
         command: Command,
+        // Wall-clock time captured when the command was submitted. Defaults to
+        // zero for WAL files written before escrow existed.
+        #[serde(default)]
+        now_ms: u64,
     },
     Deposit {
         user_id: UserId,
@@ -39,6 +43,22 @@ pub(crate) enum WalOp {
     },
     AddMarket {
         config: MarketConfig,
+    },
+    RegisterPublicKey {
+        user_id: UserId,
+        public_key: [u8; 32],
+    },
+    ReleaseEscrow {
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        delivered_at_ms: u64,
+        signature: Vec<u8>,
+        now_ms: u64,
+    },
+    RefundEscrow {
+        actor_user_id: UserId,
+        trade_id: TradeId,
+        now_ms: u64,
     },
 }
 
@@ -146,7 +166,12 @@ pub(crate) fn replay(records: &[LogRecord], core: &mut Core) -> Result<Vec<Fill>
 
 fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Result<(), String> {
     match op {
-        WalOp::Command { user_id, command } => {
+        WalOp::Command {
+            user_id,
+            command,
+            now_ms,
+        } => {
+            core.set_current_time_ms(*now_ms);
             let outcome = core.process_with_deltas(*user_id, command.clone());
             recent_trades.extend(outcome.fills().iter().cloned());
         }
@@ -170,6 +195,37 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
         WalOp::AddMarket { config } => {
             core.add_market(config.clone())?;
         }
+        WalOp::RegisterPublicKey {
+            user_id,
+            public_key,
+        } => {
+            core.register_public_key(*user_id, *public_key)
+                .map_err(|reason| format!("WAL public-key replay rejected: {reason:?}"))?;
+        }
+        WalOp::ReleaseEscrow {
+            actor_user_id,
+            trade_id,
+            delivered_at_ms,
+            signature,
+            now_ms,
+        } => {
+            core.release_escrow(
+                *actor_user_id,
+                *trade_id,
+                *delivered_at_ms,
+                signature,
+                *now_ms,
+            )
+            .map_err(|reason| format!("WAL escrow release replay rejected: {reason:?}"))?;
+        }
+        WalOp::RefundEscrow {
+            actor_user_id,
+            trade_id,
+            now_ms,
+        } => {
+            core.refund_escrow(*actor_user_id, *trade_id, *now_ms)
+                .map_err(|reason| format!("WAL escrow refund replay rejected: {reason:?}"))?;
+        }
     }
     Ok(())
 }
@@ -177,7 +233,10 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dx_types::{Command, PlaceLimit, PlaceMarket, Side, seed_markets};
+    use dx_types::{
+        Command, DeliveryReceipt, EscrowState, PlaceLimit, PlaceMarket, Side, seed_markets,
+    };
+    use ed25519_dalek::{Signer, SigningKey};
     use tempfile::tempdir;
 
     fn apply_and_log(core: &mut Core, wal: &mut WalSession, op: WalOp) {
@@ -230,6 +289,7 @@ mod tests {
                     price_ticks: 5_000,
                     qty: 2,
                 }),
+                now_ms: 0,
             },
         );
         apply_and_log(
@@ -244,6 +304,7 @@ mod tests {
                     qty: 2,
                     protect_price_ticks: 5_000,
                 }),
+                now_ms: 0,
             },
         );
 
@@ -343,5 +404,118 @@ mod tests {
 
         replay(&[record], &mut core).unwrap();
         assert_eq!(core.balance(1, dx_types::Asset::Cash).available, 1_000_000);
+    }
+    #[test]
+    fn replay_rebuilds_an_escrow_release() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut wal =
+            WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let mut core = Core::new(seed_markets()).unwrap();
+        let key = SigningKey::from_bytes(&[7u8; 32]);
+        let public_key = key.verifying_key().to_bytes();
+
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::RegisterPublicKey {
+                user_id: 2,
+                public_key,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Deposit {
+                user_id: 1,
+                amount: 2_000_000,
+                client_request_id: 1,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Issue {
+                user_id: 2,
+                market_id: 3,
+                qty: 2,
+                client_request_id: 1,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Command {
+                user_id: 2,
+                command: Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: 3,
+                    side: Side::Sell,
+                    price_ticks: 4_000,
+                    qty: 2,
+                }),
+                now_ms: 1_000,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Command {
+                user_id: 1,
+                command: Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 2,
+                    market_id: 3,
+                    side: Side::Buy,
+                    price_ticks: 4_000,
+                    qty: 2,
+                }),
+                now_ms: 1_000,
+            },
+        );
+
+        let record = core.escrow_records(1)[0].clone();
+        let receipt = DeliveryReceipt {
+            trade_id: record.trade_id,
+            market_id: record.market_id,
+            qty: record.qty,
+            buyer_id: record.buyer_id,
+            seller_id: record.seller_id,
+            delivered_at_ms: 2_000,
+        };
+        let signature = key.sign(&receipt.canonical_bytes()).to_bytes().to_vec();
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::ReleaseEscrow {
+                actor_user_id: 2,
+                trade_id: record.trade_id,
+                delivered_at_ms: 2_000,
+                signature,
+                now_ms: 2_000,
+            },
+        );
+
+        let expected_hash = core.state_hash();
+        drop(wal);
+
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut restored = Core::new(seed_markets()).unwrap();
+        replay(&recovered.replayed_records, &mut restored).unwrap();
+
+        assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(
+            restored.escrow_record(record.trade_id).unwrap().state,
+            EscrowState::Delivered
+        );
+        assert_eq!(
+            restored.balance(2, dx_types::Asset::Cash).available,
+            400_000
+        );
+        assert_eq!(
+            restored
+                .balance(1, dx_types::Asset::Pass { market_id: 3 })
+                .available,
+            2
+        );
     }
 }

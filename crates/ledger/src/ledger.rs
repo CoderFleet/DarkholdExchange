@@ -247,33 +247,7 @@ impl Ledger {
     /// Settle one fill atomically. The buyer's cash and seller's passes must already
     /// be reserved; this entry moves them to the counterparties and pays the fee.
     pub fn settle_trade(&mut self, settlement: TradeSettlement) -> Result<u64, LedgerError> {
-        if settlement.buyer_id == settlement.seller_id {
-            return Err(LedgerError::SelfTrade);
-        }
-        if settlement.qty == 0 || settlement.notional <= 0 || settlement.fee < 0 {
-            return Err(LedgerError::NonPositiveAmount);
-        }
-
-        let (buyer_fee, seller_fee) = if settlement.fee_payer == settlement.buyer_id {
-            (settlement.fee, 0)
-        } else if settlement.fee_payer == settlement.seller_id {
-            (0, settlement.fee)
-        } else {
-            return Err(LedgerError::FeePayerNotParty);
-        };
-
-        let buyer_cash = settlement
-            .notional
-            .checked_add(buyer_fee)
-            .ok_or(LedgerError::Overflow)?;
-        let seller_cash = settlement
-            .notional
-            .checked_sub(seller_fee)
-            .ok_or(LedgerError::FeeExceedsNotional)?;
-        if seller_cash < 0 {
-            return Err(LedgerError::FeeExceedsNotional);
-        }
-        let qty = i64::try_from(settlement.qty).map_err(|_| LedgerError::Overflow)?;
+        let (buyer_cash, seller_cash, qty) = Self::trade_amounts(&settlement)?;
 
         let cash = Asset::Cash;
         let pass = Asset::Pass {
@@ -311,6 +285,142 @@ impl Ledger {
         self.post(JournalKey::Trade(settlement.trade_id), postings)
     }
 
+    /// Move a fill's cash and passes into the shared escrow accounts. The buyer's cash
+    /// and seller's passes must already be reserved. No fee is paid until release.
+    pub fn hold_escrow(&mut self, settlement: TradeSettlement) -> Result<u64, LedgerError> {
+        let (buyer_cash, _seller_cash, qty) = Self::trade_amounts(&settlement)?;
+        let cash = Asset::Cash;
+        let pass = Asset::Pass {
+            market_id: settlement.market_id,
+        };
+        let postings = vec![
+            Posting::new(
+                AccountKey::user(settlement.buyer_id, cash),
+                Bucket::Held,
+                -buyer_cash,
+            ),
+            Posting::new(
+                AccountKey::system(Owner::Escrow, cash),
+                Bucket::Available,
+                buyer_cash,
+            ),
+            Posting::new(
+                AccountKey::user(settlement.seller_id, pass),
+                Bucket::Held,
+                -qty,
+            ),
+            Posting::new(
+                AccountKey::system(Owner::Escrow, pass),
+                Bucket::Available,
+                qty,
+            ),
+        ];
+        self.post(JournalKey::Trade(settlement.trade_id), postings)
+    }
+
+    /// Release an escrow hold after a valid delivery receipt: pay the seller, transfer
+    /// the pass to the buyer, and pay the platform fee.
+    pub fn release_escrow(&mut self, settlement: TradeSettlement) -> Result<u64, LedgerError> {
+        let (buyer_cash, seller_cash, qty) = Self::trade_amounts(&settlement)?;
+        let cash = Asset::Cash;
+        let pass = Asset::Pass {
+            market_id: settlement.market_id,
+        };
+        let mut postings = Vec::with_capacity(5);
+        postings.push(Posting::new(
+            AccountKey::system(Owner::Escrow, cash),
+            Bucket::Available,
+            -buyer_cash,
+        ));
+        postings.push(Posting::new(
+            AccountKey::user(settlement.seller_id, cash),
+            Bucket::Available,
+            seller_cash,
+        ));
+        if settlement.fee > 0 {
+            postings.push(Posting::new(
+                AccountKey::system(Owner::Fees, cash),
+                Bucket::Available,
+                settlement.fee,
+            ));
+        }
+        postings.push(Posting::new(
+            AccountKey::system(Owner::Escrow, pass),
+            Bucket::Available,
+            -qty,
+        ));
+        postings.push(Posting::new(
+            AccountKey::user(settlement.buyer_id, pass),
+            Bucket::Available,
+            qty,
+        ));
+        self.post(JournalKey::EscrowRelease(settlement.trade_id), postings)
+    }
+
+    /// Refund an escrow hold after its deadline. The buyer gets the cash back and
+    /// the seller gets the passes back.
+    pub fn refund_escrow(&mut self, settlement: TradeSettlement) -> Result<u64, LedgerError> {
+        let (buyer_cash, _seller_cash, qty) = Self::trade_amounts(&settlement)?;
+        let cash = Asset::Cash;
+        let pass = Asset::Pass {
+            market_id: settlement.market_id,
+        };
+        let postings = vec![
+            Posting::new(
+                AccountKey::system(Owner::Escrow, cash),
+                Bucket::Available,
+                -buyer_cash,
+            ),
+            Posting::new(
+                AccountKey::user(settlement.buyer_id, cash),
+                Bucket::Available,
+                buyer_cash,
+            ),
+            Posting::new(
+                AccountKey::system(Owner::Escrow, pass),
+                Bucket::Available,
+                -qty,
+            ),
+            Posting::new(
+                AccountKey::user(settlement.seller_id, pass),
+                Bucket::Available,
+                qty,
+            ),
+        ];
+        self.post(JournalKey::EscrowRefund(settlement.trade_id), postings)
+    }
+
+    fn trade_amounts(settlement: &TradeSettlement) -> Result<(Minor, Minor, i64), LedgerError> {
+        if settlement.buyer_id == settlement.seller_id {
+            return Err(LedgerError::SelfTrade);
+        }
+        if settlement.qty == 0 || settlement.notional <= 0 || settlement.fee < 0 {
+            return Err(LedgerError::NonPositiveAmount);
+        }
+
+        let (buyer_fee, seller_fee) = if settlement.fee_payer == settlement.buyer_id {
+            (settlement.fee, 0)
+        } else if settlement.fee_payer == settlement.seller_id {
+            (0, settlement.fee)
+        } else {
+            return Err(LedgerError::FeePayerNotParty);
+        };
+
+        let buyer_cash = settlement
+            .notional
+            .checked_add(buyer_fee)
+            .ok_or(LedgerError::Overflow)?;
+        let seller_cash = settlement
+            .notional
+            .checked_sub(seller_fee)
+            .ok_or(LedgerError::FeeExceedsNotional)?;
+        if seller_cash < 0 {
+            return Err(LedgerError::FeeExceedsNotional);
+        }
+        let qty = i64::try_from(settlement.qty).map_err(|_| LedgerError::Overflow)?;
+        Ok((buyer_cash, seller_cash, qty))
+    }
+
     pub fn balance(&self, user_id: UserId, asset: Asset) -> Balance {
         let account = self
             .accounts
@@ -322,6 +432,15 @@ impl Ledger {
             available: account.available,
             held: account.held,
         }
+    }
+
+    pub fn system_balance(&self, owner: Owner, asset: Asset) -> Minor {
+        let account = self
+            .accounts
+            .get(&AccountKey::system(owner, asset))
+            .copied()
+            .unwrap_or_default();
+        account.available.saturating_add(account.held)
     }
 
     pub fn balances(&self, user_id: UserId) -> Vec<Balance> {

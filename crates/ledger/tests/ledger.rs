@@ -119,6 +119,102 @@ fn settle_trade_moves_cash_and_passes_and_pays_buyer_fee() {
 }
 
 #[test]
+fn escrow_holds_then_releases_cash_and_passes() {
+    let mut ledger = Ledger::new();
+    ledger.deposit_cash(1, 10_000, 1).unwrap();
+    ledger.issue_passes(2, 1, 2, 1).unwrap();
+    ledger.reserve(1, Asset::Cash, 5_050).unwrap();
+    ledger.reserve(2, Asset::Pass { market_id: 1 }, 2).unwrap();
+
+    let settlement = TradeSettlement {
+        trade_id: 10,
+        market_id: 1,
+        buyer_id: 1,
+        seller_id: 2,
+        qty: 2,
+        notional: 5_000,
+        fee: 50,
+        fee_payer: 1,
+    };
+    ledger.hold_escrow(settlement).unwrap();
+
+    assert_eq!(ledger.balance(1, Asset::Cash), cash(4_950, 0));
+    assert_eq!(ledger.balance(2, Asset::Cash), cash(0, 0));
+    assert_eq!(
+        ledger.balance(1, Asset::Pass { market_id: 1 }),
+        pass(1, 0, 0)
+    );
+    assert_eq!(
+        ledger.balance(2, Asset::Pass { market_id: 1 }),
+        pass(1, 0, 0)
+    );
+    assert_eq!(ledger.system_balance(Owner::Escrow, Asset::Cash), 5_050);
+    assert_eq!(
+        ledger.system_balance(Owner::Escrow, Asset::Pass { market_id: 1 }),
+        2
+    );
+    ledger.check_invariants().unwrap();
+
+    ledger.release_escrow(settlement).unwrap();
+
+    assert_eq!(ledger.balance(1, Asset::Cash), cash(4_950, 0));
+    assert_eq!(ledger.balance(2, Asset::Cash), cash(5_000, 0));
+    assert_eq!(
+        ledger.balance(1, Asset::Pass { market_id: 1 }),
+        pass(1, 2, 0)
+    );
+    assert_eq!(
+        ledger.balance(2, Asset::Pass { market_id: 1 }),
+        pass(1, 0, 0)
+    );
+    assert_eq!(ledger.system_balance(Owner::Escrow, Asset::Cash), 0);
+    assert_eq!(
+        ledger.system_balance(Owner::Fees, Asset::Cash),
+        50,
+        "the fee is paid only on delivery"
+    );
+    ledger.check_invariants().unwrap();
+}
+
+#[test]
+fn escrow_refund_returns_both_sides() {
+    let mut ledger = Ledger::new();
+    ledger.deposit_cash(1, 10_000, 1).unwrap();
+    ledger.issue_passes(2, 1, 2, 1).unwrap();
+    ledger.reserve(1, Asset::Cash, 5_050).unwrap();
+    ledger.reserve(2, Asset::Pass { market_id: 1 }, 2).unwrap();
+
+    let settlement = TradeSettlement {
+        trade_id: 11,
+        market_id: 1,
+        buyer_id: 1,
+        seller_id: 2,
+        qty: 2,
+        notional: 5_000,
+        fee: 50,
+        fee_payer: 1,
+    };
+    ledger.hold_escrow(settlement).unwrap();
+    ledger.refund_escrow(settlement).unwrap();
+
+    assert_eq!(ledger.balance(1, Asset::Cash), cash(10_000, 0));
+    assert_eq!(
+        ledger.balance(1, Asset::Pass { market_id: 1 }),
+        pass(1, 0, 0)
+    );
+    assert_eq!(
+        ledger.balance(2, Asset::Pass { market_id: 1 }),
+        pass(1, 2, 0)
+    );
+    assert_eq!(ledger.system_balance(Owner::Escrow, Asset::Cash), 0);
+    assert_eq!(
+        ledger.system_balance(Owner::Escrow, Asset::Pass { market_id: 1 }),
+        0
+    );
+    ledger.check_invariants().unwrap();
+}
+
+#[test]
 fn settle_trade_can_charge_the_seller() {
     let mut ledger = Ledger::new();
     ledger.deposit_cash(1, 10_000, 1).unwrap();
