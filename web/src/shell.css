@@ -343,6 +343,32 @@
   color: var(--green);
 }
 
+/* A dropdown inside an admin form looks like the text boxes beside it */
+.admin-fields .field select {
+  width: 100%;
+  min-height: 42px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  outline: none;
+  background: #090a10;
+  color: var(--text-strong);
+  font-family: var(--mono);
+  font-size: 14px;
+}
+
+.admin-fields .field select:focus {
+  border-color: rgba(179, 136, 255, 0.65);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.09);
+}
+
+/* A confirmation, next to the red .banner used for errors */
+.banner.success {
+  border-color: rgba(67, 217, 139, 0.4);
+  background: rgba(67, 217, 139, 0.08);
+  color: var(--green);
+}
+
 /* Show/hide button inside the password box */
 .password-field {
   position: relative;

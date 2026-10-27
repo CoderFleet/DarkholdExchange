@@ -47,7 +47,7 @@
 | 3 | Per-identity holding limits | ✅ | Core tracks open buys, held passes, and pending escrow passes for the buyer. | — |
 | 4 | Double-entry ledger, reservations before matching | ✅ | `crates/ledger`, atomic settlement, conservation and negative-balance tests. | — |
 | 5 | Idempotency keys and replay-safe retries | ✅ | Core idempotency cache + tests. | — |
-| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT and admin/issuer roles. Users are in memory. | Check WS handshake auth; decide whether durable users are in scope. |
+| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT and admin/issuer roles. Accounts are saved in PostgreSQL when `DATABASE_URL` is set (`docs/AUTH.md` section 5). | Check WS handshake auth. |
 | 7 | WebSocket auth | ❌ | WS accepts `?user_id=` and does not verify a JWT. | Authenticate the upgrade request; reject spoofed identities. |
 | 8 | L2 snapshot + sequenced diffs + gap resync | ✅ | Gateway publisher, worker rebuild, market terminal. | — |
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
@@ -74,7 +74,7 @@
 | 30 | TypeScript frontend | 🚫 | JavaScript decision recorded in `docs/DECISIONS.md`. | Keep the decision documented; do not half-migrate. |
 | 31 | Comlink worker RPC | 🚫 | Package installed; worker uses raw `postMessage`. | Either adopt it or remove the unused dependency. |
 | 32 | Admin publishing reaches the engine | ✅ | Admin publish → writer `CreateMarket` → `Core::add_market` → engine book; tested at engine, core, writer, and gateway. Live check published market 100 and `/api/markets` returned it `Open` with book seq 0. | New markets appear via `/api/markets` on reload; no WS market-opened frame yet. |
-| 33 | Issuer console | ❌ | `web/src/pages/IssuerPage.jsx` says “Coming soon.” | Add role-checked pass issuance + supply view. |
+| 33 | Issuer console | ✅ | `IssuerPage` credits passes by username (a retry cannot double-credit) and shows how many passes users hold per market. It uses `POST /api/issuer/issue` and `GET /api/issuer/supply`, issuer role only (`docs/AUTH.md` section 6). | Seed script for demo accounts. |
 
 ## Work ownership
 
@@ -113,7 +113,6 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 - **Admin-published markets need a reload:** publishing creates the market and its book in the
   engine, but there is no WebSocket “market opened” frame yet. The market appears through
   `/api/markets` on the next load. Issuance is still required before trading.
-- **Issuer page is a placeholder.**
 - **Escrow timeout is 5 minutes and manual:** either party can trigger the refund after the deadline;
   there is no background timer service yet. Disputes/arbitration are out of scope for v1.
 - **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
@@ -135,7 +134,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **Issuer console (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add role-checked pass issuance and a supply view so new markets are tradable without dev endpoints.
+1. **Issuer seed script (T3 — Stuti):** create demo accounts and credit their passes through the issuer endpoint, so a real run needs no dev endpoints.
 2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
 3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
 4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
