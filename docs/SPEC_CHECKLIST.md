@@ -74,7 +74,7 @@
 | 30 | TypeScript frontend | 🚫 | JavaScript decision recorded in `docs/DECISIONS.md`. | Keep the decision documented; do not half-migrate. |
 | 31 | Comlink worker RPC | 🚫 | Package installed; worker uses raw `postMessage`. | Either adopt it or remove the unused dependency. |
 | 32 | Admin publishing reaches the engine | ✅ | Admin publish → writer `CreateMarket` → `Core::add_market` → engine book; tested at engine, core, writer, and gateway. Live check published market 100 and `/api/markets` returned it `Open` with book seq 0. | New markets appear via `/api/markets` on reload; no WS market-opened frame yet. |
-| 33 | Issuer console | ✅ | `IssuerPage` credits passes by username (a retry cannot double-credit) and shows how many passes users hold per market. It uses `POST /api/issuer/issue` and `GET /api/issuer/supply`, issuer role only (`docs/AUTH.md` section 6). | Seed script for demo accounts. |
+| 33 | Issuer console | ✅ | `IssuerPage` credits passes by username (a retry cannot double-credit) and shows how many passes users hold per market. It uses `POST /api/issuer/issue` and `GET /api/issuer/supply`, issuer role only (`docs/AUTH.md` section 6). `node scripts/seed.mjs` creates demo traders through these endpoints (`docs/AUTH.md` section 7). | — |
 
 ## Work ownership
 
@@ -134,13 +134,12 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **Issuer seed script (T3 — Stuti):** create demo accounts and credit their passes through the issuer endpoint, so a real run needs no dev endpoints.
-2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
-4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-6. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-7. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
+1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
+2. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
+3. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+4. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
+5. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
 
