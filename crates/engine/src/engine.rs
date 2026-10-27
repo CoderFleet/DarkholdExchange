@@ -103,6 +103,15 @@ impl Engine {
         Err(ReasonCode::OrderNotFound)
     }
 
+    /// Reserve a global trade id for a fill that did not come from the book, such
+    /// as a Dutch-auction acceptance. Keeping the counter in the engine means
+    /// auction journals and book fills never collide, and replay hashes it once.
+    pub fn alloc_trade_id(&mut self) -> TradeId {
+        let trade_id = self.next_trade_id;
+        self.next_trade_id = self.next_trade_id.saturating_add(1);
+        trade_id
+    }
+
     pub fn snapshot(&self, market_id: MarketId, depth: usize) -> Option<dx_types::BookSnapshot> {
         self.books.get(&market_id).map(|book| book.snapshot(depth))
     }

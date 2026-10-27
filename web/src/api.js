@@ -295,6 +295,61 @@ export const refundEscrow = (userId, tradeId) =>
   })
 
 /**
+ * Active and past Dutch auctions, optionally for one market.
+ *
+ * @param {{ market_id?: number }} [query]
+ * @returns {Promise<{ items: any[], now_ms: number }>}
+ */
+export const getAuctions = (query = {}) => {
+  const params = new URLSearchParams()
+  if (query.market_id != null) params.set('market_id', String(query.market_id))
+  const qs = params.toString() ? `?${params.toString()}` : ''
+  return request(`/api/auctions${qs}`)
+}
+
+/**
+ * Create a seller-backed Dutch auction. The seller's passes are reserved.
+ *
+ * @param {number} userId
+ * @param {{ client_order_id: number, market_id: number, qty: number, start_price_ticks: number, floor_price_ticks: number, duration_ms: number }} body
+ * @returns {Promise<any>}
+ */
+export const createAuction = (userId, body) =>
+  request('/api/auctions', {
+    method: 'POST',
+    headers: jsonHeaders(userId),
+    body: JSON.stringify(body),
+  })
+
+/**
+ * Accept a slice of an auction at or below `max_price_ticks`.
+ *
+ * @param {number} userId
+ * @param {number} auctionId
+ * @param {{ client_order_id: number, qty: number, max_price_ticks: number }} body
+ * @returns {Promise<any>}
+ */
+export const acceptAuction = (userId, auctionId, body) =>
+  request(`/api/auctions/${auctionId}/accept`, {
+    method: 'POST',
+    headers: jsonHeaders(userId),
+    body: JSON.stringify(body),
+  })
+
+/**
+ * Return an auction's unsold passes to the seller after its deadline.
+ *
+ * @param {number} userId
+ * @param {number} auctionId
+ * @returns {Promise<any>}
+ */
+export const expireAuction = (userId, auctionId) =>
+  request(`/api/auctions/${auctionId}/expire`, {
+    method: 'POST',
+    headers: authHeaders(userId),
+  })
+
+/**
  * @param {number} userId
  * @returns {string}
  */

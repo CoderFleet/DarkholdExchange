@@ -2,6 +2,7 @@ import { useEffect } from 'react'
 import { Link, Navigate, Route, Routes } from 'react-router-dom'
 import App from '../App'
 import { AdminPage } from '../pages/AdminPage'
+import { AuctionsPage } from '../pages/AuctionsPage'
 import { IssuerPage } from '../pages/IssuerPage'
 import { LoginPage } from '../pages/LoginPage'
 import { SignupPage } from '../pages/SignupPage'
@@ -38,6 +39,7 @@ export function AppShell() {
         <Route path="/market" element={<App initialView="trade" />} />
         <Route path="/wallet" element={<App initialView="wallet" />} />
         <Route path="/history" element={<App initialView="history" />} />
+        <Route path="/auctions" element={<AuctionsPage />} />
         <Route path="/speed" element={<App initialView="speed" />} />
         <Route path="/verify" element={<VerifyPage />} />
         <Route path="/login" element={<LoginPage />} />

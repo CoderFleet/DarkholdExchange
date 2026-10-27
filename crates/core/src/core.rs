@@ -15,8 +15,9 @@ use std::collections::HashMap;
 use dx_engine::{Engine, PlaceOutcome};
 use dx_ledger::{Ledger, LedgerError, Owner, TradeSettlement};
 use dx_types::{
-    Asset, Balance, BookDelta, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse,
-    DeliveryReceipt, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId, MarketStatus, Minor,
+    AcceptDutchAuction, Asset, AuctionAccept, AuctionStatus, Balance, BookDelta, BookSnapshot,
+    Cancel, ClientOrderId, Command, CommandResponse, CreateDutchAuction, DeliveryReceipt,
+    DutchAuction, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId, MarketStatus, Minor,
     OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Seq, Side, Ticks, TradeId, UserId,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -26,6 +27,10 @@ use sha2::{Digest, Sha256};
 /// can be requested. Kept short for the demo; production would use a market-level
 /// policy.
 pub const ESCROW_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+
+/// Upper bound on a Dutch-auction window. Keeps the published countdown sane and
+/// stops a typo from reserving inventory for years.
+pub const MAX_DUTCH_AUCTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandKind {
@@ -57,6 +62,15 @@ pub struct Core {
     escrow: HashMap<TradeId, EscrowRecord>,
     /// Seller signing keys. Registered explicitly so escrow release is replayable.
     public_keys: HashMap<UserId, [u8; 32]>,
+    /// Dutch auctions by id. Seller passes stay reserved until a sale or expiry.
+    auctions: HashMap<u64, DutchAuction>,
+    next_auction_id: u64,
+    /// Accepted auction slices, keyed by `(buyer, client_order_id)`, so a retried
+    /// accept returns the original settlement instead of buying twice.
+    auction_accepts: HashMap<(UserId, ClientOrderId), AuctionAccept>,
+    /// Auction ids keyed by `(seller, client_order_id)`, so a retried create does
+    /// not reserve the seller's passes twice.
+    auction_creates: HashMap<(UserId, ClientOrderId), u64>,
     /// Wall-clock time supplied by the gateway for the current command. Not hashed;
     /// replay supplies the same value from the WAL operation.
     current_time_ms: u64,
@@ -118,6 +132,10 @@ impl Core {
             open_buy_qty: HashMap::new(),
             escrow: HashMap::new(),
             public_keys: HashMap::new(),
+            auctions: HashMap::new(),
+            next_auction_id: 1,
+            auction_accepts: HashMap::new(),
+            auction_creates: HashMap::new(),
             current_time_ms: 0,
             poisoned: false,
         })
@@ -837,20 +855,10 @@ impl Core {
     }
 
     fn reject_ledger(&mut self, seq: Seq, error: &LedgerError, asset: Asset) -> CommandResponse {
-        let code = match error {
-            LedgerError::InsufficientFunds { .. } | LedgerError::InsufficientHeld { .. } => {
-                if asset == Asset::Cash {
-                    ReasonCode::InsufficientFunds
-                } else {
-                    ReasonCode::InsufficientInventory
-                }
-            }
-            LedgerError::NonPositiveAmount => ReasonCode::InvalidQuantity,
-            _ => {
-                self.poisoned = true;
-                ReasonCode::InternalError
-            }
-        };
+        let code = ledger_reason(error, asset);
+        if code == ReasonCode::InternalError {
+            self.poisoned = true;
+        }
         CommandResponse::rejected(seq, code)
     }
 
@@ -1030,6 +1038,220 @@ impl Core {
         Ok(record)
     }
 
+    /// Create a seller-backed Dutch auction. The seller's passes are reserved now
+    /// and released only when the auction sells out or expires.
+    pub fn create_dutch_auction(
+        &mut self,
+        seller_id: UserId,
+        request: CreateDutchAuction,
+        now_ms: u64,
+    ) -> Result<DutchAuction, ReasonCode> {
+        let create_key = (seller_id, request.client_order_id);
+        if let Some(auction_id) = self.auction_creates.get(&create_key).copied()
+            && let Some(existing) = self.auctions.get(&auction_id)
+        {
+            return Ok(existing.clone());
+        }
+
+        if request.qty == 0 {
+            return Err(ReasonCode::InvalidQuantity);
+        }
+        if request.duration_ms == 0 || request.duration_ms > MAX_DUTCH_AUCTION_MS {
+            return Err(ReasonCode::InvalidRequest);
+        }
+        let Some(market) = self.markets.get(&request.market_id).cloned() else {
+            return Err(ReasonCode::UnknownMarket);
+        };
+        if market.status != MarketStatus::Open {
+            return Err(ReasonCode::MarketClosed);
+        }
+        if request.start_price_ticks <= request.floor_price_ticks {
+            return Err(ReasonCode::InvalidPrice);
+        }
+        if !market.price_in_collar(request.start_price_ticks)
+            || !market.price_in_collar(request.floor_price_ticks)
+        {
+            return Err(ReasonCode::OutsideCollar);
+        }
+
+        let Ok(qty) = i64::try_from(request.qty) else {
+            return Err(ReasonCode::InvalidQuantity);
+        };
+        if let Err(error) = self.ledger.reserve(
+            seller_id,
+            Asset::Pass {
+                market_id: market.id,
+            },
+            qty,
+        ) {
+            return Err(ledger_reason(
+                &error,
+                Asset::Pass {
+                    market_id: market.id,
+                },
+            ));
+        }
+
+        let auction = DutchAuction {
+            id: self.next_auction_id,
+            market_id: market.id,
+            seller_id,
+            qty_total: request.qty,
+            qty_remaining: request.qty,
+            start_price_ticks: request.start_price_ticks,
+            floor_price_ticks: request.floor_price_ticks,
+            start_ms: now_ms,
+            end_ms: now_ms.saturating_add(request.duration_ms),
+            status: AuctionStatus::Active,
+        };
+        self.next_auction_id = self.next_auction_id.saturating_add(1);
+        self.auctions.insert(auction.id, auction.clone());
+        self.auction_creates.insert(create_key, auction.id);
+        self.bump_state_version();
+        Ok(auction)
+    }
+
+    /// Take a slice of an active auction at the current decayed price. The price
+    /// is recomputed here from `now_ms`; the buyer's `max_price_ticks` is the only
+    /// price they authorise.
+    pub fn accept_dutch_auction(
+        &mut self,
+        buyer_id: UserId,
+        request: AcceptDutchAuction,
+        now_ms: u64,
+    ) -> Result<AuctionAccept, ReasonCode> {
+        let accept_key = (buyer_id, request.client_order_id);
+        if let Some(cached) = self.auction_accepts.get(&accept_key) {
+            return Ok(cached.clone());
+        }
+
+        let Some(mut auction) = self.auctions.get(&request.auction_id).cloned() else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+        if auction.status != AuctionStatus::Active || auction.qty_remaining == 0 {
+            return Err(ReasonCode::AuctionClosed);
+        }
+        if now_ms >= auction.end_ms {
+            return Err(ReasonCode::AuctionClosed);
+        }
+        if request.qty == 0 || request.qty > auction.qty_remaining {
+            return Err(ReasonCode::InvalidQuantity);
+        }
+        let price_ticks = auction.price_at(now_ms);
+        if price_ticks > request.max_price_ticks {
+            return Err(ReasonCode::StaleAuctionPrice);
+        }
+        if buyer_id == auction.seller_id {
+            return Err(ReasonCode::SelfTrade);
+        }
+        let Some(market) = self.markets.get(&auction.market_id).cloned() else {
+            self.poisoned = true;
+            return Err(ReasonCode::InternalError);
+        };
+        if !self.within_holding_limit(
+            buyer_id,
+            market.id,
+            Side::Buy,
+            request.qty,
+            market.holding_limit,
+        ) {
+            return Err(ReasonCode::HoldingLimitExceeded);
+        }
+
+        let Some(notional) = market.notional_minor(price_ticks, request.qty) else {
+            return Err(ReasonCode::InvalidQuantity);
+        };
+        let fee = market.taker_fee_minor(notional);
+        let Some(cash) = notional.checked_add(fee) else {
+            self.poisoned = true;
+            return Err(ReasonCode::InternalError);
+        };
+        if let Err(error) = self.ledger.reserve(buyer_id, Asset::Cash, cash) {
+            return Err(ledger_reason(&error, Asset::Cash));
+        }
+
+        let trade_id = self.engine.alloc_trade_id();
+        let settlement = TradeSettlement {
+            trade_id,
+            market_id: market.id,
+            buyer_id,
+            seller_id: auction.seller_id,
+            qty: request.qty,
+            notional,
+            fee,
+            fee_payer: buyer_id,
+        };
+        if self.ledger.settle_trade(settlement).is_err() {
+            self.poisoned = true;
+            return Err(ReasonCode::InternalError);
+        }
+
+        auction.qty_remaining -= request.qty;
+        if auction.qty_remaining == 0 {
+            auction.status = AuctionStatus::Sold;
+        }
+        self.auctions.insert(auction.id, auction);
+        let accepted = AuctionAccept {
+            auction_id: request.auction_id,
+            trade_id,
+            market_id: market.id,
+            buyer_id,
+            seller_id: settlement.seller_id,
+            qty: request.qty,
+            price_ticks,
+            notional,
+            fee,
+        };
+        self.auction_accepts.insert(accept_key, accepted.clone());
+        self.bump_state_version();
+        Ok(accepted)
+    }
+
+    /// Close an auction after its deadline and return unsold passes to the seller.
+    /// Safe to retry once the auction is already expired.
+    pub fn expire_dutch_auction(
+        &mut self,
+        actor_user_id: UserId,
+        auction_id: u64,
+        now_ms: u64,
+    ) -> Result<DutchAuction, ReasonCode> {
+        let Some(mut auction) = self.auctions.get(&auction_id).cloned() else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+        if auction.status == AuctionStatus::Expired {
+            return Ok(auction);
+        }
+        if auction.status != AuctionStatus::Active || now_ms < auction.end_ms {
+            return Err(ReasonCode::AuctionNotActive);
+        }
+        if actor_user_id != auction.seller_id {
+            return Err(ReasonCode::NotOrderOwner);
+        }
+        if auction.qty_remaining > 0 {
+            self.release_pass(auction.seller_id, auction.market_id, auction.qty_remaining)?;
+        }
+        auction.status = AuctionStatus::Expired;
+        self.auctions.insert(auction_id, auction.clone());
+        self.bump_state_version();
+        Ok(auction)
+    }
+
+    pub fn dutch_auction(&self, auction_id: u64) -> Option<&DutchAuction> {
+        self.auctions.get(&auction_id)
+    }
+
+    /// All auctions, oldest first, optionally filtered by market.
+    pub fn dutch_auctions(&self, market_id: Option<MarketId>) -> Vec<DutchAuction> {
+        let mut auctions: Vec<_> = self
+            .auctions
+            .values()
+            .filter(|auction| market_id.is_none_or(|id| auction.market_id == id))
+            .cloned()
+            .collect();
+        auctions.sort_by_key(|auction| auction.id);
+        auctions
+    }
+
     pub fn balance(&self, user_id: UserId, asset: Asset) -> Balance {
         self.ledger.balance(user_id, asset)
     }
@@ -1160,6 +1382,27 @@ impl Core {
             hasher.update(user_id.to_le_bytes());
             hasher.update(key);
         }
+
+        let mut auctions: Vec<_> = self.auctions.values().collect();
+        auctions.sort_by_key(|auction| auction.id);
+        for auction in auctions {
+            hasher.update(auction.id.to_le_bytes());
+            hasher.update(auction.market_id.to_le_bytes());
+            hasher.update(auction.seller_id.to_le_bytes());
+            hasher.update(auction.qty_total.to_le_bytes());
+            hasher.update(auction.qty_remaining.to_le_bytes());
+            hasher.update(auction.start_price_ticks.to_le_bytes());
+            hasher.update(auction.floor_price_ticks.to_le_bytes());
+            hasher.update(auction.start_ms.to_le_bytes());
+            hasher.update(auction.end_ms.to_le_bytes());
+            hasher.update([match auction.status {
+                AuctionStatus::Active => 0,
+                AuctionStatus::Sold => 1,
+                AuctionStatus::Expired => 2,
+            }]);
+        }
+        hasher.update(self.next_auction_id.to_le_bytes());
+
         hasher.update(self.next_seq.to_le_bytes());
         hasher.update(self.state_version.to_le_bytes());
         hasher.update([self.poisoned as u8]);
@@ -1210,6 +1453,26 @@ impl Core {
                             .ok_or_else(|| "expected pass overflow".to_string())?;
                     }
                 }
+            }
+        }
+
+        for auction in self.auctions.values() {
+            match auction.status {
+                AuctionStatus::Active => {
+                    let entry = expected_pass
+                        .entry((auction.seller_id, auction.market_id))
+                        .or_default();
+                    *entry = entry
+                        .checked_add(auction.qty_remaining)
+                        .ok_or_else(|| "expected auction pass overflow".to_string())?;
+                }
+                AuctionStatus::Sold if auction.qty_remaining != 0 => {
+                    return Err(format!(
+                        "sold auction {} still has {} passes",
+                        auction.id, auction.qty_remaining
+                    ));
+                }
+                _ => {}
             }
         }
 
@@ -1336,6 +1599,20 @@ fn escrow_settlement(record: &EscrowRecord) -> TradeSettlement {
         notional: record.notional,
         fee: record.fee,
         fee_payer: record.fee_payer,
+    }
+}
+
+fn ledger_reason(error: &LedgerError, asset: Asset) -> ReasonCode {
+    match error {
+        LedgerError::InsufficientFunds { .. } | LedgerError::InsufficientHeld { .. } => {
+            if asset == Asset::Cash {
+                ReasonCode::InsufficientFunds
+            } else {
+                ReasonCode::InsufficientInventory
+            }
+        }
+        LedgerError::NonPositiveAmount => ReasonCode::InvalidQuantity,
+        _ => ReasonCode::InternalError,
     }
 }
 

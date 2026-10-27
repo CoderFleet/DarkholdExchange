@@ -22,10 +22,11 @@ use axum::{Json, Router};
 use dx_core::Core;
 use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
-    Balance, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, ErrorBody,
-    EscrowRecord, EscrowState, Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor,
-    OpenOrderView, OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, TradeId,
-    UserId, WsClientMessage, WsServerMessage, seed_markets,
+    AcceptDutchAuction, AuctionStatus, Balance, BookSnapshot, Cancel, ClientOrderId, Command,
+    CommandResponse, CreateDutchAuction, DutchAuction, ErrorBody, EscrowRecord, EscrowState, Fill,
+    JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, TradeId, UserId,
+    WsClientMessage, WsServerMessage, seed_markets,
 };
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -286,6 +287,9 @@ async fn main() {
         .route("/api/me/escrow", get(escrow_current))
         .route("/api/escrow/{trade_id}/receipt", post(escrow_receipt))
         .route("/api/escrow/{trade_id}/refund", post(escrow_refund))
+        .route("/api/auctions", get(auctions_current).post(auction_create))
+        .route("/api/auctions/{auction_id}/accept", post(auction_accept))
+        .route("/api/auctions/{auction_id}/expire", post(auction_expire))
         .route("/api/history", get(history_current))
         .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
@@ -1063,6 +1067,198 @@ async fn escrow_refund(
         state: record.state,
         delivered_at_ms: record.delivered_at_ms,
     }))
+}
+
+#[derive(Deserialize)]
+struct AuctionQuery {
+    market_id: Option<MarketId>,
+}
+
+#[derive(Serialize)]
+struct AuctionView {
+    id: u64,
+    market_id: MarketId,
+    market_name: String,
+    seller_id: UserId,
+    qty_total: Qty,
+    qty_remaining: Qty,
+    start_price_ticks: Ticks,
+    floor_price_ticks: Ticks,
+    start_ms: u64,
+    end_ms: u64,
+    status: AuctionStatus,
+    /// Price the server would settle at right now, for this poll.
+    current_price_ticks: Ticks,
+    current_price_minor: Minor,
+    tick_size_minor: Minor,
+}
+
+#[derive(Serialize)]
+struct AuctionsResponse {
+    items: Vec<AuctionView>,
+    now_ms: u64,
+}
+
+fn auction_view(auction: &DutchAuction, markets: &[MarketView], at_ms: u64) -> AuctionView {
+    let market = markets
+        .iter()
+        .find(|market| market.config.id == auction.market_id);
+    let market_name = market
+        .map(|market| market.config.name.clone())
+        .unwrap_or_else(|| format!("Market #{}", auction.market_id));
+    let tick_size_minor = market
+        .map(|market| market.config.tick_size_minor)
+        .unwrap_or(1)
+        .max(1);
+    let current_price_ticks = auction.price_at(at_ms);
+    let current_price_minor =
+        i64::try_from((current_price_ticks as u128) * (tick_size_minor as u128))
+            .unwrap_or(i64::MAX);
+    AuctionView {
+        id: auction.id,
+        market_id: auction.market_id,
+        market_name,
+        seller_id: auction.seller_id,
+        qty_total: auction.qty_total,
+        qty_remaining: auction.qty_remaining,
+        start_price_ticks: auction.start_price_ticks,
+        floor_price_ticks: auction.floor_price_ticks,
+        start_ms: auction.start_ms,
+        end_ms: auction.end_ms,
+        status: auction.status,
+        current_price_ticks,
+        current_price_minor,
+        tick_size_minor,
+    }
+}
+
+async fn auctions_current(
+    State(state): State<AppState>,
+    Query(query): Query<AuctionQuery>,
+) -> Result<Json<AuctionsResponse>, ApiError> {
+    let auctions = state
+        .writer
+        .auctions(query.market_id)
+        .await
+        .map_err(writer_error)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    let at_ms = now_ms();
+    let items = auctions
+        .iter()
+        .map(|auction| auction_view(auction, &markets, at_ms))
+        .collect();
+    Ok(Json(AuctionsResponse {
+        items,
+        now_ms: at_ms,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateAuctionPayload {
+    client_order_id: ClientOrderId,
+    market_id: MarketId,
+    qty: Qty,
+    start_price_ticks: Ticks,
+    floor_price_ticks: Ticks,
+    duration_ms: u64,
+}
+
+async fn auction_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateAuctionPayload>, JsonRejection>,
+) -> Result<Json<AuctionView>, ApiError> {
+    let seller_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let request = CreateDutchAuction {
+        client_order_id: body.client_order_id,
+        market_id: body.market_id,
+        qty: body.qty,
+        start_price_ticks: body.start_price_ticks,
+        floor_price_ticks: body.floor_price_ticks,
+        duration_ms: body.duration_ms,
+    };
+    let at_ms = now_ms();
+    let auction = state
+        .writer
+        .create_auction(seller_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(auction_view(&auction, &markets, at_ms)))
+}
+
+#[derive(Deserialize)]
+struct AcceptAuctionPayload {
+    client_order_id: ClientOrderId,
+    qty: Qty,
+    max_price_ticks: Ticks,
+}
+
+#[derive(Serialize)]
+struct AuctionAcceptView {
+    auction: AuctionView,
+    trade_id: TradeId,
+    qty: Qty,
+    price_ticks: Ticks,
+    notional: Minor,
+    fee: Minor,
+}
+
+async fn auction_accept(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<AcceptAuctionPayload>, JsonRejection>,
+) -> Result<Json<AuctionAcceptView>, ApiError> {
+    let buyer_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let request = AcceptDutchAuction {
+        client_order_id: body.client_order_id,
+        auction_id,
+        qty: body.qty,
+        max_price_ticks: body.max_price_ticks,
+    };
+    let at_ms = now_ms();
+    let accepted = state
+        .writer
+        .accept_auction(buyer_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    let auction = state
+        .writer
+        .auction(auction_id)
+        .await
+        .map_err(writer_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, ReasonCode::OrderNotFound))?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(AuctionAcceptView {
+        auction: auction_view(&auction, &markets, at_ms),
+        trade_id: accepted.trade_id,
+        qty: accepted.qty,
+        price_ticks: accepted.price_ticks,
+        notional: accepted.notional,
+        fee: accepted.fee,
+    }))
+}
+
+async fn auction_expire(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuctionView>, ApiError> {
+    let actor_user_id = caller_user(&state, &headers)?;
+    let at_ms = now_ms();
+    let auction = state
+        .writer
+        .expire_auction(actor_user_id, auction_id, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(auction_view(&auction, &markets, at_ms)))
 }
 
 #[derive(Deserialize)]

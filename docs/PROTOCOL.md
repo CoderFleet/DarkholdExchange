@@ -273,7 +273,113 @@ Both actions return `{ "trade_id": 2, "state": "delivered" | "refunded", "delive
 Escrow is also included in the wallet response: `escrow_cash` is the buyer's pending cash and
 `passes[].held` is the quantity in escrow.
 
-### 2.8 Temporary aliases
+### 2.8 Auctions
+
+Dutch auctions liquidate passes the seller already owns. Creation reserves the seller's passes;
+acceptance moves cash and passes atomically at the current decayed price. This is separate from
+escrow: an auction fill settles immediately, even on an escrow-enabled market, because the seller is
+the auction itself rather than a matched counterparty awaiting delivery.
+
+List auctions, optionally for one market:
+
+```http
+GET /api/auctions?market_id=1
+```
+
+```json
+{
+  "items": [
+    {
+      "id": 1,
+      "market_id": 1,
+      "market_name": "Day 1 General",
+      "seller_id": 2,
+      "qty_total": 4,
+      "qty_remaining": 2,
+      "start_price_ticks": 5000,
+      "floor_price_ticks": 2500,
+      "start_ms": 1793083525399,
+      "end_ms": 1793083585399,
+      "status": "active",
+      "current_price_ticks": 3750,
+      "current_price_minor": 375000,
+      "tick_size_minor": 100
+    }
+  ],
+  "now_ms": 1793083555399
+}
+```
+
+Create one as the authenticated seller. `client_order_id` is the idempotency key; retrying the same
+value returns the original auction instead of reserving inventory twice.
+
+```http
+POST /api/auctions
+Content-Type: application/json
+x-dev-user: 2
+```
+
+```json
+{
+  "client_order_id": 1,
+  "market_id": 1,
+  "qty": 4,
+  "start_price_ticks": 5000,
+  "floor_price_ticks": 2500,
+  "duration_ms": 60000
+}
+```
+
+Rules: quantity is positive; the window is between 1 ms and seven days; `start > floor`; both prices
+must sit inside the market collar. The seller must have the passes available.
+
+Accept a slice. The server recomputes the price when the command is sequenced. `max_price_ticks` is
+the highest price the buyer authorises, so a little network latency cannot make them pay more.
+
+```http
+POST /api/auctions/{id}/accept
+Content-Type: application/json
+x-dev-user: 1
+```
+
+```json
+{ "client_order_id": 2, "qty": 1, "max_price_ticks": 3750 }
+```
+
+```json
+{
+  "auction": { "id": 1, "qty_remaining": 1, "...": "auction view" },
+  "trade_id": 7,
+  "qty": 1,
+  "price_ticks": 3750,
+  "notional": 375000,
+  "fee": 3750
+}
+```
+
+The acceptance is a compare-and-set: `qty` must not exceed `qty_remaining`, the auction must still
+be inside its window, and the buyer's per-identity holding limit applies. A retried
+`client_order_id` returns the original settlement without charging twice. Sold-out auctions close
+immediately.
+
+After the deadline the seller closes the auction and takes back the unsold passes:
+
+```http
+POST /api/auctions/{id}/expire
+x-dev-user: 2
+```
+
+The price curve is linear from start to floor, rounded down, and clamped outside the window:
+
+```text
+price(t) = start - floor((start - floor) * (t - start_ms) / (end_ms - start_ms))
+```
+
+There is no tick-by-tick price stream; clients compute the same curve from the published parameters.
+Expiry is manual in v1: no background timer submits it, and cancellation before the deadline is not
+supported.
+
+### 2.9 Temporary aliases
 
 These remain available so the current terminal keeps working. New code should use the canonical
 paths above.

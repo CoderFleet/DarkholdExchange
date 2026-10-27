@@ -1,8 +1,8 @@
 use dx_core::{CommandOutcome, Core};
 use dx_types::{
-    Asset, Balance, BookDelta, BookLevel, BookSnapshot, Cancel, Command, DeliveryReceipt,
-    EscrowState, LevelChange, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks,
-    seed_markets,
+    AcceptDutchAuction, Asset, AuctionStatus, Balance, BookDelta, BookLevel, BookSnapshot, Cancel,
+    Command, CreateDutchAuction, DeliveryReceipt, EscrowState, LevelChange, OrderStatus,
+    PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, seed_markets,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -901,4 +901,342 @@ fn pending_escrow_passes_count_toward_the_buyer_holding_limit() {
         .sum();
     assert_eq!(pending, 5);
     core.check_invariants().unwrap();
+}
+
+fn auction_create_request(
+    client_order_id: u64,
+    market_id: u32,
+    qty: Qty,
+    start: Ticks,
+    floor: Ticks,
+    duration_ms: u64,
+) -> CreateDutchAuction {
+    CreateDutchAuction {
+        client_order_id,
+        market_id,
+        qty,
+        start_price_ticks: start,
+        floor_price_ticks: floor,
+        duration_ms,
+    }
+}
+
+fn auction_accept_request(
+    client_order_id: u64,
+    auction_id: u64,
+    qty: Qty,
+    max_price_ticks: Ticks,
+) -> AcceptDutchAuction {
+    AcceptDutchAuction {
+        client_order_id,
+        auction_id,
+        qty,
+        max_price_ticks,
+    }
+}
+
+#[test]
+fn dutch_auction_reserves_passes_and_settles_at_the_decayed_price() {
+    let mut core = core();
+    core.deposit_cash(1, 1_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 10, 1).unwrap();
+
+    let start = 1_000_000;
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 4, 5_000, 2_500, 10_000),
+            start,
+        )
+        .unwrap();
+    assert_eq!(auction.id, 1);
+    assert_eq!(auction.status, AuctionStatus::Active);
+    assert_eq!(auction.qty_remaining, 4);
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 6, 4)
+    );
+    core.check_invariants().unwrap();
+
+    // Halfway through the window the price is 3,750 ticks.
+    let accepted = core
+        .accept_dutch_auction(
+            1,
+            auction_accept_request(1, auction.id, 2, 3_800),
+            start + 5_000,
+        )
+        .unwrap();
+    assert_eq!(accepted.price_ticks, 3_750);
+    assert_eq!(accepted.qty, 2);
+    assert_eq!(accepted.notional, 750_000);
+    assert_eq!(accepted.fee, 7_500);
+
+    assert_eq!(core.balance(1, Asset::Cash), cash(242_500, 0));
+    assert_eq!(
+        core.balance(1, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 2, 0)
+    );
+    assert_eq!(core.balance(2, Asset::Cash), cash(750_000, 0));
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 6, 2)
+    );
+
+    let updated = core.dutch_auction(auction.id).unwrap();
+    assert_eq!(updated.qty_remaining, 2);
+    assert_eq!(updated.status, AuctionStatus::Active);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_accept_is_compare_and_set_and_idempotent() {
+    let mut core = core();
+    core.deposit_cash(1, 1_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 10, 1).unwrap();
+    let start = 1_000;
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 2, 5_000, 2_500, 10_000),
+            start,
+        )
+        .unwrap();
+
+    assert_eq!(
+        core.accept_dutch_auction(1, auction_accept_request(1, auction.id, 3, 5_000), start),
+        Err(ReasonCode::InvalidQuantity)
+    );
+    assert_eq!(
+        core.accept_dutch_auction(1, auction_accept_request(2, auction.id, 1, 4_999), start),
+        Err(ReasonCode::StaleAuctionPrice)
+    );
+    assert_eq!(core.balance(1, Asset::Cash), cash(1_000_000, 0));
+
+    let first = core
+        .accept_dutch_auction(1, auction_accept_request(3, auction.id, 1, 5_000), start)
+        .unwrap();
+    let cash_after = core.balance(1, Asset::Cash);
+    let retry = core
+        .accept_dutch_auction(1, auction_accept_request(3, auction.id, 1, 5_000), start)
+        .unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(core.balance(1, Asset::Cash), cash_after);
+    assert_eq!(core.dutch_auction(auction.id).unwrap().qty_remaining, 1);
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_sells_out_and_then_closes() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 4, 1).unwrap();
+    let start = 5_000;
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 2, 5_000, 2_500, 10_000),
+            start,
+        )
+        .unwrap();
+    core.accept_dutch_auction(1, auction_accept_request(1, auction.id, 2, 5_000), start)
+        .unwrap();
+
+    let sold = core.dutch_auction(auction.id).unwrap();
+    assert_eq!(sold.status, AuctionStatus::Sold);
+    assert_eq!(sold.qty_remaining, 0);
+    assert_eq!(
+        core.accept_dutch_auction(1, auction_accept_request(2, auction.id, 1, 5_000), start),
+        Err(ReasonCode::AuctionClosed)
+    );
+    assert_eq!(
+        core.expire_dutch_auction(2, auction.id, start + 10_000),
+        Err(ReasonCode::AuctionNotActive)
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_expiry_returns_unsold_passes_to_the_seller() {
+    let mut core = core();
+    core.issue_passes(2, MARKET, 6, 1).unwrap();
+    let start = 10_000;
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 5, 5_000, 2_500, 10_000),
+            start,
+        )
+        .unwrap();
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 1, 5)
+    );
+
+    assert_eq!(
+        core.expire_dutch_auction(2, auction.id, start + 9_999),
+        Err(ReasonCode::AuctionNotActive)
+    );
+    assert_eq!(
+        core.expire_dutch_auction(1, auction.id, start + 10_000),
+        Err(ReasonCode::NotOrderOwner)
+    );
+    let expired = core
+        .expire_dutch_auction(2, auction.id, start + 10_000)
+        .unwrap();
+    assert_eq!(expired.status, AuctionStatus::Expired);
+    assert_eq!(expired.qty_remaining, 5);
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 6, 0)
+    );
+    assert_eq!(
+        core.accept_dutch_auction(
+            1,
+            auction_accept_request(1, auction.id, 1, 5_000),
+            start + 10_001
+        ),
+        Err(ReasonCode::AuctionClosed)
+    );
+    // Retrying expiry is harmless.
+    assert_eq!(
+        core.expire_dutch_auction(2, auction.id, start + 20_000),
+        Ok(expired)
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_validates_parameters_and_inventory() {
+    let mut core = core();
+    core.issue_passes(2, MARKET, 1, 1).unwrap();
+
+    assert_eq!(
+        core.create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 1, 2_500, 2_500, 1_000),
+            0
+        ),
+        Err(ReasonCode::InvalidPrice)
+    );
+    assert_eq!(
+        core.create_dutch_auction(2, auction_create_request(2, MARKET, 1, 5_000, 2_500, 0), 0),
+        Err(ReasonCode::InvalidRequest)
+    );
+    assert_eq!(
+        core.create_dutch_auction(
+            2,
+            auction_create_request(3, MARKET, 1, 6_001, 2_500, 1_000),
+            0
+        ),
+        Err(ReasonCode::OutsideCollar)
+    );
+    assert_eq!(
+        core.create_dutch_auction(
+            2,
+            auction_create_request(4, MARKET, 1, 5_000, 2_499, 1_000),
+            0
+        ),
+        Err(ReasonCode::OutsideCollar)
+    );
+    assert_eq!(
+        core.create_dutch_auction(
+            2,
+            auction_create_request(5, MARKET, 2, 5_000, 2_500, 1_000),
+            0
+        ),
+        Err(ReasonCode::InsufficientInventory)
+    );
+    // Creating the same request twice is idempotent and reserves only once.
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(6, MARKET, 1, 5_000, 2_500, 1_000),
+            0,
+        )
+        .unwrap();
+    let retry = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(6, MARKET, 1, 5_000, 2_500, 1_000),
+            0,
+        )
+        .unwrap();
+    assert_eq!(retry, auction);
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }),
+        pass(MARKET, 0, 1)
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_accept_respects_the_holding_limit() {
+    let mut core = core();
+    core.deposit_cash(1, 5_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 6, 1).unwrap();
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 6, 5_000, 2_500, 10_000),
+            1_000,
+        )
+        .unwrap();
+
+    // Market 1 allows four passes per identity.
+    assert_eq!(
+        core.accept_dutch_auction(1, auction_accept_request(1, auction.id, 5, 5_000), 1_000),
+        Err(ReasonCode::HoldingLimitExceeded)
+    );
+    core.accept_dutch_auction(1, auction_accept_request(2, auction.id, 4, 5_000), 1_000)
+        .unwrap();
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_on_an_escrow_market_settles_without_a_receipt() {
+    let mut core = core();
+    core.deposit_cash(1, 2_000_000, 1).unwrap();
+    core.issue_passes(2, ESCROW_MARKET, 2, 1).unwrap();
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, ESCROW_MARKET, 2, 5_000, 4_000, 1_000),
+            2_000,
+        )
+        .unwrap();
+    let accepted = core
+        .accept_dutch_auction(1, auction_accept_request(1, auction.id, 2, 5_000), 2_000)
+        .unwrap();
+    assert_eq!(accepted.price_ticks, 5_000);
+    assert_eq!(
+        core.balance(
+            1,
+            Asset::Pass {
+                market_id: ESCROW_MARKET
+            }
+        ),
+        pass(ESCROW_MARKET, 2, 0)
+    );
+    assert!(core.escrow_records(1).is_empty());
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn dutch_auction_state_hash_covers_auction_progress() {
+    let mut core = core();
+    core.deposit_cash(1, 1_000_000, 1).unwrap();
+    core.issue_passes(2, MARKET, 2, 1).unwrap();
+    let before = core.state_hash();
+    let auction = core
+        .create_dutch_auction(
+            2,
+            auction_create_request(1, MARKET, 2, 5_000, 2_500, 10_000),
+            1_000,
+        )
+        .unwrap();
+    let created = core.state_hash();
+    assert_ne!(before, created);
+    core.accept_dutch_auction(1, auction_accept_request(1, auction.id, 1, 5_000), 1_000)
+        .unwrap();
+    assert_ne!(created, core.state_hash());
 }

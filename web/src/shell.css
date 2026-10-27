@@ -379,3 +379,222 @@
   color: #ffb3bf;
   font-size: 12px;
 }
+/* Dutch auctions */
+.auction-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.auction-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+}
+
+.auction-heading h2 {
+  margin: 4px 0 0;
+  color: var(--text-strong);
+}
+
+.auction-intro {
+  max-width: 560px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.auction-error,
+.auction-notice {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.auction-error {
+  border: 1px solid rgba(255, 99, 99, 0.4);
+  background: rgba(255, 99, 99, 0.08);
+  color: #ffb4b4;
+}
+
+.auction-notice {
+  border: 1px solid rgba(80, 220, 150, 0.35);
+  background: rgba(80, 220, 150, 0.08);
+  color: #9cf0c5;
+}
+
+.auction-panel {
+  padding: 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.auction-panel h3 {
+  margin: 0 0 12px;
+  color: var(--text-strong);
+}
+
+.auction-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.auction-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+
+.auction-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.auction-card header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.auction-card h4 {
+  flex: 1;
+  margin: 0;
+  color: var(--text-strong);
+  font-size: 14px;
+}
+
+.auction-id {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auction-phase {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.phase-active {
+  background: rgba(80, 220, 150, 0.15);
+  color: #9cf0c5;
+}
+
+.phase-scheduled {
+  background: rgba(120, 160, 255, 0.15);
+  color: #b9c9ff;
+}
+
+.phase-ended,
+.phase-expired {
+  background: rgba(255, 190, 90, 0.15);
+  color: #ffd79a;
+}
+
+.phase-sold {
+  background: rgba(179, 136, 255, 0.18);
+  color: var(--purple);
+}
+
+.auction-card dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.auction-card dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.auction-card dd {
+  margin: 2px 0 0;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+}
+
+.auction-actions {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.auction-actions label,
+.auction-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auction-actions input {
+  width: 76px;
+}
+
+.auction-card input,
+.auction-form input,
+.auction-form select {
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: rgba(0, 0, 0, 0.25);
+  color: var(--text-strong);
+  font: inherit;
+}
+
+.auction-actions button,
+.auction-form button {
+  padding: 8px 12px;
+  border: 1px solid rgba(179, 136, 255, 0.5);
+  border-radius: 8px;
+  background: rgba(139, 92, 246, 0.18);
+  color: var(--text-strong);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.auction-actions button:hover:not(:disabled),
+.auction-form button:hover:not(:disabled) {
+  background: rgba(139, 92, 246, 0.3);
+}
+
+.auction-actions button:disabled,
+.auction-form button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.auction-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.auction-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.auction-form button {
+  min-height: 36px;
+}

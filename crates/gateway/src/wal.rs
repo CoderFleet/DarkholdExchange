@@ -9,7 +9,10 @@ use std::path::Path;
 
 use dkx_wal::{LogRecord, Wal};
 use dx_core::Core;
-use dx_types::{ClientOrderId, Command, Fill, MarketConfig, MarketId, Minor, Qty, TradeId, UserId};
+use dx_types::{
+    AcceptDutchAuction, ClientOrderId, Command, CreateDutchAuction, Fill, MarketConfig, MarketId,
+    Minor, Qty, TradeId, UserId,
+};
 use serde::{Deserialize, Serialize};
 
 const KIND_OP: u8 = 1;
@@ -58,6 +61,21 @@ pub(crate) enum WalOp {
     RefundEscrow {
         actor_user_id: UserId,
         trade_id: TradeId,
+        now_ms: u64,
+    },
+    CreateDutchAuction {
+        seller_id: UserId,
+        request: CreateDutchAuction,
+        now_ms: u64,
+    },
+    AcceptDutchAuction {
+        buyer_id: UserId,
+        request: AcceptDutchAuction,
+        now_ms: u64,
+    },
+    ExpireDutchAuction {
+        actor_user_id: UserId,
+        auction_id: u64,
         now_ms: u64,
     },
 }
@@ -226,6 +244,30 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
             core.refund_escrow(*actor_user_id, *trade_id, *now_ms)
                 .map_err(|reason| format!("WAL escrow refund replay rejected: {reason:?}"))?;
         }
+        WalOp::CreateDutchAuction {
+            seller_id,
+            request,
+            now_ms,
+        } => {
+            core.create_dutch_auction(*seller_id, request.clone(), *now_ms)
+                .map_err(|reason| format!("WAL auction create replay rejected: {reason:?}"))?;
+        }
+        WalOp::AcceptDutchAuction {
+            buyer_id,
+            request,
+            now_ms,
+        } => {
+            core.accept_dutch_auction(*buyer_id, request.clone(), *now_ms)
+                .map_err(|reason| format!("WAL auction accept replay rejected: {reason:?}"))?;
+        }
+        WalOp::ExpireDutchAuction {
+            actor_user_id,
+            auction_id,
+            now_ms,
+        } => {
+            core.expire_dutch_auction(*actor_user_id, *auction_id, *now_ms)
+                .map_err(|reason| format!("WAL auction expire replay rejected: {reason:?}"))?;
+        }
     }
     Ok(())
 }
@@ -234,7 +276,8 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
 mod tests {
     use super::*;
     use dx_types::{
-        Command, DeliveryReceipt, EscrowState, PlaceLimit, PlaceMarket, Side, seed_markets,
+        AcceptDutchAuction, AuctionStatus, Command, CreateDutchAuction, DeliveryReceipt,
+        EscrowState, PlaceLimit, PlaceMarket, Side, seed_markets,
     };
     use ed25519_dalek::{Signer, SigningKey};
     use tempfile::tempdir;
@@ -516,6 +559,102 @@ mod tests {
                 .balance(1, dx_types::Asset::Pass { market_id: 3 })
                 .available,
             2
+        );
+    }
+
+    #[test]
+    fn replay_rebuilds_a_dutch_auction_sale_and_expiry() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut wal =
+            WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let mut core = Core::new(seed_markets()).unwrap();
+
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Issue {
+                user_id: 2,
+                market_id: 1,
+                qty: 6,
+                client_request_id: 1,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Deposit {
+                user_id: 1,
+                amount: 2_000_000,
+                client_request_id: 1,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::CreateDutchAuction {
+                seller_id: 2,
+                request: CreateDutchAuction {
+                    client_order_id: 1,
+                    market_id: 1,
+                    qty: 6,
+                    start_price_ticks: 5_000,
+                    floor_price_ticks: 2_500,
+                    duration_ms: 10_000,
+                },
+                now_ms: 1_000,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::AcceptDutchAuction {
+                buyer_id: 1,
+                request: AcceptDutchAuction {
+                    client_order_id: 1,
+                    auction_id: 1,
+                    qty: 2,
+                    max_price_ticks: 5_000,
+                },
+                now_ms: 1_000,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::ExpireDutchAuction {
+                actor_user_id: 2,
+                auction_id: 1,
+                now_ms: 11_000,
+            },
+        );
+        let expected_hash = core.state_hash();
+        let settled = core.dutch_auction(1).unwrap().clone();
+        drop(wal);
+
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut restored = Core::new(seed_markets()).unwrap();
+        replay(&recovered.replayed_records, &mut restored).unwrap();
+
+        assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(restored.dutch_auction(1).unwrap(), &settled);
+        assert_eq!(settled.status, AuctionStatus::Expired);
+        assert_eq!(settled.qty_remaining, 4);
+        assert_eq!(
+            restored.balance(1, dx_types::Asset::Pass { market_id: 1 }),
+            dx_types::Balance {
+                asset: dx_types::Asset::Pass { market_id: 1 },
+                available: 2,
+                held: 0,
+            }
+        );
+        assert_eq!(
+            restored.balance(2, dx_types::Asset::Pass { market_id: 1 }),
+            dx_types::Balance {
+                asset: dx_types::Asset::Pass { market_id: 1 },
+                available: 4,
+                held: 0,
+            }
         );
     }
 }

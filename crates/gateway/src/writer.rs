@@ -16,9 +16,10 @@ use crate::wal::{WalOp, WalSession};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    Asset, Balance, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, EscrowRecord,
-    Fill, MarketConfig, MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode,
-    Seq, TradeId, UserId, WsServerMessage,
+    AcceptDutchAuction, Asset, AuctionAccept, Balance, BookDelta, BookSnapshot, ClientOrderId,
+    Command, CommandResponse, CreateDutchAuction, DutchAuction, EscrowRecord, Fill, MarketConfig,
+    MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq, TradeId, UserId,
+    WsServerMessage,
 };
 use hdrhistogram::Histogram;
 use tokio::sync::{broadcast, oneshot};
@@ -237,6 +238,32 @@ enum WriterRequest {
         now_ms: u64,
         reply: oneshot::Sender<Result<EscrowRecord, ReasonCode>>,
     },
+    CreateAuction {
+        seller_id: UserId,
+        request: CreateDutchAuction,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<DutchAuction, ReasonCode>>,
+    },
+    AcceptAuction {
+        buyer_id: UserId,
+        request: AcceptDutchAuction,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<AuctionAccept, ReasonCode>>,
+    },
+    ExpireAuction {
+        actor_user_id: UserId,
+        auction_id: u64,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<DutchAuction, ReasonCode>>,
+    },
+    Auctions {
+        market_id: Option<MarketId>,
+        reply: oneshot::Sender<Vec<DutchAuction>>,
+    },
+    Auction {
+        auction_id: u64,
+        reply: oneshot::Sender<Option<DutchAuction>>,
+    },
     Baseline {
         market_filter: Option<Vec<MarketId>>,
         depth: usize,
@@ -441,6 +468,67 @@ impl WriterHandle {
             reply,
         })
         .await
+    }
+
+    pub(crate) async fn create_auction(
+        &self,
+        seller_id: UserId,
+        request: CreateDutchAuction,
+        now_ms: u64,
+    ) -> Result<Result<DutchAuction, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::CreateAuction {
+            seller_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn accept_auction(
+        &self,
+        buyer_id: UserId,
+        request: AcceptDutchAuction,
+        now_ms: u64,
+    ) -> Result<Result<AuctionAccept, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::AcceptAuction {
+            buyer_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn expire_auction(
+        &self,
+        actor_user_id: UserId,
+        auction_id: u64,
+        now_ms: u64,
+    ) -> Result<Result<DutchAuction, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::ExpireAuction {
+            actor_user_id,
+            auction_id,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn auctions(
+        &self,
+        market_id: Option<MarketId>,
+    ) -> Result<Vec<DutchAuction>, WriterError> {
+        self.request(|reply| WriterRequest::Auctions { market_id, reply })
+            .await
+    }
+
+    pub(crate) async fn auction(
+        &self,
+        auction_id: u64,
+    ) -> Result<Option<DutchAuction>, WriterError> {
+        self.request(|reply| WriterRequest::Auction { auction_id, reply })
+            .await
     }
 
     pub(crate) async fn baseline(
@@ -939,6 +1027,63 @@ fn writer_loop(
                 }
                 let _ = reply.send(result);
             }
+            WriterRequest::CreateAuction {
+                seller_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::CreateDutchAuction {
+                    seller_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.create_dutch_auction(seller_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::AcceptAuction {
+                buyer_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::AcceptDutchAuction {
+                    buyer_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.accept_dutch_auction(buyer_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::ExpireAuction {
+                actor_user_id,
+                auction_id,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::ExpireDutchAuction {
+                    actor_user_id,
+                    auction_id,
+                    now_ms,
+                };
+                let result = core.expire_dutch_auction(actor_user_id, auction_id, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::Auctions { market_id, reply } => {
+                let _ = reply.send(core.dutch_auctions(market_id));
+            }
+            WriterRequest::Auction { auction_id, reply } => {
+                let _ = reply.send(core.dutch_auction(auction_id).cloned());
+            }
             WriterRequest::Baseline {
                 market_filter,
                 depth,
@@ -1027,7 +1172,10 @@ fn recent_trades_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dx_types::{PlaceLimit, PlaceMarket, Side, seed_markets};
+    use dx_types::{
+        AcceptDutchAuction, AuctionStatus, CreateDutchAuction, PlaceLimit, PlaceMarket, Side,
+        seed_markets,
+    };
     use tempfile::tempdir;
 
     const MARKET: MarketId = 1;
@@ -1164,6 +1312,63 @@ mod tests {
         );
         assert_eq!(fills.len(), 1);
         assert_eq!(restored.balance(3, Asset::Cash).available, 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn auctions_round_trip_through_the_writer() {
+        let core = funded_core();
+        let (tx, _rx) = broadcast::channel(16);
+        let (writer, _metrics) = spawn_writer(core, tx, Vec::new(), 8);
+
+        let created = writer
+            .create_auction(
+                2,
+                CreateDutchAuction {
+                    client_order_id: 1,
+                    market_id: MARKET,
+                    qty: 2,
+                    start_price_ticks: 5_000,
+                    floor_price_ticks: 2_500,
+                    duration_ms: 10_000,
+                },
+                1_000,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(created.qty_remaining, 2);
+        assert_eq!(writer.auctions(Some(MARKET)).await.unwrap().len(), 1);
+
+        let accepted = writer
+            .accept_auction(
+                1,
+                AcceptDutchAuction {
+                    client_order_id: 2,
+                    auction_id: created.id,
+                    qty: 2,
+                    max_price_ticks: 5_000,
+                },
+                6_000,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(accepted.price_ticks, 3_750);
+        assert_eq!(accepted.notional, 750_000);
+        assert_eq!(
+            writer.auction(created.id).await.unwrap().unwrap().status,
+            AuctionStatus::Sold
+        );
+        assert_eq!(
+            writer
+                .auctions(None)
+                .await
+                .unwrap()
+                .first()
+                .unwrap()
+                .qty_remaining,
+            0
+        );
     }
 
     #[test]

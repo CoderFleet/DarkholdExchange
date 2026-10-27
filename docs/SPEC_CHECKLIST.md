@@ -17,7 +17,7 @@
 | Server-enforced price collars + holding limits | ✅ | Enforced by the core on every command. The gateway relies on core validation; there is no separate gateway pre-check. |
 | Atomic double-entry ledger with reservations and invariants | ✅ | Ledger, settlement, idempotency, and property tests are in place. |
 | Live L2 ladder, depth chart, trade tape, WS diffs + resync | ✅ | Live market terminal is working, including charts and WebSocket rebuild/resync. |
-| Dutch-auction liquidation engine | ❌ | No auction types, state, command, settlement, gateway route, or UI. |
+| Dutch-auction liquidation engine | ✅ | Seller-backed auctions reserve passes and decay linearly from start to floor. Accept is a compare-and-set at the server-computed price; unsold passes return on expiry. `/auctions` UI and WAL replay are covered. |
 | Frequent batch auctions with commit-reveal | ❌ | Not implemented. |
 | Escrow with signed delivery receipts and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
@@ -51,7 +51,7 @@
 | 7 | WebSocket auth | ❌ | WS accepts `?user_id=` and does not verify a JWT. | Authenticate the upgrade request; reject spoofed identities. |
 | 8 | L2 snapshot + sequenced diffs + gap resync | ✅ | Gateway publisher, worker rebuild, market terminal. | — |
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
-| 10 | Dutch auction | ❌ | Nothing in `crates/types`, core, ledger, gateway, or web. | Implement linear decay, `Accept`, CAS quantity, settlement, expiry/refund, UI. |
+| 10 | Dutch auction | ✅ | `crates/types/src/auction.rs` (integer decay curve), core create/accept/expire with CAS quantity, reserved seller passes, atomic settlement, WAL replay, and the `/auctions` UI. | Optional: background expiry timer and seller cancellation before the deadline. |
 | 11 | Batch auction + commit-reveal | ❌ | Nothing implemented. | Defer until P1 items are complete, unless the submission needs it. |
 | 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered` on a valid receipt, or `Refunded` after the deadline. Ledger hold/release/refund journals and core escrow invariants are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. Refund is triggered manually by either party after the deadline; there is no background timer yet. | Optional T3 timer service to auto-submit refunds. |
 | 13 | ed25519 signed delivery receipts | ✅ | `dx-types` canonical bytes, core seller-key registry, `ed25519-dalek` verification, WAL-logged key registration/release, and browser Web Crypto seller signing. | — |
@@ -92,7 +92,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 |---|---|
 | **T1 — Rudransh** | WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow disputes/arbitration; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; Dutch auction; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -118,6 +118,11 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
   there is no background timer service yet. Disputes/arbitration are out of scope for v1.
 - **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
   core/WAL, but the private key is browser-local and is not a production key-management story.
+- **Dutch auctions expire manually:** after the deadline the seller must call expire to recover
+  unsold passes; there is no background timer and no cancellation before the deadline. Auction
+  fills settle atomically and bypass the escrow receipt flow, even on escrow-enabled markets. The
+  `/auctions` page polls for updates rather than streaming them, and auction fills are not yet
+  added to the order-book tape or `/api/history`; balances and wallet holdings update immediately.
 - **Market 3 is the seeded escrow market:** it starts with an empty book and seeded pass inventory.
   Old WALs from before the market-3 seed change fail their state-hash checkpoint; clear `data/log`
   in development.
@@ -133,18 +138,17 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 1. **Issuer console (T3 — Stuti, with T1 market setup):** admin publishing now creates a live market; add role-checked pass issuance and a supply view so new markets are tradable without dev endpoints.
 2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
 3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
-4. **Dutch auction (T3 — Stuti, with T1 engine hooks):** end-to-end vertical slice.
-5. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-6. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-7. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-8. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
+4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+5. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
+6. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+7. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
 
 The PDF abstract names a Dutch-auction engine, escrow, and a cryptographic proof of solvency. The
-solvency proof and escrow v1 are now real. Dutch auction and batch auction are still missing. Before
-the deadline, either implement them or explicitly mark them as **not delivered** in the final README
-and demo script. Do not let the abstract imply that a running feature exists when it does not.
+Dutch auction, escrow v1, and solvency proof are now real. Batch auction is still missing. Before the
+deadline, either implement it or explicitly mark it as **not delivered** in the final README and demo
+script. Do not let the abstract imply that a running feature exists when it does not.
 
 ## Verification commands
 
