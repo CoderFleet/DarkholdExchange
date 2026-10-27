@@ -265,3 +265,38 @@ changes nothing. To give everybody more passes, run it with the next round, for 
 
 If it stops, it says why: the gateway is not running, the issuer login was refused, a trader
 already exists with another password, or there are no markets yet.
+
+## 8. Rate limits
+
+Every request passes through one layer (`crates/gateway/src/rate.rs`) before any handler. It uses
+token buckets (`crates/limits`): each key has a bucket that holds up to a *burst* of tokens and
+refills at a steady rate per second. A request takes one token; with none left it is refused.
+
+| Bucket | Key | Applies to | Default (burst / per second) |
+|---|---|---|---|
+| IP | source address | every request except health checks | 120 / 60 |
+| Login | source address | `POST /api/auth/login` and `/signup` | 10 / 0.2 (one every 5 s) |
+| User | user id | `POST`/`DELETE` of orders, commands, auctions, escrow, wallet top-up, public key | 30 / 15 |
+
+A refused request gets **429**, `{"reason":"rate_limited"}` and a `Retry-After` header (whole
+seconds). The web app already shows that message. A refused request costs nothing, so waiting the
+stated time always works.
+
+Notes:
+- The user is taken from the validated token (or `x-dev-user` in dev mode). A bad token never
+  touches a user's bucket, so nobody can use up someone else's allowance.
+- `X-Forwarded-For` is ignored unless `DX_TRUST_PROXY=1`. Then only the last entry (added by our own
+  proxy) counts; anything earlier was written by the client.
+- At most 100 000 keys are kept per bucket. Idle ones are dropped; if the table is still full,
+  new keys are refused rather than letting memory grow.
+- Limits live in memory: a restart gives everyone a fresh allowance, and several gateway copies
+  would each count on their own.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DX_RATE_LIMIT` | on | `off` (or `0`) disables all limits. The load test sets it (`DX_LOAD_RATE_LIMIT` overrides) |
+| `DX_RATE_IP` / `DX_RATE_AUTH` / `DX_RATE_USER` | see table | `BURST/PER_SECOND`, for example `30/15` |
+| `DX_TRUST_PROXY` | off | `1` behind a reverse proxy that sets `X-Forwarded-For` |
+
+Not covered here: the WebSocket feeds are limited only by the IP bucket at connection time, and
+adaptive proof-of-work (a harder puzzle for clients that keep hitting the limits) is the next step.

@@ -644,6 +644,7 @@ dependencies = [
  "dx-admin",
  "dx-auth",
  "dx-core",
+ "dx-limits",
  "dx-solvency",
  "dx-store",
  "dx-types",
@@ -656,6 +657,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -667,6 +669,10 @@ dependencies = [
  "serde",
  "thiserror",
 ]
+
+[[package]]
+name = "dx-limits"
+version = "0.1.0"
 
 [[package]]
 name = "dx-simulator"

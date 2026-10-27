@@ -39,7 +39,16 @@ if (!whole(CASH_RUPEES, 0, 100_000)) fail('DX_SEED_CASH must be a whole number o
 if (!whole(ROUND, 1, 1_000_000)) fail('DX_SEED_ROUND must be a whole number from 1 up.')
 
 /** Sends one request. Returns { status, body }. Stops the script if the gateway cannot be reached. */
-async function call(path, { method = 'GET', token, body } = {}) {
+async function call(path, options = {}) {
+  // The gateway rate-limits; if it says "wait N seconds" the script waits and tries again.
+  for (let attempt = 0; ; attempt += 1) {
+    const answer = await send(path, options)
+    if (answer.status !== 429 || attempt >= 5) return answer
+    await new Promise((resolve) => setTimeout(resolve, Math.max(1, answer.retryAfter) * 1000))
+  }
+}
+
+async function send(path, { method = 'GET', token, body } = {}) {
   const headers = {}
   if (body !== undefined) headers['content-type'] = 'application/json'
   if (token) headers.authorization = `Bearer ${token}`
@@ -60,7 +69,8 @@ async function call(path, { method = 'GET', token, body } = {}) {
   } catch {
     // Not JSON: keep null, the status is enough.
   }
-  return { status: response.status, body: parsed }
+  const retryAfter = Number(response.headers.get('retry-after')) || 1
+  return { status: response.status, body: parsed, retryAfter }
 }
 
 /** Fails with a readable line unless the answer was a success. */

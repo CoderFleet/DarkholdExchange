@@ -8,6 +8,7 @@ axum = { version = "0.8.9", features = ["ws"] }
 dx-admin = { version = "0.1.0", path = "../admin" }
 dx-auth = { version = "0.1.0", path = "../auth" }
 dx-core = { version = "0.1.0", path = "../core" }
+dx-limits = { version = "0.1.0", path = "../limits" }
 dx-solvency = { version = "0.1.0", path = "../solvency" }
 dx-store = { version = "0.1.0", path = "../store" }
 dx-types = { version = "0.1.0", path = "../types" }
@@ -23,3 +24,4 @@ tokio = { version = "1.54.0", features = ["full"] }
 [dev-dependencies]
 ed25519-dalek = "2"
 tempfile = "3.27"
+tower = { version = "0.5", features = ["util"] }

@@ -5,9 +5,11 @@
 //! comes from the login token (`Authorization: Bearer`, docs/AUTH.md). While `DX_DEV_AUTH` is on
 //! (the default locally), requests without a token may still use `x-dev-user` (default user 1).
 
+mod rate;
 mod wal;
 mod writer;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -287,6 +289,7 @@ async fn main() {
         auth: auth.clone(),
     };
 
+    let rate_state = rate::RateState::new(rate::RateLimits::from_env(), auth.clone());
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/health", get(health))
@@ -325,13 +328,24 @@ async fn main() {
         .route("/ws/market/{market_id}", get(ws_market))
         .with_state(state)
         .merge(dx_auth::router(auth.clone()))
-        .merge(dx_admin::router(admin, auth));
+        .merge(dx_admin::router(admin, auth))
+        // Last, so it wraps every route above: rate limits (src/rate.rs, docs/AUTH.md section 8).
+        .layer(axum::middleware::from_fn_with_state(
+            rate_state,
+            rate::limit,
+        ));
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("bind gateway");
     println!("Darkhold Exchange gateway listening on {addr}");
-    axum::serve(listener, app).await.expect("gateway server");
+    // `ConnectInfo` hands the rate limiter each request's source address.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await
+    .expect("gateway server");
 }
 
 fn queue_capacity() -> usize {
