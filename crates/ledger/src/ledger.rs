@@ -23,6 +23,8 @@ pub struct TradeSettlement {
     /// Platform fee, paid by exactly one side.
     pub fee: Minor,
     pub fee_payer: UserId,
+    /// When true, funds enter escrow rather than settling immediately.
+    pub escrow: bool,
 }
 
 pub struct Ledger {
@@ -246,6 +248,8 @@ impl Ledger {
 
     /// Settle one fill atomically. The buyer's cash and seller's passes must already
     /// be reserved; this entry moves them to the counterparties and pays the fee.
+    /// Returns the journal id. If `settlement.escrow` is true, funds are routed
+    /// to the escrow account instead of settling immediately.
     pub fn settle_trade(&mut self, settlement: TradeSettlement) -> Result<u64, LedgerError> {
         let (buyer_cash, seller_cash, qty) = Self::trade_amounts(&settlement)?;
 
@@ -253,36 +257,65 @@ impl Ledger {
         let pass = Asset::Pass {
             market_id: settlement.market_id,
         };
-        let mut postings = Vec::with_capacity(5);
-        postings.push(Posting::new(
-            AccountKey::user(settlement.buyer_id, cash),
-            Bucket::Held,
-            -buyer_cash,
-        ));
-        postings.push(Posting::new(
-            AccountKey::user(settlement.seller_id, cash),
-            Bucket::Available,
-            seller_cash,
-        ));
-        if settlement.fee > 0 {
-            postings.push(Posting::new(
-                AccountKey::system(Owner::Fees, cash),
-                Bucket::Available,
-                settlement.fee,
-            ));
-        }
-        postings.push(Posting::new(
-            AccountKey::user(settlement.seller_id, pass),
-            Bucket::Held,
-            -qty,
-        ));
-        postings.push(Posting::new(
-            AccountKey::user(settlement.buyer_id, pass),
-            Bucket::Available,
-            qty,
-        ));
 
-        self.post(JournalKey::Trade(settlement.trade_id), postings)
+        if settlement.escrow {
+            // Escrow path: buyer cash → escrow account; seller passes → buyer held
+            let postings = vec![
+                Posting::new(
+                    AccountKey::user(settlement.buyer_id, cash),
+                    Bucket::Held,
+                    -buyer_cash,
+                ),
+                Posting::new(
+                    AccountKey::system(Owner::Escrow, cash),
+                    Bucket::Available,
+                    buyer_cash,
+                ),
+                Posting::new(
+                    AccountKey::user(settlement.seller_id, pass),
+                    Bucket::Held,
+                    -qty,
+                ),
+                // Pass goes to buyer as held (not tradable until escrow resolves)
+                Posting::new(
+                    AccountKey::user(settlement.buyer_id, pass),
+                    Bucket::Held,
+                    qty,
+                ),
+            ];
+            self.post(JournalKey::Trade(settlement.trade_id), postings)
+        } else {
+            // Spot path: immediate settlement
+            let mut postings = Vec::with_capacity(5);
+            postings.push(Posting::new(
+                AccountKey::user(settlement.buyer_id, cash),
+                Bucket::Held,
+                -buyer_cash,
+            ));
+            postings.push(Posting::new(
+                AccountKey::user(settlement.seller_id, cash),
+                Bucket::Available,
+                seller_cash,
+            ));
+            if settlement.fee > 0 {
+                postings.push(Posting::new(
+                    AccountKey::system(Owner::Fees, cash),
+                    Bucket::Available,
+                    settlement.fee,
+                ));
+            }
+            postings.push(Posting::new(
+                AccountKey::user(settlement.seller_id, pass),
+                Bucket::Held,
+                -qty,
+            ));
+            postings.push(Posting::new(
+                AccountKey::user(settlement.buyer_id, pass),
+                Bucket::Available,
+                qty,
+            ));
+            self.post(JournalKey::Trade(settlement.trade_id), postings)
+        }
     }
 
     /// Move a fill's cash and passes into the shared escrow accounts. The buyer's cash

@@ -14,6 +14,7 @@ fn place_limit_matches_fixture() {
         side: Side::Buy,
         price_ticks: 100,
         qty: 1,
+        escrow: false,
     });
     assert_eq!(
         serde_json::to_value(&m).unwrap(),

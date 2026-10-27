@@ -369,3 +369,68 @@ export const marketWebsocketUrl = (userId, marketId) => {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws'
   return `${protocol}://${window.location.host}/ws/market/${marketId}?user_id=${userId}`
 }
+
+/**
+ * @param {string} [state]
+ * @returns {Promise<any[]>}
+ */
+export const getEscrows = (state) => {
+  const qs = state ? `?state=${encodeURIComponent(state)}` : ''
+  return request(`/api/escrow${qs}`)
+}
+
+/**
+ * @param {number} id
+ * @returns {Promise<any>}
+ */
+export const getEscrowById = (id) => request(`/api/escrow/${id}`)
+
+/**
+ * @param {number} id
+ * @returns {Promise<any>}
+ */
+export const acceptEscrow = (id) =>
+  request(`/api/escrow/${id}/accept`, {
+    method: 'POST',
+  })
+
+/**
+ * @param {number} id
+ * @param {string} reason
+ * @param {string} note
+ * @returns {Promise<any>}
+ */
+export const rejectEscrow = (id, reason, note) =>
+  request(`/api/escrow/${id}/reject`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ reason, note }),
+  })
+
+/**
+ * @param {number} id
+ * @returns {Promise<{ valid: boolean }>}
+ */
+export const verifyEscrowReceipt = (id) =>
+  request(`/api/escrow/${id}/verify`, {
+    method: 'POST',
+  })
+
+/**
+ * @returns {Promise<any[]>}
+ */
+export const getAdminDisputes = () => request('/api/admin/disputes')
+
+/**
+ * @param {number} id
+ * @param {'buyer' | 'seller'} ruling
+ * @param {string} note
+ * @returns {Promise<any>}
+ */
+export const ruleAdminDispute = (id, ruling, note) =>
+  request(`/api/admin/disputes/${id}/rule`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ruling, note }),
+  })
+

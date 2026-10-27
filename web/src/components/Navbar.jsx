@@ -25,7 +25,12 @@ export function Navbar() {
         <NavLink to="/auctions">Auctions</NavLink>
         <NavLink to="/speed">Speed</NavLink>
         <NavLink to="/verify">Verify</NavLink>
-        {user?.role === 'admin' && <NavLink to="/admin">Admin</NavLink>}
+        {user?.role === 'admin' && (
+          <>
+            <NavLink to="/admin">Admin</NavLink>
+            <NavLink to="/admin/disputes">Disputes</NavLink>
+          </>
+        )}
         {user?.role === 'issuer' && <NavLink to="/issuer">Issuer</NavLink>}
       </nav>
       <div className="shell-user">

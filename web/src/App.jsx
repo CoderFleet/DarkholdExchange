@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import {
   nextClientOrderId,
   placeLimit,
@@ -591,6 +592,7 @@ function BookRow({ market, level, maxQty, side }) {
 }
 
 function TradeTape({ market, trades }) {
+  const navigate = useNavigate()
   const visible = trades.slice(-40).reverse()
 
   return (
@@ -607,8 +609,15 @@ function TradeTape({ market, trades }) {
         )}
         {visible.map((fill) => {
           const takerSide = fill.maker_side === 'Buy' ? 'Sell' : 'Buy'
+          const isEscrow = fill.escrow_id != null
           return (
-            <div className="tape-row" key={fill.trade_id}>
+            <div
+              className={`tape-row${isEscrow ? ' escrow' : ''}`}
+              key={fill.trade_id}
+              style={isEscrow ? { cursor: 'pointer' } : {}}
+              onClick={isEscrow ? () => navigate(`/trade/${fill.escrow_id}`) : undefined}
+              title={isEscrow ? `Escrow #${fill.escrow_id} — click to inspect` : undefined}
+            >
               <span
                 className={
                   takerSide === 'Buy' ? 'positive' : 'negative'
@@ -620,6 +629,20 @@ function TradeTape({ market, trades }) {
               <span className={`side-tag ${takerSide.toLowerCase()}`}>
                 {takerSide}
               </span>
+              {isEscrow && (
+                <span
+                  style={{
+                    fontSize: '0.65rem',
+                    background: '#78350f',
+                    color: '#fef3c7',
+                    borderRadius: '3px',
+                    padding: '1px 4px',
+                    marginLeft: '4px',
+                  }}
+                >
+                  ESC
+                </span>
+              )}
             </div>
           )
         })}
@@ -687,6 +710,7 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
   const [orderType, setOrderType] = useState('limit')
   const [price, setPrice] = useState(String(initialPrice))
   const [qty, setQty] = useState('1')
+  const [useEscrow, setUseEscrow] = useState(false)
 
   const priceTicks = Number(price)
   const quantity = Number(qty)
@@ -707,9 +731,13 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
   const qtyInvalid = !Number.isInteger(quantity) || quantity < 1
   const disabled = submitting || priceInvalid || qtyInvalid
 
+  // Escrow is only available when the market has it enabled and taker is buying
+  const escrowAvailable = market.escrow_enabled && side === Side.Buy
+
   const handleSubmit = async (event) => {
     event.preventDefault()
     if (disabled) return
+    const escrow = escrowAvailable && useEscrow
     const command =
       orderType === 'limit'
         ? placeLimit({
@@ -718,6 +746,7 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
             side,
             priceTicks,
             qty: quantity,
+            escrow,
           })
         : placeMarket({
             clientOrderId: nextClientOrderId(),
@@ -725,6 +754,7 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
             side,
             qty: quantity,
             protectPriceTicks: protectTicks,
+            escrow,
           })
     const response = await onSubmit(command)
     if (response && response.status !== 'Rejected') setQty('1')
@@ -812,6 +842,23 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
           />
         </label>
 
+        {escrowAvailable && (
+          <label
+            className="field"
+            style={{ flexDirection: 'row', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}
+          >
+            <input
+              type="checkbox"
+              checked={useEscrow}
+              onChange={(e) => setUseEscrow(e.target.checked)}
+              style={{ width: 'auto', accentColor: '#f59e0b' }}
+            />
+            <span style={{ fontSize: '0.85rem' }}>
+              Escrow <em style={{ color: '#9ca3af' }}>— hold funds until you accept the pass</em>
+            </span>
+          </label>
+        )}
+
         <div className="estimate">
           <div>
             <span>{orderType === 'market' ? 'Max notional' : 'Notional'}</span>
@@ -836,7 +883,7 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
             ? 'Submitting…'
             : `${side} ${formatQty(quantity || 0)} ${
                 quantity === 1 ? 'pass' : 'passes'
-              }`}
+              }${escrowAvailable && useEscrow ? ' (Escrow)' : ''}`}
         </button>
         <p className="fine-print">
           Maker fills pay no fee. Taker fee is charged on matched quantity.

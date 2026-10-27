@@ -5,8 +5,10 @@ edition = "2024"
 
 [dependencies]
 dx-types = { version = "0.1.0", path = "../types" }
+dkx-escrow = { version = "0.1.0", path = "../dkx-escrow" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
+ed25519-dalek = "2.2.0"
 
 [dev-dependencies]
 proptest = "1.12.0"

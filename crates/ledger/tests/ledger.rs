@@ -94,6 +94,7 @@ fn settle_trade_moves_cash_and_passes_and_pays_buyer_fee() {
             notional: 5_000,
             fee: 50,
             fee_payer: 1,
+            escrow: false,
         })
         .unwrap();
 
@@ -232,6 +233,7 @@ fn settle_trade_can_charge_the_seller() {
             notional: 5_000,
             fee: 50,
             fee_payer: 2,
+            escrow: false,
         })
         .unwrap();
 
@@ -260,6 +262,7 @@ fn settlement_without_reservation_is_rejected_atomically() {
             notional: 5_000,
             fee: 0,
             fee_payer: 1,
+            escrow: false,
         })
         .unwrap_err();
     assert!(matches!(err, LedgerError::InsufficientHeld { .. }));
@@ -289,6 +292,7 @@ fn duplicate_trade_settlement_is_idempotent() {
         notional: 5_000,
         fee: 0,
         fee_payer: 1,
+        escrow: false,
     };
     let first = ledger.settle_trade(settlement).unwrap();
     let second = ledger.settle_trade(settlement).unwrap();

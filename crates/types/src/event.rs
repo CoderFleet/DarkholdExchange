@@ -18,4 +18,7 @@ pub struct Fill {
     pub price_ticks: Ticks,
     pub qty: Qty,
     pub seq: Seq,
+    /// Set when the fill was settled into escrow; absent for spot fills.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escrow_id: Option<u64>,
 }

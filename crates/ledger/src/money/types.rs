@@ -50,6 +50,8 @@ pub enum EntryKind {
     ReservePass,
     Release,
     Fill,
+    EscrowRelease,
+    EscrowRefund,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

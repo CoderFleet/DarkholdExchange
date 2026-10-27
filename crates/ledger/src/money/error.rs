@@ -36,6 +36,15 @@ pub enum LedgerError {
     #[error("escrow mode is not ready until Stage 6")]
     EscrowNotReady,
 
+    #[error("escrow not found: {id}")]
+    EscrowNotFound { id: u64 },
+
+    #[error("invalid escrow state transition: escrow {id} in state {current}")]
+    InvalidEscrowState { id: u64, current: String },
+
+    #[error("unauthorized action on escrow {id}")]
+    UnauthorizedEscrowAction { id: u64 },
+
     #[error("amount must be positive: {amount}")]
     NonPositiveAmount { amount: i64 },
 
@@ -65,5 +74,14 @@ pub enum Violation {
         account: Account,
         account_locked: i64,
         sum_reservations: i64,
+    },
+    EscrowCashMismatch {
+        account_balance: i64,
+        open_escrows_total: i64,
+    },
+    PassHeldMismatch {
+        account: Account,
+        account_held: i64,
+        open_escrows_qty: i64,
     },
 }

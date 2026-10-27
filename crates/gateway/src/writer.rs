@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wal::{WalOp, WalSession};
+use dkx_escrow::{AdminRuling, DisputeRecord, EscrowRecord};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
@@ -268,6 +269,43 @@ enum WriterRequest {
         market_filter: Option<Vec<MarketId>>,
         depth: usize,
         reply: oneshot::Sender<StreamBaseline>,
+    },
+    // ── Escrow operations ──────────────────────────────────────────────────
+    AllEscrows {
+        reply: oneshot::Sender<Vec<EscrowRecord>>,
+    },
+    GetEscrow {
+        id: u64,
+        reply: oneshot::Sender<Option<EscrowRecord>>,
+    },
+    EscrowAccept {
+        user_id: UserId,
+        id: u64,
+        reply: oneshot::Sender<Result<(), ReasonCode>>,
+    },
+    EscrowReject {
+        user_id: UserId,
+        id: u64,
+        reason: String,
+        note: String,
+        reply: oneshot::Sender<Result<(), ReasonCode>>,
+    },
+    EscrowVerify {
+        id: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    AllDisputes {
+        reply: oneshot::Sender<Vec<DisputeRecord>>,
+    },
+    AdminRule {
+        admin_id: UserId,
+        id: u64,
+        ruling: AdminRuling,
+        note: String,
+        reply: oneshot::Sender<Result<(), ReasonCode>>,
+    },
+    EscrowPublicKey {
+        reply: oneshot::Sender<String>,
     },
 }
 
@@ -544,6 +582,76 @@ impl WriterHandle {
         .await
     }
 
+    // ── Escrow handle methods ──────────────────────────────────────────────
+
+    pub(crate) async fn all_escrows(&self) -> Result<Vec<EscrowRecord>, WriterError> {
+        self.request(|reply| WriterRequest::AllEscrows { reply })
+            .await
+    }
+
+    pub(crate) async fn get_escrow(&self, id: u64) -> Result<Option<EscrowRecord>, WriterError> {
+        self.request(|reply| WriterRequest::GetEscrow { id, reply })
+            .await
+    }
+
+    pub(crate) async fn escrow_accept(
+        &self,
+        user_id: UserId,
+        id: u64,
+    ) -> Result<Result<(), ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::EscrowAccept { user_id, id, reply })
+            .await
+    }
+
+    pub(crate) async fn escrow_reject(
+        &self,
+        user_id: UserId,
+        id: u64,
+        reason: String,
+        note: String,
+    ) -> Result<Result<(), ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::EscrowReject {
+            user_id,
+            id,
+            reason,
+            note,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn escrow_verify(&self, id: u64) -> Result<bool, WriterError> {
+        self.request(|reply| WriterRequest::EscrowVerify { id, reply })
+            .await
+    }
+
+    pub(crate) async fn all_disputes(&self) -> Result<Vec<DisputeRecord>, WriterError> {
+        self.request(|reply| WriterRequest::AllDisputes { reply })
+            .await
+    }
+
+    pub(crate) async fn admin_rule(
+        &self,
+        admin_id: UserId,
+        id: u64,
+        ruling: AdminRuling,
+        note: String,
+    ) -> Result<Result<(), ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::AdminRule {
+            admin_id,
+            id,
+            ruling,
+            note,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn escrow_public_key(&self) -> Result<String, WriterError> {
+        self.request(|reply| WriterRequest::EscrowPublicKey { reply })
+            .await
+    }
+
     async fn request<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<T>) -> WriterRequest,
@@ -802,6 +910,9 @@ fn writer_loop(
 ) {
     let mut snapshot_cache = SnapshotCache::default();
     let mut stashed_job: Option<WriterJob> = None;
+
+    // Escrow state: in-memory store populated from fills and driven by commands.
+    let mut escrow_store = EscrowStore::new();
     loop {
         let job = if let Some(job) = stashed_job.take() {
             job
@@ -838,6 +949,12 @@ fn writer_loop(
                     now_ms,
                     reply,
                 );
+                // Populate escrow store from any newly escrowed fills
+                for fill in recent_trades.iter().rev().take(32) {
+                    if let Some(eid) = fill.escrow_id {
+                        escrow_store.maybe_create_from_fill(fill, eid);
+                    }
+                }
                 if disconnected {
                     break;
                 }
@@ -1114,7 +1231,231 @@ fn writer_loop(
                     recent_trades,
                 });
             }
+            WriterRequest::AllEscrows { reply } => {
+                let _ = reply.send(escrow_store.all());
+            }
+            WriterRequest::GetEscrow { id, reply } => {
+                let _ = reply.send(escrow_store.get(id));
+            }
+            WriterRequest::EscrowAccept { user_id, id, reply } => {
+                let result = escrow_store.accept(user_id, id);
+                let _ = reply.send(result);
+            }
+            WriterRequest::EscrowReject {
+                user_id,
+                id,
+                reason,
+                note,
+                reply,
+            } => {
+                let result = escrow_store.reject(user_id, id, reason, note);
+                let _ = reply.send(result);
+            }
+            WriterRequest::EscrowVerify { id, reply } => {
+                let valid = escrow_store.verify(id);
+                let _ = reply.send(valid);
+            }
+            WriterRequest::AllDisputes { reply } => {
+                let _ = reply.send(escrow_store.all_disputes());
+            }
+            WriterRequest::AdminRule {
+                admin_id,
+                id,
+                ruling,
+                note,
+                reply,
+            } => {
+                let result = escrow_store.admin_rule(admin_id, id, ruling, note);
+                let _ = reply.send(result);
+            }
+            WriterRequest::EscrowPublicKey { reply } => {
+                let _ = reply.send(escrow_store.public_key_hex());
+            }
         }
+    }
+}
+
+// ─── Escrow in-memory store ──────────────────────────────────────────────────
+
+struct EscrowStore {
+    escrows: std::collections::HashMap<u64, dkx_escrow::EscrowRecord>,
+    disputes: std::collections::HashMap<u64, dkx_escrow::DisputeRecord>,
+    next_dispute_id: u64,
+    signing_key: Option<ed25519_dalek::SigningKey>,
+    verifying_key: Option<ed25519_dalek::VerifyingKey>,
+    inspection_secs: u64,
+}
+
+impl EscrowStore {
+    fn new() -> Self {
+        let signing_key = dkx_escrow::load_signing_key_from_env().ok();
+        let verifying_key = signing_key.as_ref().map(|sk| sk.verifying_key());
+        let inspection_secs = dkx_escrow::parse_inspection_secs_from_env().unwrap_or(300);
+        Self {
+            escrows: std::collections::HashMap::new(),
+            disputes: std::collections::HashMap::new(),
+            next_dispute_id: 1,
+            signing_key,
+            verifying_key,
+            inspection_secs,
+        }
+    }
+
+    fn public_key_hex(&self) -> String {
+        self.verifying_key
+            .as_ref()
+            .map(|vk| hex::encode(vk.to_bytes()))
+            .unwrap_or_default()
+    }
+
+    fn maybe_create_from_fill(&mut self, fill: &Fill, escrow_id: u64) {
+        if self.escrows.contains_key(&escrow_id) {
+            return;
+        }
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let delivered_at = now_micros;
+        let deadline = delivered_at.saturating_add(self.inspection_secs.saturating_mul(1_000_000));
+        let (buyer_id, seller_id) = if fill.maker_side == dx_types::Side::Sell {
+            (fill.taker_user_id, fill.maker_user_id)
+        } else {
+            (fill.maker_user_id, fill.taker_user_id)
+        };
+        let price_minor = fill.price_ticks as i64;
+        let receipt_bytes = dkx_escrow::build_receipt_bytes(
+            escrow_id,
+            fill.trade_id,
+            fill.market_id,
+            buyer_id,
+            seller_id,
+            fill.qty as u32,
+            price_minor,
+            delivered_at,
+        );
+        let receipt_sig = self
+            .signing_key
+            .as_ref()
+            .map(|sk| dkx_escrow::sign_receipt(sk, &receipt_bytes))
+            .unwrap_or_default();
+        self.escrows.insert(
+            escrow_id,
+            dkx_escrow::EscrowRecord {
+                id: escrow_id,
+                trade_id: fill.trade_id,
+                market_id: fill.market_id,
+                buyer_id,
+                seller_id,
+                qty: fill.qty as u32,
+                price: price_minor,
+                fee: 0,
+                state: dkx_escrow::EscrowState::Delivered,
+                delivered_at,
+                deadline,
+                receipt_bytes,
+                receipt_sig,
+                updated_seq: fill.seq,
+            },
+        );
+    }
+
+    fn all(&self) -> Vec<dkx_escrow::EscrowRecord> {
+        self.escrows.values().cloned().collect()
+    }
+    fn get(&self, id: u64) -> Option<dkx_escrow::EscrowRecord> {
+        self.escrows.get(&id).cloned()
+    }
+
+    fn accept(&mut self, user_id: UserId, id: u64) -> Result<(), ReasonCode> {
+        let e = self.escrows.get_mut(&id).ok_or(ReasonCode::OrderNotFound)?;
+        if e.buyer_id != user_id {
+            return Err(ReasonCode::NotOrderOwner);
+        }
+        if e.state != dkx_escrow::EscrowState::Delivered {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        e.state = dkx_escrow::EscrowState::Released;
+        Ok(())
+    }
+
+    fn reject(
+        &mut self,
+        user_id: UserId,
+        id: u64,
+        reason: String,
+        note: String,
+    ) -> Result<(), ReasonCode> {
+        let e = self.escrows.get_mut(&id).ok_or(ReasonCode::OrderNotFound)?;
+        if e.buyer_id != user_id {
+            return Err(ReasonCode::NotOrderOwner);
+        }
+        if e.state != dkx_escrow::EscrowState::Delivered {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        e.state = dkx_escrow::EscrowState::Disputed;
+        let did = self.next_dispute_id;
+        self.next_dispute_id += 1;
+        self.disputes.insert(
+            id,
+            dkx_escrow::DisputeRecord {
+                id: did,
+                escrow_id: id,
+                reason,
+                note,
+                status: "open".into(),
+                ruling: None,
+                ruled_by: None,
+                ruled_at: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn verify(&self, id: u64) -> bool {
+        let Some(e) = self.escrows.get(&id) else {
+            return false;
+        };
+        let Some(vk) = &self.verifying_key else {
+            return !e.receipt_sig.is_empty();
+        };
+        dkx_escrow::verify_receipt(vk, &e.receipt_bytes, &e.receipt_sig).unwrap_or(false)
+    }
+
+    fn all_disputes(&self) -> Vec<dkx_escrow::DisputeRecord> {
+        self.disputes.values().cloned().collect()
+    }
+
+    fn admin_rule(
+        &mut self,
+        admin_id: UserId,
+        id: u64,
+        ruling: dkx_escrow::AdminRuling,
+        note: String,
+    ) -> Result<(), ReasonCode> {
+        let e = self.escrows.get_mut(&id).ok_or(ReasonCode::OrderNotFound)?;
+        if e.state != dkx_escrow::EscrowState::Disputed {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+        e.state = match ruling {
+            dkx_escrow::AdminRuling::Buyer => dkx_escrow::EscrowState::Refunded,
+            dkx_escrow::AdminRuling::Seller => dkx_escrow::EscrowState::Released,
+        };
+        if let Some(d) = self.disputes.get_mut(&id) {
+            d.status = "resolved".into();
+            d.ruling = Some(ruling);
+            d.ruled_by = Some(admin_id);
+            d.ruled_at = Some(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|t| t.as_micros() as u64)
+                    .unwrap_or(0),
+            );
+            if !note.is_empty() {
+                d.note = format!("{}\nAdmin: {}", d.note, note);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1243,6 +1584,7 @@ mod tests {
                     side: Side::Sell,
                     price_ticks: 5_000,
                     qty: 2,
+                    escrow: false,
                 }),
             )
             .await
@@ -1279,6 +1621,7 @@ mod tests {
                     side: Side::Sell,
                     price_ticks: 5_000,
                     qty: 2,
+                    escrow: false,
                 }),
             )
             .await
@@ -1292,6 +1635,7 @@ mod tests {
                     side: Side::Buy,
                     qty: 2,
                     protect_price_ticks: 5_000,
+                    escrow: false,
                 }),
             )
             .await
@@ -1429,6 +1773,7 @@ mod tests {
                 side: Side::Sell,
                 price_ticks: 5_000,
                 qty: 2,
+                escrow: false,
             }),
         );
         assert_eq!(response.status, OrderStatus::Rested);
@@ -1455,6 +1800,7 @@ mod tests {
                 side: Side::Sell,
                 price_ticks: 5_000,
                 qty: 1,
+                escrow: false,
             }),
         );
         assert_eq!(ask.status, OrderStatus::Rested);
@@ -1469,6 +1815,7 @@ mod tests {
                 side: Side::Buy,
                 qty: 1,
                 protect_price_ticks: 5_000,
+                escrow: false,
             }),
         );
         assert_eq!(buy.status, OrderStatus::Filled);

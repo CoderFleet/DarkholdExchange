@@ -946,6 +946,7 @@ async fn send_limit(
         side,
         price_ticks,
         qty,
+        escrow: false,
     });
     let outcome = match http
         .post(format!("{}/api/orders", config.base_url))

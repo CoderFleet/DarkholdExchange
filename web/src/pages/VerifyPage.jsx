@@ -56,6 +56,18 @@ export function VerifyPage() {
   const [checks, setChecks] = useState([])
   const [status, setStatus] = useState('loading')
   const [error, setError] = useState(null)
+  const [signingKey, setSigningKey] = useState('')
+
+  useEffect(() => {
+    fetch('/api/escrow/public-key')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((body) => {
+        if (body?.public_key_hex) {
+          setSigningKey(body.public_key_hex)
+        }
+      })
+      .catch(() => {})
+  }, [])
 
   const load = useCallback(async () => {
     setStatus('loading')
@@ -111,6 +123,18 @@ export function VerifyPage() {
         as the Rust core. It proves inclusion in the published liabilities, not that reserves are
         backed by real funds.
       </p>
+
+      {signingKey && (
+        <div className="panel verify-card" style={{ marginBottom: '1.5rem' }}>
+          <div className="panel-header">
+            <h3>Platform Escrow Signing Key</h3>
+            <span className="panel-meta">Ed25519 Public Key for Trade Receipts</span>
+          </div>
+          <p className="mono" style={{ wordBreak: 'break-all', padding: '0.75rem 0' }}>
+            {signingKey}
+          </p>
+        </div>
+      )}
 
       {error && (
         <div className="banner error" role="alert">

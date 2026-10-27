@@ -312,7 +312,7 @@ impl Core {
         };
 
         let (fills, taker_cash_spent) =
-            match self.settle_fills(seq, user_id, place.side, &market, &outcome) {
+            match self.settle_fills(seq, user_id, place.side, &market, &outcome, place.escrow) {
                 Ok(result) => result,
                 Err(code) => return CommandResponse::rejected(seq, code),
             };
@@ -459,7 +459,7 @@ impl Core {
         };
 
         let (fills, taker_cash_spent) =
-            match self.settle_fills(seq, user_id, place.side, &market, &outcome) {
+            match self.settle_fills(seq, user_id, place.side, &market, &outcome, place.escrow) {
                 Ok(result) => result,
                 Err(code) => return CommandResponse::rejected(seq, code),
             };
@@ -599,6 +599,7 @@ impl Core {
         taker_side: Side,
         market: &MarketConfig,
         outcome: &PlaceOutcome,
+        escrow_requested: bool,
     ) -> Result<(Vec<Fill>, Minor), ReasonCode> {
         let mut fills = Vec::with_capacity(outcome.fills.len());
         let mut taker_cash_spent: Minor = 0;
@@ -613,6 +614,8 @@ impl Core {
                 return Err(ReasonCode::InternalError);
             };
             let fee = market.taker_fee_minor(notional);
+            // Escrow only applies when the market supports it AND the taker requested it
+            let use_escrow = escrow_requested && market.escrow_enabled;
             let settlement = TradeSettlement {
                 trade_id: fill.trade_id,
                 market_id: market.id,
@@ -622,6 +625,7 @@ impl Core {
                 notional,
                 fee,
                 fee_payer: taker_user,
+                escrow: use_escrow,
             };
             if market.escrow_enabled {
                 let Some(seller_public_key) = self.public_keys.get(&seller_id).copied() else {
@@ -680,6 +684,11 @@ impl Core {
                 price_ticks: fill.price_ticks,
                 qty: fill.qty,
                 seq,
+                escrow_id: if use_escrow {
+                    Some(fill.trade_id)
+                } else {
+                    None
+                },
             });
         }
 

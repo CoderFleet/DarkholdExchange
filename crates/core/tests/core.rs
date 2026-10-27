@@ -75,6 +75,7 @@ fn limit(client_order_id: u64, side: Side, price_ticks: Ticks, qty: Qty) -> Comm
         side,
         price_ticks,
         qty,
+        escrow: false,
     })
 }
 
@@ -111,6 +112,7 @@ fn market_order(client_order_id: u64, side: Side, qty: Qty, protect: Ticks) -> C
         side,
         qty,
         protect_price_ticks: protect,
+        escrow: false,
     })
 }
 
@@ -341,6 +343,7 @@ fn collar_quantity_and_market_are_validated() {
             side: Side::Buy,
             price_ticks: PRICE,
             qty: 1,
+            escrow: false,
         }),
     );
     assert_rejected(&unknown, ReasonCode::UnknownMarket);
@@ -454,6 +457,7 @@ fn runtime_market_is_tradable_and_consumes_a_sequence() {
             side: Side::Sell,
             price_ticks: PRICE,
             qty: 2,
+            escrow: false,
         }),
     );
     assert_eq!(ask.status, OrderStatus::Rested);
@@ -466,6 +470,7 @@ fn runtime_market_is_tradable_and_consumes_a_sequence() {
             side: Side::Buy,
             qty: 2,
             protect_price_ticks: PRICE,
+            escrow: false,
         }),
     );
     assert_eq!(buy.status, OrderStatus::Filled);

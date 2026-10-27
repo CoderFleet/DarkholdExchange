@@ -1,9 +1,11 @@
+#![allow(clippy::type_complexity)]
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     routing::{get, post},
 };
+use dkx_escrow::{load_signing_key_from_env, verify_receipt};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -144,6 +146,17 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/api/history", get(get_history))
         .route("/api/statements", get(get_statements))
         .route("/api/ledger", get(get_ledger))
+        .route("/api/escrow", get(get_escrows))
+        .route("/api/escrow/{id}", get(get_escrow_by_id))
+        .route("/api/escrow/{id}/accept", post(post_escrow_accept))
+        .route("/api/escrow/{id}/reject", post(post_escrow_reject))
+        .route("/api/escrow/{id}/verify", post(post_escrow_verify))
+        .route("/api/escrow/public-key", get(get_escrow_public_key))
+        .route("/api/admin/disputes", get(get_admin_disputes))
+        .route(
+            "/api/admin/disputes/{id}/rule",
+            post(post_admin_dispute_rule),
+        )
         .with_state(state)
 }
 
@@ -463,6 +476,643 @@ async fn get_ledger(
     };
 
     Ok(Json(LedgerResponse { items, next_cursor }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct EscrowListQuery {
+    pub state: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReceiptView {
+    pub bytes_hex: String,
+    pub signature_hex: String,
+    pub public_key_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DisputeView {
+    pub id: i64,
+    pub reason: String,
+    pub note: String,
+    pub status: String,
+    pub ruling: Option<String>,
+    pub ruled_by: Option<i64>,
+    pub ruled_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EscrowDetailResponse {
+    pub id: i64,
+    pub trade_id: i64,
+    pub market_id: i32,
+    pub buyer_id: i64,
+    pub seller_id: i64,
+    pub role: String,
+    pub qty: i32,
+    pub price: i64,
+    pub fee: i64,
+    pub state: String,
+    pub delivered_at: i64,
+    pub deadline: i64,
+    pub receipt: ReceiptView,
+    pub dispute: Option<DisputeView>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RejectEscrowPayload {
+    pub reason: String,
+    pub note: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AdminRulePayload {
+    pub ruling: String, // "buyer" | "seller"
+    pub note: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VerifyResponse {
+    pub valid: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PublicKeyResponse {
+    pub public_key_hex: String,
+}
+
+async fn get_escrows(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+    Query(query): Query<EscrowListQuery>,
+) -> Result<Json<Vec<EscrowDetailResponse>>, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let rows: Vec<(
+        i64,
+        i64,
+        i32,
+        i64,
+        i64,
+        i32,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+    )> = if let Some(ref st) = query.state {
+        sqlx::query_as(
+            r#"
+            SELECT id, trade_id, market_id, buyer_id, seller_id, qty, price, fee, state, delivered_at, deadline, receipt_bytes, receipt_sig
+            FROM escrows
+            WHERE (buyer_id = $1 OR seller_id = $1) AND state = $2
+            ORDER BY id DESC
+            "#,
+        )
+        .bind(auth.user_id as i64)
+        .bind(st)
+        .fetch_all(&state.pool)
+        .await
+    } else {
+        sqlx::query_as(
+            r#"
+            SELECT id, trade_id, market_id, buyer_id, seller_id, qty, price, fee, state, delivered_at, deadline, receipt_bytes, receipt_sig
+            FROM escrows
+            WHERE buyer_id = $1 OR seller_id = $1
+            ORDER BY id DESC
+            "#,
+        )
+        .bind(auth.user_id as i64)
+        .fetch_all(&state.pool)
+        .await
+    }
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string()))))?;
+
+    let pubkey_hex = load_signing_key_from_env()
+        .map(|sk| hex::encode(sk.verifying_key().to_bytes()))
+        .unwrap_or_default();
+
+    let mut result = Vec::new();
+    for r in rows {
+        let role = if r.3 == auth.user_id as i64 {
+            "buyer".to_string()
+        } else {
+            "seller".to_string()
+        };
+
+        result.push(EscrowDetailResponse {
+            id: r.0,
+            trade_id: r.1,
+            market_id: r.2,
+            buyer_id: r.3,
+            seller_id: r.4,
+            role,
+            qty: r.5,
+            price: r.6,
+            fee: r.7,
+            state: r.8,
+            delivered_at: r.9,
+            deadline: r.10,
+            receipt: ReceiptView {
+                bytes_hex: hex::encode(&r.11),
+                signature_hex: hex::encode(&r.12),
+                public_key_hex: pubkey_hex.clone(),
+            },
+            dispute: None,
+        });
+    }
+
+    Ok(Json(result))
+}
+
+async fn get_escrow_by_id(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<EscrowDetailResponse>, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let row: Option<(
+        i64,
+        i64,
+        i32,
+        i64,
+        i64,
+        i32,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, trade_id, market_id, buyer_id, seller_id, qty, price, fee, state, delivered_at, deadline, receipt_bytes, receipt_sig
+        FROM escrows
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string()))))?;
+
+    let r = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorEnvelope::new("NOT_FOUND", "Escrow not found")),
+        )
+    })?;
+
+    if auth.role != crate::auth::Role::Admin
+        && r.3 != auth.user_id as i64
+        && r.4 != auth.user_id as i64
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorEnvelope::new(
+                "FORBIDDEN",
+                "Access denied: neither buyer nor seller",
+            )),
+        ));
+    }
+
+    let dispute_row: Option<(
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, reason, note, status, ruling, ruled_by, ruled_at
+        FROM disputes
+        WHERE escrow_id = $1
+        ORDER BY id DESC LIMIT 1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await
+    .unwrap_or(None);
+
+    let dispute = dispute_row.map(|d| DisputeView {
+        id: d.0,
+        reason: d.1,
+        note: d.2,
+        status: d.3,
+        ruling: d.4,
+        ruled_by: d.5,
+        ruled_at: d.6,
+    });
+
+    let role = if r.3 == auth.user_id as i64 {
+        "buyer".to_string()
+    } else {
+        "seller".to_string()
+    };
+
+    let pubkey_hex = load_signing_key_from_env()
+        .map(|sk| hex::encode(sk.verifying_key().to_bytes()))
+        .unwrap_or_default();
+
+    Ok(Json(EscrowDetailResponse {
+        id: r.0,
+        trade_id: r.1,
+        market_id: r.2,
+        buyer_id: r.3,
+        seller_id: r.4,
+        role,
+        qty: r.5,
+        price: r.6,
+        fee: r.7,
+        state: r.8,
+        delivered_at: r.9,
+        deadline: r.10,
+        receipt: ReceiptView {
+            bytes_hex: hex::encode(&r.11),
+            signature_hex: hex::encode(&r.12),
+            public_key_hex: pubkey_hex,
+        },
+        dispute,
+    }))
+}
+
+async fn post_escrow_accept(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT buyer_id, state FROM escrows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                )
+            })?;
+
+    let (buyer_id, state_str) = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorEnvelope::new("NOT_FOUND", "Escrow not found")),
+        )
+    })?;
+
+    if buyer_id != auth.user_id as i64 {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorEnvelope::new(
+                "FORBIDDEN",
+                "Only buyer can accept escrow",
+            )),
+        ));
+    }
+    if state_str != "Delivered" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorEnvelope::new(
+                "INVALID_STATE",
+                "Escrow is not in Delivered state",
+            )),
+        ));
+    }
+
+    // Call submit_fn for single-writer core processing if available
+    let req_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
+
+    (state.submit_fn)(TopUpCommand {
+        user_id: auth.user_id,
+        amount_paise: 0,
+        idempotency_key: format!("accept-{id}-{req_id}"),
+    })
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new("CORE_ERROR", e)),
+        )
+    })?;
+
+    sqlx::query("UPDATE escrows SET state = 'Released' WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+            )
+        })?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn post_escrow_reject(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+    AxumPath(id): AxumPath<i64>,
+    Json(payload): Json<RejectEscrowPayload>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let row: Option<(i64, String)> =
+        sqlx::query_as("SELECT buyer_id, state FROM escrows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                )
+            })?;
+
+    let (buyer_id, state_str) = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorEnvelope::new("NOT_FOUND", "Escrow not found")),
+        )
+    })?;
+
+    if buyer_id != auth.user_id as i64 {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorEnvelope::new(
+                "FORBIDDEN",
+                "Only buyer can reject escrow",
+            )),
+        ));
+    }
+    if state_str != "Delivered" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorEnvelope::new(
+                "INVALID_STATE",
+                "Escrow is not in Delivered state",
+            )),
+        ));
+    }
+
+    let req_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(1);
+
+    (state.submit_fn)(TopUpCommand {
+        user_id: auth.user_id,
+        amount_paise: 0,
+        idempotency_key: format!("reject-{id}-{req_id}"),
+    })
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new("CORE_ERROR", e)),
+        )
+    })?;
+
+    sqlx::query("UPDATE escrows SET state = 'Disputed' WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+            )
+        })?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO disputes (escrow_id, reason, note, status)
+        VALUES ($1, $2, $3, 'open')
+        "#,
+    )
+    .bind(id)
+    .bind(&payload.reason)
+    .bind(&payload.note)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+        )
+    })?;
+
+    Ok(StatusCode::OK)
+}
+
+async fn post_escrow_verify(
+    State(state): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Result<Json<VerifyResponse>, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let row: Option<(Vec<u8>, Vec<u8>)> =
+        sqlx::query_as("SELECT receipt_bytes, receipt_sig FROM escrows WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                )
+            })?;
+
+    let (receipt_bytes, receipt_sig) = row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorEnvelope::new("NOT_FOUND", "Escrow not found")),
+        )
+    })?;
+
+    let signing_key = load_signing_key_from_env().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new(
+                "CONFIG_ERROR",
+                "Signing key unavailable",
+            )),
+        )
+    })?;
+
+    let valid =
+        verify_receipt(&signing_key.verifying_key(), &receipt_bytes, &receipt_sig).unwrap_or(false);
+    Ok(Json(VerifyResponse { valid }))
+}
+
+async fn get_escrow_public_key()
+-> Result<Json<PublicKeyResponse>, (StatusCode, Json<ApiErrorEnvelope>)> {
+    let signing_key = load_signing_key_from_env().map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new(
+                "CONFIG_ERROR",
+                "Signing key unavailable",
+            )),
+        )
+    })?;
+
+    let pubkey_hex = hex::encode(signing_key.verifying_key().to_bytes());
+    Ok(Json(PublicKeyResponse {
+        public_key_hex: pubkey_hex,
+    }))
+}
+
+async fn get_admin_disputes(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+) -> Result<Json<Vec<DisputeView>>, (StatusCode, Json<ApiErrorEnvelope>)> {
+    if auth.role != crate::auth::Role::Admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorEnvelope::new("FORBIDDEN", "Admin role required")),
+        ));
+    }
+
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT id, reason, note, status, ruling, ruled_by, ruled_at
+        FROM disputes
+        ORDER BY id DESC
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+        )
+    })?;
+
+    let disputes = rows
+        .into_iter()
+        .map(|d| DisputeView {
+            id: d.0,
+            reason: d.1,
+            note: d.2,
+            status: d.3,
+            ruling: d.4,
+            ruled_by: d.5,
+            ruled_at: d.6,
+        })
+        .collect();
+
+    Ok(Json(disputes))
+}
+
+async fn post_admin_dispute_rule(
+    State(state): State<ApiState>,
+    auth: AuthUser,
+    AxumPath(id): AxumPath<i64>,
+    Json(payload): Json<AdminRulePayload>,
+) -> Result<StatusCode, (StatusCode, Json<ApiErrorEnvelope>)> {
+    if auth.role != crate::auth::Role::Admin {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(ApiErrorEnvelope::new("FORBIDDEN", "Admin role required")),
+        ));
+    }
+
+    let ruling_lower = payload.ruling.to_lowercase();
+    if ruling_lower != "buyer" && ruling_lower != "seller" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorEnvelope::new(
+                "INVALID_RULING",
+                "Ruling must be 'buyer' or 'seller'",
+            )),
+        ));
+    }
+
+    let dispute_row: Option<(i64, String)> =
+        sqlx::query_as("SELECT escrow_id, status FROM disputes WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+                )
+            })?;
+
+    let (escrow_id, status) = dispute_row.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ApiErrorEnvelope::new("NOT_FOUND", "Dispute not found")),
+        )
+    })?;
+
+    if status == "resolved" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiErrorEnvelope::new(
+                "ALREADY_RESOLVED",
+                "Dispute has already been ruled on",
+            )),
+        ));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+
+    let next_state = if ruling_lower == "buyer" {
+        "Refunded"
+    } else {
+        "Released"
+    };
+
+    sqlx::query("UPDATE escrows SET state = $2 WHERE id = $1")
+        .bind(escrow_id)
+        .bind(next_state)
+        .execute(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+            )
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE disputes
+        SET status = 'resolved', ruling = $2, ruled_by = $3, ruled_at = $4,
+            note = note || E'\nAdmin note: ' || $5
+        WHERE id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(&ruling_lower)
+    .bind(auth.user_id as i64)
+    .bind(now)
+    .bind(&payload.note)
+    .execute(&state.pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiErrorEnvelope::new("DB_ERROR", e.to_string())),
+        )
+    })?;
+
+    Ok(StatusCode::OK)
 }
 
 // Axum AuthUser extractor stub for JWT authentication

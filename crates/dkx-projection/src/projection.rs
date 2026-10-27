@@ -198,6 +198,73 @@ impl ProjectionWorker {
                         .execute(&mut *tx)
                         .await?;
                     }
+                    ProjectionEvent::EscrowUpserted { seq: _, escrow } => {
+                        let state_str = format!("{:?}", escrow.state);
+                        sqlx::query(
+                            r#"
+                            INSERT INTO escrows (id, trade_id, market_id, buyer_id, seller_id, qty, price, fee, state, delivered_at, deadline, receipt_bytes, receipt_sig, updated_seq)
+                            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                            ON CONFLICT (id) DO UPDATE
+                            SET state = $9, updated_seq = $14
+                            "#,
+                        )
+                        .bind(escrow.id as i64)
+                        .bind(escrow.trade_id as i64)
+                        .bind(escrow.market_id as i32)
+                        .bind(escrow.buyer_id as i64)
+                        .bind(escrow.seller_id as i64)
+                        .bind(escrow.qty as i32)
+                        .bind(escrow.price)
+                        .bind(escrow.fee)
+                        .bind(state_str)
+                        .bind(escrow.delivered_at as i64)
+                        .bind(escrow.deadline as i64)
+                        .bind(&escrow.receipt_bytes)
+                        .bind(&escrow.receipt_sig)
+                        .bind(escrow.updated_seq as i64)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    ProjectionEvent::DisputeOpened { seq: _, dispute } => {
+                        sqlx::query(
+                            r#"
+                            INSERT INTO disputes (id, escrow_id, reason, note, status, ruling, ruled_by, ruled_at)
+                            VALUES ($1, $2, $3, $4, $5, NULL, NULL, NULL)
+                            ON CONFLICT (id) DO NOTHING
+                            "#,
+                        )
+                        .bind(dispute.id as i64)
+                        .bind(dispute.escrow_id as i64)
+                        .bind(&dispute.reason)
+                        .bind(&dispute.note)
+                        .bind(&dispute.status)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    ProjectionEvent::DisputeResolved {
+                        seq: _,
+                        escrow_id,
+                        ruling,
+                        ruled_by,
+                        ruled_at,
+                        note,
+                    } => {
+                        sqlx::query(
+                            r#"
+                            UPDATE disputes
+                            SET status = 'resolved', ruling = $2, ruled_by = $3, ruled_at = $4,
+                                note = note || E'\nAdmin note: ' || $5
+                            WHERE escrow_id = $1
+                            "#,
+                        )
+                        .bind(*escrow_id as i64)
+                        .bind(ruling)
+                        .bind(*ruled_by as i64)
+                        .bind(*ruled_at as i64)
+                        .bind(note)
+                        .execute(&mut *tx)
+                        .await?;
+                    }
                 }
 
                 last_seq = seq;
@@ -241,6 +308,10 @@ impl ProjectionWorker {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM trades").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM disputes")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM escrows").execute(&mut *tx).await?;
         sqlx::query("UPDATE projection_state SET last_seq = 0 WHERE id = 1")
             .execute(&mut *tx)
             .await?;

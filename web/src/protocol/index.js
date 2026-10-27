@@ -15,30 +15,32 @@ export const Side = Object.freeze({ Buy: 'Buy', Sell: 'Sell' })
 
 /**
  * @param {{ clientOrderId: number, marketId: number, side: SideValue,
- *   priceTicks: number, qty: number }} input
+ *   priceTicks: number, qty: number, escrow?: boolean }} input
  * @returns {PlaceLimitCommand}
  */
-export const placeLimit = ({ clientOrderId, marketId, side, priceTicks, qty }) => ({
+export const placeLimit = ({ clientOrderId, marketId, side, priceTicks, qty, escrow }) => ({
   type: 'PlaceLimit',
   client_order_id: clientOrderId,
   market_id: marketId,
   side,
   price_ticks: priceTicks,
   qty,
+  ...(escrow ? { escrow: true } : {}),
 })
 
 /**
  * @param {{ clientOrderId: number, marketId: number, side: SideValue,
- *   qty: number, protectPriceTicks: number }} input
+ *   qty: number, protectPriceTicks: number, escrow?: boolean }} input
  * @returns {PlaceMarketCommand}
  */
-export const placeMarket = ({ clientOrderId, marketId, side, qty, protectPriceTicks }) => ({
+export const placeMarket = ({ clientOrderId, marketId, side, qty, protectPriceTicks, escrow }) => ({
   type: 'PlaceMarket',
   client_order_id: clientOrderId,
   market_id: marketId,
   side,
   qty,
   protect_price_ticks: protectPriceTicks,
+  ...(escrow ? { escrow: true } : {}),
 })
 
 /**

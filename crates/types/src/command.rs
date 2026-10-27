@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct PlaceLimit {
     pub client_order_id: ClientOrderId,
@@ -14,10 +13,12 @@ pub struct PlaceLimit {
     pub side: Side,
     pub price_ticks: Ticks,
     pub qty: Qty,
+    /// When true and the market has escrow_enabled, the fill enters escrow.
+    #[serde(default)]
+    pub escrow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct PlaceMarket {
     pub client_order_id: ClientOrderId,
@@ -26,6 +27,9 @@ pub struct PlaceMarket {
     pub qty: Qty,
     /// Buy: maximum price. Sell: minimum price.
     pub protect_price_ticks: Ticks,
+    /// When true and the market has escrow_enabled, the fill enters escrow.
+    #[serde(default)]
+    pub escrow: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

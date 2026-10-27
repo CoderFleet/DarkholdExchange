@@ -9,10 +9,13 @@ dx-admin = { version = "0.1.0", path = "../admin" }
 dx-auth = { version = "0.1.0", path = "../auth" }
 dx-core = { version = "0.1.0", path = "../core" }
 dx-limits = { version = "0.1.0", path = "../limits" }
+dx-ledger = { version = "0.1.0", path = "../ledger" }
+dkx-escrow = { version = "0.1.0", path = "../dkx-escrow" }
 dx-solvency = { version = "0.1.0", path = "../solvency" }
 dx-store = { version = "0.1.0", path = "../store" }
 dx-types = { version = "0.1.0", path = "../types" }
 dkx-wal = { version = "0.1.0", path = "../dkx-wal" }
+ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std"] }
 futures-util = "0.3"
 hex = "0.4"
 hdrhistogram = { version = "7", default-features = false }

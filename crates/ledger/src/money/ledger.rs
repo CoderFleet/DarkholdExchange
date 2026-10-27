@@ -1,9 +1,14 @@
 use std::collections::{HashMap, VecDeque};
 
+use dkx_escrow::{
+    AdminRuling, DisputeRecord, EscrowRecord, EscrowState, build_receipt_bytes, sign_receipt,
+};
+use ed25519_dalek::SigningKey;
+
 use crate::money::error::{LedgerError, Violation};
 use crate::money::types::{
-    Account, Asset, EntryKind, Fill, IdemKey, JournalEntry, JournalId, Leg, MarketId, OrderId,
-    Paise, SettleOutcome, UserId,
+    Account, Asset, EntryKind, EscrowId, Fill, IdemKey, JournalEntry, JournalId, Leg, MarketId,
+    OrderId, Paise, SettleOutcome, UserId,
 };
 
 /// 100 basis points = 1.00%
@@ -39,6 +44,12 @@ pub struct Ledger {
     current_ts_micros: u64,
     idem_results: HashMap<IdemKey, IdemResult>,
     idem_order: VecDeque<IdemKey>,
+    escrows: HashMap<EscrowId, EscrowRecord>,
+    disputes: HashMap<EscrowId, DisputeRecord>,
+    next_escrow_id: EscrowId,
+    next_dispute_id: u64,
+    signing_key: Option<SigningKey>,
+    inspection_secs: u64,
 }
 
 impl Default for Ledger {
@@ -49,6 +60,9 @@ impl Default for Ledger {
 
 impl Ledger {
     pub fn new() -> Self {
+        let inspection_secs = dkx_escrow::parse_inspection_secs_from_env().unwrap_or(300);
+        let signing_key = dkx_escrow::load_signing_key_from_env().ok();
+
         Self {
             balances: HashMap::new(),
             reservations: HashMap::new(),
@@ -57,7 +71,37 @@ impl Ledger {
             current_ts_micros: 0,
             idem_results: HashMap::new(),
             idem_order: VecDeque::new(),
+            escrows: HashMap::new(),
+            disputes: HashMap::new(),
+            next_escrow_id: 1,
+            next_dispute_id: 1,
+            signing_key,
+            inspection_secs,
         }
+    }
+
+    pub fn set_signing_key(&mut self, key: SigningKey) {
+        self.signing_key = Some(key);
+    }
+
+    pub fn set_inspection_secs(&mut self, secs: u64) {
+        self.inspection_secs = secs;
+    }
+
+    pub fn get_escrow(&self, id: EscrowId) -> Option<&EscrowRecord> {
+        self.escrows.get(&id)
+    }
+
+    pub fn get_dispute(&self, escrow_id: EscrowId) -> Option<&DisputeRecord> {
+        self.disputes.get(&escrow_id)
+    }
+
+    pub fn all_escrows(&self) -> Vec<EscrowRecord> {
+        self.escrows.values().cloned().collect()
+    }
+
+    pub fn all_disputes(&self) -> Vec<DisputeRecord> {
+        self.disputes.values().cloned().collect()
     }
 
     pub fn set_current_ts_micros(&mut self, ts: u64) {
@@ -362,10 +406,6 @@ impl Ledger {
             return Ok(outcome.clone());
         }
 
-        if fill.escrow {
-            return Err(LedgerError::EscrowNotReady);
-        }
-
         if fill.qty <= 0 || fill.price <= 0 {
             return Err(LedgerError::NonPositiveAmount {
                 amount: if fill.qty <= 0 { fill.qty } else { fill.price },
@@ -433,35 +473,111 @@ impl Ledger {
             });
         }
 
-        let legs = vec![
-            Leg {
-                account: Account::CashLocked(fill.buyer),
-                asset: Asset::Cash,
-                amount: -notional,
-            },
-            Leg {
-                account: Account::CashAvail(fill.seller),
-                asset: Asset::Cash,
-                amount: seller_proceeds,
-            },
-            Leg {
-                account: Account::PlatformFee,
-                asset: Asset::Cash,
-                amount: fee,
-            },
-            Leg {
-                account: Account::PassLocked(fill.seller, fill.market),
-                asset: Asset::Pass(fill.market),
-                amount: -fill.qty,
-            },
-            Leg {
-                account: Account::PassAvail(fill.buyer, fill.market),
-                asset: Asset::Pass(fill.market),
-                amount: fill.qty,
-            },
-        ];
+        let outcome = if fill.escrow {
+            let escrow_id = self.next_escrow_id;
+            self.next_escrow_id = self.next_escrow_id.saturating_add(1);
 
-        self.apply_entry(EntryKind::Fill, legs, key)?;
+            let legs = vec![
+                Leg {
+                    account: Account::CashLocked(fill.buyer),
+                    asset: Asset::Cash,
+                    amount: -notional,
+                },
+                Leg {
+                    account: Account::EscrowCash,
+                    asset: Asset::Cash,
+                    amount: notional,
+                },
+                Leg {
+                    account: Account::PassLocked(fill.seller, fill.market),
+                    asset: Asset::Pass(fill.market),
+                    amount: -fill.qty,
+                },
+                Leg {
+                    account: Account::PassHeld(fill.buyer, fill.market),
+                    asset: Asset::Pass(fill.market),
+                    amount: fill.qty,
+                },
+            ];
+
+            self.apply_entry(EntryKind::Fill, legs, key)?;
+
+            let delivered_at = if fill.ts_micros > 0 {
+                fill.ts_micros
+            } else {
+                self.current_ts_micros
+            };
+            let deadline =
+                delivered_at.saturating_add(self.inspection_secs.saturating_mul(1_000_000));
+
+            let receipt_bytes = build_receipt_bytes(
+                escrow_id,
+                fill.seq,
+                fill.market,
+                fill.buyer,
+                fill.seller,
+                fill.qty as u32,
+                fill.price,
+                delivered_at,
+            );
+
+            let receipt_sig = if let Some(ref sk) = self.signing_key {
+                sign_receipt(sk, &receipt_bytes)
+            } else {
+                Vec::new()
+            };
+
+            let escrow_record = EscrowRecord {
+                id: escrow_id,
+                trade_id: fill.seq,
+                market_id: fill.market,
+                buyer_id: fill.buyer,
+                seller_id: fill.seller,
+                qty: fill.qty as u32,
+                price: fill.price,
+                fee,
+                state: EscrowState::Delivered,
+                delivered_at,
+                deadline,
+                receipt_bytes,
+                receipt_sig,
+                updated_seq: fill.seq,
+            };
+            self.escrows.insert(escrow_id, escrow_record);
+
+            SettleOutcome::Escrowed(escrow_id)
+        } else {
+            let legs = vec![
+                Leg {
+                    account: Account::CashLocked(fill.buyer),
+                    asset: Asset::Cash,
+                    amount: -notional,
+                },
+                Leg {
+                    account: Account::CashAvail(fill.seller),
+                    asset: Asset::Cash,
+                    amount: seller_proceeds,
+                },
+                Leg {
+                    account: Account::PlatformFee,
+                    asset: Asset::Cash,
+                    amount: fee,
+                },
+                Leg {
+                    account: Account::PassLocked(fill.seller, fill.market),
+                    asset: Asset::Pass(fill.market),
+                    amount: -fill.qty,
+                },
+                Leg {
+                    account: Account::PassAvail(fill.buyer, fill.market),
+                    asset: Asset::Pass(fill.market),
+                    amount: fill.qty,
+                },
+            ];
+
+            self.apply_entry(EntryKind::Fill, legs, key)?;
+            SettleOutcome::Settled
+        };
 
         let rem_buyer = buyer_res - notional;
         if rem_buyer == 0 {
@@ -490,9 +606,237 @@ impl Ledger {
             );
         }
 
-        let outcome = SettleOutcome::Settled;
         self.record_idem(key, IdemResult::Settle(outcome.clone()));
         Ok(outcome)
+    }
+
+    pub fn escrow_accept(
+        &mut self,
+        user: UserId,
+        id: EscrowId,
+        seq: u64,
+        key: IdemKey,
+    ) -> Result<(), LedgerError> {
+        let escrow = self
+            .escrows
+            .get(&id)
+            .ok_or(LedgerError::EscrowNotFound { id })?
+            .clone();
+
+        if escrow.buyer_id != user {
+            return Err(LedgerError::UnauthorizedEscrowAction { id });
+        }
+        if escrow.state != EscrowState::Delivered {
+            return Err(LedgerError::InvalidEscrowState {
+                id,
+                current: format!("{:?}", escrow.state),
+            });
+        }
+
+        self.execute_escrow_release(&escrow, seq, key)
+    }
+
+    pub fn escrow_timeout(
+        &mut self,
+        id: EscrowId,
+        seq: u64,
+        key: IdemKey,
+    ) -> Result<bool, LedgerError> {
+        let escrow = match self.escrows.get(&id) {
+            Some(e) => e.clone(),
+            None => return Ok(false),
+        };
+
+        if escrow.state == EscrowState::Delivered {
+            self.execute_escrow_release(&escrow, seq, key)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn escrow_reject(
+        &mut self,
+        user: UserId,
+        id: EscrowId,
+        reason: String,
+        note: String,
+        seq: u64,
+    ) -> Result<(), LedgerError> {
+        let escrow = self
+            .escrows
+            .get_mut(&id)
+            .ok_or(LedgerError::EscrowNotFound { id })?;
+
+        if escrow.buyer_id != user {
+            return Err(LedgerError::UnauthorizedEscrowAction { id });
+        }
+        if escrow.state != EscrowState::Delivered {
+            return Err(LedgerError::InvalidEscrowState {
+                id,
+                current: format!("{:?}", escrow.state),
+            });
+        }
+
+        escrow.state = EscrowState::Disputed;
+        escrow.updated_seq = seq;
+
+        let dispute_id = self.next_dispute_id;
+        self.next_dispute_id = self.next_dispute_id.saturating_add(1);
+
+        let dispute = DisputeRecord {
+            id: dispute_id,
+            escrow_id: id,
+            reason,
+            note,
+            status: "open".to_string(),
+            ruling: None,
+            ruled_by: None,
+            ruled_at: None,
+        };
+        self.disputes.insert(id, dispute);
+        Ok(())
+    }
+
+    pub fn admin_rule(
+        &mut self,
+        admin: UserId,
+        id: EscrowId,
+        ruling: AdminRuling,
+        note: String,
+        seq: u64,
+        key: IdemKey,
+    ) -> Result<(), LedgerError> {
+        let escrow = self
+            .escrows
+            .get(&id)
+            .ok_or(LedgerError::EscrowNotFound { id })?
+            .clone();
+
+        if escrow.state != EscrowState::Disputed {
+            return Err(LedgerError::InvalidEscrowState {
+                id,
+                current: format!("{:?}", escrow.state),
+            });
+        }
+
+        match ruling {
+            AdminRuling::Seller => {
+                self.execute_escrow_release(&escrow, seq, key)?;
+            }
+            AdminRuling::Buyer => {
+                self.execute_escrow_refund(&escrow, seq, key)?;
+            }
+        }
+
+        if let Some(dispute) = self.disputes.get_mut(&id) {
+            dispute.status = "resolved".to_string();
+            dispute.ruling = Some(ruling);
+            dispute.ruled_by = Some(admin);
+            dispute.ruled_at = Some(self.current_ts_micros);
+            if !note.is_empty() {
+                dispute.note = format!("{}\nAdmin note: {}", dispute.note, note);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn execute_escrow_release(
+        &mut self,
+        escrow: &EscrowRecord,
+        seq: u64,
+        key: IdemKey,
+    ) -> Result<(), LedgerError> {
+        let notional = (escrow.price as i128)
+            .checked_mul(escrow.qty as i128)
+            .ok_or(LedgerError::ArithmeticOverflow)? as i64;
+        let fee = escrow.fee;
+        let seller_proceeds = notional
+            .checked_sub(fee)
+            .ok_or(LedgerError::ArithmeticOverflow)?;
+        let qty = escrow.qty as i64;
+
+        let legs = vec![
+            Leg {
+                account: Account::EscrowCash,
+                asset: Asset::Cash,
+                amount: -notional,
+            },
+            Leg {
+                account: Account::CashAvail(escrow.seller_id),
+                asset: Asset::Cash,
+                amount: seller_proceeds,
+            },
+            Leg {
+                account: Account::PlatformFee,
+                asset: Asset::Cash,
+                amount: fee,
+            },
+            Leg {
+                account: Account::PassHeld(escrow.buyer_id, escrow.market_id),
+                asset: Asset::Pass(escrow.market_id),
+                amount: -qty,
+            },
+            Leg {
+                account: Account::PassAvail(escrow.buyer_id, escrow.market_id),
+                asset: Asset::Pass(escrow.market_id),
+                amount: qty,
+            },
+        ];
+
+        self.apply_entry(EntryKind::EscrowRelease, legs, key)?;
+
+        if let Some(e) = self.escrows.get_mut(&escrow.id) {
+            e.state = EscrowState::Released;
+            e.updated_seq = seq;
+        }
+
+        Ok(())
+    }
+
+    fn execute_escrow_refund(
+        &mut self,
+        escrow: &EscrowRecord,
+        seq: u64,
+        key: IdemKey,
+    ) -> Result<(), LedgerError> {
+        let notional = (escrow.price as i128)
+            .checked_mul(escrow.qty as i128)
+            .ok_or(LedgerError::ArithmeticOverflow)? as i64;
+        let qty = escrow.qty as i64;
+
+        let legs = vec![
+            Leg {
+                account: Account::EscrowCash,
+                asset: Asset::Cash,
+                amount: -notional,
+            },
+            Leg {
+                account: Account::CashAvail(escrow.buyer_id),
+                asset: Asset::Cash,
+                amount: notional,
+            },
+            Leg {
+                account: Account::PassHeld(escrow.buyer_id, escrow.market_id),
+                asset: Asset::Pass(escrow.market_id),
+                amount: -qty,
+            },
+            Leg {
+                account: Account::PassAvail(escrow.seller_id, escrow.market_id),
+                asset: Asset::Pass(escrow.market_id),
+                amount: qty,
+            },
+        ];
+
+        self.apply_entry(EntryKind::EscrowRefund, legs, key)?;
+
+        if let Some(e) = self.escrows.get_mut(&escrow.id) {
+            e.state = EscrowState::Refunded;
+            e.updated_seq = seq;
+        }
+
+        Ok(())
     }
 
     pub fn check_invariants(&self) -> Vec<Violation> {
@@ -586,6 +930,52 @@ impl Ledger {
                     account: *account,
                     account_locked: actual,
                     sum_reservations: 0,
+                });
+            }
+        }
+
+        // Invariant check: EscrowCash and PassHeld equal the open escrows
+        let mut expected_escrow_cash: i64 = 0;
+        let mut expected_pass_held: HashMap<(UserId, MarketId), i64> = HashMap::new();
+
+        for escrow in self.escrows.values() {
+            if matches!(escrow.state, EscrowState::Delivered | EscrowState::Disputed) {
+                let notional = (escrow.price as i128).saturating_mul(escrow.qty as i128) as i64;
+                expected_escrow_cash = expected_escrow_cash.saturating_add(notional);
+                let entry = expected_pass_held
+                    .entry((escrow.buyer_id, escrow.market_id))
+                    .or_insert(0);
+                *entry = entry.saturating_add(escrow.qty as i64);
+            }
+        }
+
+        let actual_escrow_cash = self.balance_of(Account::EscrowCash);
+        if actual_escrow_cash != expected_escrow_cash {
+            violations.push(Violation::EscrowCashMismatch {
+                account_balance: actual_escrow_cash,
+                open_escrows_total: expected_escrow_cash,
+            });
+        }
+
+        for (&(user, market), &exp_qty) in &expected_pass_held {
+            let actual = self.balance_of(Account::PassHeld(user, market));
+            if actual != exp_qty {
+                violations.push(Violation::PassHeldMismatch {
+                    account: Account::PassHeld(user, market),
+                    account_held: actual,
+                    open_escrows_qty: exp_qty,
+                });
+            }
+        }
+        for (account, &actual) in &self.balances {
+            if let Account::PassHeld(user, market) = account
+                && !expected_pass_held.contains_key(&(*user, *market))
+                && actual != 0
+            {
+                violations.push(Violation::PassHeldMismatch {
+                    account: *account,
+                    account_held: actual,
+                    open_escrows_qty: 0,
                 });
             }
         }

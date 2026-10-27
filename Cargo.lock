@@ -540,6 +540,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dkx-escrow"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "ts-rs 10.1.0",
+]
+
+[[package]]
 name = "dkx-hash"
 version = "0.1.0"
 dependencies = [
@@ -555,7 +569,9 @@ name = "dkx-projection"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dkx-escrow",
  "dx-ledger",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",
@@ -640,11 +656,13 @@ name = "dx-gateway"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "dkx-escrow",
  "dkx-wal",
  "dx-admin",
  "dx-auth",
  "dx-core",
  "dx-limits",
+ "dx-ledger",
  "dx-solvency",
  "dx-store",
  "dx-types",
@@ -664,7 +682,9 @@ dependencies = [
 name = "dx-ledger"
 version = "0.1.0"
 dependencies = [
+ "dkx-escrow",
  "dx-types",
+ "ed25519-dalek",
  "proptest",
  "serde",
  "thiserror",
@@ -717,7 +737,32 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_json",
- "ts-rs",
+ "ts-rs 12.0.1",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "pkcs8",
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -2761,12 +2806,35 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "ts-rs"
+version = "10.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e640d9b0964e9d39df633548591090ab92f7a4567bc31d3891af23471a3365c6"
+dependencies = [
+ "lazy_static",
+ "thiserror",
+ "ts-rs-macros 10.1.0",
+]
+
+[[package]]
+name = "ts-rs"
 version = "12.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "756050066659291d47a554a9f558125db17428b073c5ffce1daf5dcb0f7231d8"
 dependencies = [
  "thiserror",
- "ts-rs-macros",
+ "ts-rs-macros 12.0.1",
+]
+
+[[package]]
+name = "ts-rs-macros"
+version = "10.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e9d8656589772eeec2cf7a8264d9cda40fb28b9bc53118ceb9e8c07f8f38730"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+ "termcolor",
 ]
 
 [[package]]

@@ -324,6 +324,15 @@ async fn main() {
         .route("/api/dev/issue", post(dev_issue))
         .route("/api/issuer/issue", post(issuer_issue))
         .route("/api/issuer/supply", get(issuer_supply))
+        // Escrow endpoints
+        .route("/api/escrow", get(escrow_list))
+        .route("/api/escrow/public-key", get(escrow_public_key))
+        .route("/api/escrow/{id}", get(escrow_get))
+        .route("/api/escrow/{id}/accept", post(escrow_accept))
+        .route("/api/escrow/{id}/reject", post(escrow_reject))
+        .route("/api/escrow/{id}/verify", post(escrow_verify))
+        .route("/api/admin/disputes", get(admin_disputes_list))
+        .route("/api/admin/disputes/{id}/rule", post(admin_disputes_rule))
         .route("/ws", get(ws))
         .route("/ws/market/{market_id}", get(ws_market))
         .with_state(state)
@@ -1935,6 +1944,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
                 side,
                 price_ticks,
                 qty,
+                escrow: false, // <-- Added here
             }),
         );
         assert_eq!(
@@ -1955,6 +1965,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
             side: Side::Buy,
             qty: 1,
             protect_price_ticks: 5_200,
+            escrow: false, // <-- Added here
         }),
     );
     assert_eq!(sweep.status, OrderStatus::Filled, "seed sweep: {sweep:?}");
@@ -1968,6 +1979,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
             side: Side::Sell,
             price_ticks: 5_100,
             qty: 1,
+            escrow: false, // <-- Added here
         }),
     );
     assert_eq!(
@@ -2046,6 +2058,7 @@ mod tests {
             side,
             price_ticks,
             qty,
+            escrow: false,
         })
     }
 
@@ -2056,6 +2069,7 @@ mod tests {
             side,
             qty,
             protect_price_ticks: PRICE,
+            escrow: false,
         })
     }
 
@@ -2628,4 +2642,238 @@ mod tests {
         let error = issuer_supply(State(state), user_map).await.err().unwrap();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
+}
+
+// ─── Escrow HTTP handlers ─────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct EscrowStateQuery {
+    state: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct EscrowReceiptView {
+    bytes_hex: String,
+    signature_hex: String,
+    public_key_hex: String,
+}
+
+#[derive(Debug, Serialize)]
+struct EscrowView {
+    id: u64,
+    trade_id: u64,
+    market_id: u32,
+    buyer_id: UserId,
+    seller_id: UserId,
+    qty: u32,
+    price: i64,
+    fee: i64,
+    state: String,
+    delivered_at: u64,
+    deadline: u64,
+    receipt: EscrowReceiptView,
+    role: String,
+}
+
+fn escrow_to_view(e: &dkx_escrow::EscrowRecord, role: &str, pub_key: &str) -> EscrowView {
+    EscrowView {
+        id: e.id,
+        trade_id: e.trade_id,
+        market_id: e.market_id,
+        buyer_id: e.buyer_id,
+        seller_id: e.seller_id,
+        qty: e.qty,
+        price: e.price,
+        fee: e.fee,
+        state: format!("{:?}", e.state),
+        delivered_at: e.delivered_at,
+        deadline: e.deadline,
+        receipt: EscrowReceiptView {
+            bytes_hex: hex::encode(&e.receipt_bytes),
+            signature_hex: hex::encode(&e.receipt_sig),
+            public_key_hex: pub_key.to_string(),
+        },
+        role: role.to_string(),
+    }
+}
+
+async fn escrow_public_key(State(state): State<AppState>) -> impl IntoResponse {
+    let key = state.writer.escrow_public_key().await.unwrap_or_default();
+    Json(serde_json::json!({ "public_key_hex": key }))
+}
+
+async fn escrow_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<EscrowStateQuery>,
+) -> Result<Json<Vec<EscrowView>>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let escrows = state.writer.all_escrows().await.map_err(writer_error)?;
+    let pub_key = state.writer.escrow_public_key().await.unwrap_or_default();
+    let filter = q.state.as_deref().unwrap_or("").to_lowercase();
+    let views = escrows
+        .iter()
+        .filter(|e| e.buyer_id == user_id || e.seller_id == user_id)
+        .filter(|e| filter.is_empty() || format!("{:?}", e.state).to_lowercase() == filter)
+        .map(|e| {
+            let role = if e.buyer_id == user_id {
+                "buyer"
+            } else {
+                "seller"
+            };
+            escrow_to_view(e, role, &pub_key)
+        })
+        .collect();
+    Ok(Json(views))
+}
+
+async fn escrow_get(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EscrowView>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let e = state
+        .writer
+        .get_escrow(id)
+        .await
+        .map_err(writer_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, ReasonCode::OrderNotFound))?;
+    let is_party = e.buyer_id == user_id || e.seller_id == user_id;
+    if !is_party {
+        match identify(&state.auth, &headers)? {
+            Caller::Token {
+                role: dx_auth::Role::Admin,
+                ..
+            } => {}
+            Caller::Dev(_) => {}
+            _ => return Err(forbidden()),
+        }
+    }
+    let pub_key = state.writer.escrow_public_key().await.unwrap_or_default();
+    let role = if e.buyer_id == user_id {
+        "buyer"
+    } else if e.seller_id == user_id {
+        "seller"
+    } else {
+        "admin"
+    };
+    Ok(Json(escrow_to_view(&e, role, &pub_key)))
+}
+
+#[derive(Debug, Deserialize)]
+struct EscrowRejectBody {
+    reason: String,
+    note: String,
+}
+
+async fn escrow_accept(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    state
+        .writer
+        .escrow_accept(user_id, id)
+        .await
+        .map_err(writer_error)?
+        .map_err(|r| api_error(status_for_reason(r), r))?;
+    Ok(Json(serde_json::json!({ "status": "Released" })))
+}
+
+async fn escrow_reject(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<EscrowRejectBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    state
+        .writer
+        .escrow_reject(user_id, id, body.reason, body.note)
+        .await
+        .map_err(writer_error)?
+        .map_err(|r| api_error(status_for_reason(r), r))?;
+    Ok(Json(serde_json::json!({ "status": "Disputed" })))
+}
+
+async fn escrow_verify(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let valid = state.writer.escrow_verify(id).await.map_err(writer_error)?;
+    Ok(Json(serde_json::json!({ "valid": valid })))
+}
+
+async fn admin_disputes_list(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<serde_json::Value>>, ApiError> {
+    match identify(&state.auth, &headers)? {
+        Caller::Token {
+            role: dx_auth::Role::Admin,
+            ..
+        } => {}
+        Caller::Dev(_) => {}
+        _ => return Err(forbidden()),
+    }
+    let disputes = state.writer.all_disputes().await.map_err(writer_error)?;
+    let views = disputes
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "id": d.id,
+                "escrow_id": d.escrow_id,
+                "reason": d.reason,
+                "note": d.note,
+                "status": d.status,
+                "ruling": d.ruling,
+                "ruled_by": d.ruled_by,
+                "ruled_at": d.ruled_at,
+            })
+        })
+        .collect();
+    Ok(Json(views))
+}
+
+#[derive(Debug, Deserialize)]
+struct AdminRuleBody {
+    ruling: String,
+    note: String,
+}
+
+async fn admin_disputes_rule(
+    Path(id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<AdminRuleBody>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let admin_id = match identify(&state.auth, &headers)? {
+        Caller::Token {
+            user_id,
+            role: dx_auth::Role::Admin,
+        } => user_id,
+        Caller::Dev(uid) => uid,
+        _ => return Err(forbidden()),
+    };
+    let body = json_body(payload)?;
+    let ruling = match body.ruling.to_lowercase().as_str() {
+        "buyer" => dkx_escrow::AdminRuling::Buyer,
+        "seller" => dkx_escrow::AdminRuling::Seller,
+        _ => {
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                ReasonCode::InvalidRequest,
+            ));
+        }
+    };
+    state
+        .writer
+        .admin_rule(admin_id, id, ruling, body.note)
+        .await
+        .map_err(writer_error)?
+        .map_err(|r| api_error(status_for_reason(r), r))?;
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }

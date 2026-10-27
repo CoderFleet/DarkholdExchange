@@ -1,6 +1,10 @@
+use dkx_escrow::{AdminRuling, EscrowState};
+
 use crate::money::error::LedgerError;
 use crate::money::ledger::Ledger;
-use crate::money::types::{Fill, IdemKey, MarketId, OrderId, Paise, SettleOutcome, UserId};
+use crate::money::types::{
+    EscrowId, Fill, IdemKey, MarketId, OrderId, Paise, SettleOutcome, UserId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -36,6 +40,28 @@ pub enum Command {
         fill: Fill,
         key: IdemKey,
     },
+    EscrowAccept {
+        user: UserId,
+        id: EscrowId,
+        key: IdemKey,
+    },
+    EscrowReject {
+        user: UserId,
+        id: EscrowId,
+        reason: String,
+        note: String,
+    },
+    EscrowTimeout {
+        id: EscrowId,
+        key: IdemKey,
+    },
+    AdminRule {
+        admin: UserId,
+        id: EscrowId,
+        ruling: AdminRuling,
+        note: String,
+        key: IdemKey,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +92,11 @@ pub enum Event {
     FillSettled {
         outcome: SettleOutcome,
     },
+    EscrowChanged {
+        id: EscrowId,
+        state: EscrowState,
+        ts_micros: u64,
+    },
 }
 
 pub struct MoneyCore {
@@ -88,7 +119,7 @@ impl MoneyCore {
     pub fn handle(
         &mut self,
         cmd: &Command,
-        _seq: u64,
+        seq: u64,
         ts_micros: u64,
     ) -> Result<Vec<Event>, LedgerError> {
         self.ledger.set_current_ts_micros(ts_micros);
@@ -148,7 +179,70 @@ impl MoneyCore {
             }
             Command::PostFill { fill, key } => {
                 let outcome = self.ledger.post_fill(fill, *key)?;
-                Ok(vec![Event::FillSettled { outcome }])
+                let mut events = vec![Event::FillSettled {
+                    outcome: outcome.clone(),
+                }];
+                if let SettleOutcome::Escrowed(id) = outcome {
+                    events.push(Event::EscrowChanged {
+                        id,
+                        state: EscrowState::Delivered,
+                        ts_micros,
+                    });
+                }
+                Ok(events)
+            }
+            Command::EscrowAccept { user, id, key } => {
+                self.ledger.escrow_accept(*user, *id, seq, *key)?;
+                Ok(vec![Event::EscrowChanged {
+                    id: *id,
+                    state: EscrowState::Released,
+                    ts_micros,
+                }])
+            }
+            Command::EscrowTimeout { id, key } => {
+                let transitioned = self.ledger.escrow_timeout(*id, seq, *key)?;
+                if transitioned {
+                    Ok(vec![Event::EscrowChanged {
+                        id: *id,
+                        state: EscrowState::Released,
+                        ts_micros,
+                    }])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            Command::EscrowReject {
+                user,
+                id,
+                reason,
+                note,
+            } => {
+                self.ledger
+                    .escrow_reject(*user, *id, reason.clone(), note.clone(), seq)?;
+                Ok(vec![Event::EscrowChanged {
+                    id: *id,
+                    state: EscrowState::Disputed,
+                    ts_micros,
+                }])
+            }
+            Command::AdminRule {
+                admin,
+                id,
+                ruling,
+                note,
+                key,
+            } => {
+                self.ledger
+                    .admin_rule(*admin, *id, *ruling, note.clone(), seq, *key)?;
+                let final_state = match ruling {
+                    AdminRuling::Seller => EscrowState::Released,
+                    AdminRuling::Buyer => EscrowState::Refunded,
+                };
+                Ok(vec![Event::EscrowChanged {
+                    id: *id,
+                    state: final_state,
+                    ts_micros,
+                }])
             }
         }
     }

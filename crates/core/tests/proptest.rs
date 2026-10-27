@@ -43,6 +43,7 @@ proptest! {
                         side,
                         price_ticks,
                         qty,
+                        escrow: false,
                     }),
                 );
                 if let Some(order_id) = response.order_id
