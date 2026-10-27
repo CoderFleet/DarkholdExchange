@@ -9,6 +9,7 @@ dx-admin = { version = "0.1.0", path = "../admin" }
 dx-auth = { version = "0.1.0", path = "../auth" }
 dx-core = { version = "0.1.0", path = "../core" }
 dx-solvency = { version = "0.1.0", path = "../solvency" }
+dx-store = { version = "0.1.0", path = "../store" }
 dx-types = { version = "0.1.0", path = "../types" }
 dkx-wal = { version = "0.1.0", path = "../dkx-wal" }
 futures-util = "0.3"

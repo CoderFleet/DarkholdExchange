@@ -132,3 +132,42 @@ it. Each change is small, backward compatible, in its own PR, and passes CI befo
    Identity dropdown shows only while nobody is logged in (dev). Real runs set `DX_DEV_AUTH=0`.
    Still open: the WebSocket does not check the token yet, and in a real run `/market` shows
    errors, instead of redirecting to the login page, when nobody is logged in.
+
+
+## 5. Saving accounts, events and tiers
+
+**Why.** The engine already survives a restart through the write-ahead log (its money and
+markets come back). Accounts, events and tiers lived only in memory. After a restart the user ids
+started again at 200, so a new sign-up could be given the id of an old account and inherit its
+money from the log. Admin market ids also restarted at 100, so publishing a new tier failed. Now
+they are saved in PostgreSQL.
+
+**How it is switched on.** Set `DATABASE_URL`, for example
+`postgres://darkhold:darkhold@localhost:5432/darkhold` (`docker compose up -d db` starts that
+database). At start the gateway connects, creates three tables if they are missing
+(`app_users`, `admin_events`, `admin_tiers`, see `crates/store/migrations`), loads everything,
+and continues the ids from the highest saved one.
+
+- **Real run (`DX_DEV_AUTH=0`):** the gateway refuses to start without `DATABASE_URL`, and also
+  refuses if the database cannot be reached.
+- **Dev run without `DATABASE_URL`:** everything works in memory as before, and a warning says
+  the data is lost on restart. If the write-ahead log is on, delete the `data` folder before
+  restarting, or new sign-ups will be given the old accounts' ids and money.
+
+**What is saved.**
+- Only the Argon2id password **hash** is saved, never a password.
+- The demo accounts (`trader1`, `dummy_user` and the other seeded traders) are never saved.
+- The admin and issuer accounts are saved only when their password comes from the environment
+  (`DX_ADMIN_PASSWORD`, `DX_ISSUER_PASSWORD`). If the environment sets one, it wins over a saved
+  row on every start, so changing the password and restarting takes effect.
+
+**Order of work.** The database is written first and the in-memory copy changes only after the
+write succeeded. If the write fails, the request answers 500 and nothing is created, so memory
+and database never disagree. The database's unique rules are the final judge of duplicates
+(username, and tier name per event ignoring capitals), so two requests at the same moment cannot
+both win.
+
+**Known gap.** Publishing a tier does two things: it creates the market in the engine, then
+saves the tier as published. If the server crashes between the two, the tier is saved as a draft
+while the engine already has the market, and publishing it again fails. This needs a manual fix
+for now.
