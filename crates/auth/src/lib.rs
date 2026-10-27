@@ -417,6 +417,17 @@ impl AuthState {
         ids
     }
 
+    /// The id of the account with this username, if there is one. Names are stored in lowercase,
+    /// so capitals and spaces around the name do not matter. The issuer endpoint uses it, so
+    /// an issuer can name the person to credit instead of knowing their number.
+    pub fn user_id_of(&self, username: &str) -> Option<UserId> {
+        let store = self.0.store.lock().expect("auth store");
+        store
+            .by_name
+            .get(&username.trim().to_lowercase())
+            .map(|record| record.user_id)
+    }
+
     /// Signs a token for a user. The login handlers use it; tests in other crates can too.
     pub fn issue_token(&self, user: &PublicUser) -> Result<String, AuthError> {
         let iat = now_secs();
@@ -761,6 +772,17 @@ mod tests {
         let (status, me, _) = call(&app, get_me(Some(&token))).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(me, body["user"]);
+    }
+
+    #[tokio::test]
+    async fn a_username_is_looked_up_ignoring_capitals_and_spaces() {
+        let state = fresh_state();
+        let app = router(state.clone());
+        let (status, _) = signup(&app, "Carol").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(state.user_id_of("carol"), Some(200));
+        assert_eq!(state.user_id_of("  CAROL "), Some(200));
+        assert_eq!(state.user_id_of("nobody"), None);
     }
 
     #[tokio::test]
