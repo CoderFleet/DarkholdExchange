@@ -1,6 +1,8 @@
 //! Login, sign-up and "who am I" for the gateway. Contract: `docs/AUTH.md`.
 //!
-//! Users live in memory for now (they are gone when the server restarts). The password is
+//! Users are kept in memory. If a [`UserRepo`] is attached (the gateway does this when
+//! `DATABASE_URL` is set) every new account is also saved there, and the saved accounts are
+//! loaded back at start-up, so accounts and their ids survive a restart. The password is
 //! never stored: only an Argon2id hash. A session is a signed JWT sent as
 //! `Authorization: Bearer <token>`.
 //!
@@ -8,6 +10,8 @@
 //! handler can ask for the caller with the [`AuthUser`] extractor.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +45,27 @@ pub enum Role {
     User,
     Admin,
     Issuer,
+}
+
+impl Role {
+    /// The word used for this role when it is saved (the same as in the JSON).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::User => "user",
+            Role::Admin => "admin",
+            Role::Issuer => "issuer",
+        }
+    }
+
+    /// The reverse of [`Role::as_str`]. `None` for any other word.
+    pub fn parse(text: &str) -> Option<Role> {
+        match text {
+            "user" => Some(Role::User),
+            "admin" => Some(Role::Admin),
+            "issuer" => Some(Role::Issuer),
+            _ => None,
+        }
+    }
 }
 
 /// What the client is told about a user. Never contains the password or its hash.
@@ -127,13 +152,38 @@ impl IntoResponse for AuthError {
     }
 }
 
-#[derive(Debug, Clone)]
-struct UserRecord {
-    user_id: UserId,
-    username: String,
-    role: Role,
-    password_hash: String,
+/// One account as it is saved: the password is only ever the Argon2id hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUser {
+    pub user_id: UserId,
+    pub username: String,
+    pub role: Role,
+    pub password_hash: String,
 }
+
+/// Why saving an account failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoError {
+    /// Somebody already has this username.
+    UsernameTaken,
+    /// Anything else (the database is down, ...). The text is only for the server log.
+    Failed(String),
+}
+
+/// What a save or load returns. Written out by hand so the trait can be a `dyn` object.
+pub type RepoFuture<T> = Pin<Box<dyn Future<Output = Result<T, RepoError>> + Send>>;
+
+/// Where accounts are saved. The `dx-store` crate implements it with PostgreSQL; the tests
+/// use a fake. Attach one with [`AuthState::attach_repo`].
+pub trait UserRepo: Send + Sync {
+    /// Saves a new account. `Err(UsernameTaken)` if the name or id is already used.
+    fn insert(&self, user: StoredUser) -> RepoFuture<()>;
+    /// Saves an account, replacing the saved one with the same username. Used for the
+    /// admin and issuer accounts, whose password comes from the environment at every start.
+    fn upsert(&self, user: StoredUser) -> RepoFuture<()>;
+}
+
+type UserRecord = StoredUser;
 
 #[derive(Default)]
 struct Store {
@@ -147,6 +197,10 @@ struct Inner {
     decoding: DecodingKey,
     ttl: Duration,
     store: Mutex<Store>,
+    /// Where new accounts are saved. Empty (memory only) until `attach_repo` is called.
+    repo: OnceLock<Arc<dyn UserRepo>>,
+    /// Admin and issuer accounts whose password came from the environment: saved at attach.
+    durable_seeds: Mutex<Vec<StoredUser>>,
     /// A real hash of a throwaway password. Checked when the username does not exist, so an
     /// unknown user takes as long as a wrong password (no username guessing by timing).
     dummy_hash: OnceLock<String>,
@@ -218,6 +272,8 @@ impl AuthState {
                 next_id: FIRST_SIGNUP_ID,
                 ..Store::default()
             }),
+            repo: OnceLock::new(),
+            durable_seeds: Mutex::new(Vec::new()),
             dummy_hash: OnceLock::new(),
             failed_logins: Mutex::new(HashMap::new()),
             dev_auth,
@@ -256,18 +312,32 @@ impl AuthState {
             .unwrap_or(DEFAULT_TOKEN_TTL);
         let state = Self::new(&secret, ttl, dev_auth);
 
-        let seed = |var: &str, demo: &str| -> Option<String> {
+        // The bool says whether the password came from the environment. Only those accounts
+        // are saved to the database: a demo password must never be saved.
+        let seed = |var: &str, demo: &str| -> Option<(String, bool)> {
             match std::env::var(var) {
-                Ok(value) => Some(value),
-                Err(_) if dev_auth => Some(demo.to_string()),
+                Ok(value) => Some((value, true)),
+                Err(_) if dev_auth => Some((demo.to_string(), false)),
                 Err(_) => None,
             }
         };
-        if let Some(password) = seed("DX_ADMIN_PASSWORD", "admin-pass-1") {
-            state.seed_user(100, "admin", &password, Role::Admin);
+        let mut seeded = vec![];
+        if let Some((password, from_env)) = seed("DX_ADMIN_PASSWORD", "admin-pass-1") {
+            seeded.push((
+                state.seed_user(100, "admin", &password, Role::Admin),
+                from_env,
+            ));
         }
-        if let Some(password) = seed("DX_ISSUER_PASSWORD", "issuer-pass-1") {
-            state.seed_user(101, "issuer", &password, Role::Issuer);
+        if let Some((password, from_env)) = seed("DX_ISSUER_PASSWORD", "issuer-pass-1") {
+            seeded.push((
+                state.seed_user(101, "issuer", &password, Role::Issuer),
+                from_env,
+            ));
+        }
+        for (record, from_env) in seeded {
+            if from_env {
+                state.0.durable_seeds.lock().expect("seeds").push(record);
+            }
         }
         // Make the dummy hash now, so the first login with an unknown name is not slower.
         state.dummy_hash();
@@ -279,19 +349,58 @@ impl AuthState {
     }
 
     /// Adds an account with a fixed id and role (used for admin, issuer and demo users).
-    pub fn seed_user(&self, user_id: UserId, username: &str, password: &str, role: Role) {
+    /// Returns the account as it would be saved.
+    pub fn seed_user(
+        &self,
+        user_id: UserId,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> StoredUser {
         let password_hash = hash_password(password).expect("hash seed password");
+        let record = UserRecord {
+            user_id,
+            username: username.to_string(),
+            role,
+            password_hash,
+        };
         let mut store = self.0.store.lock().expect("auth store");
         store.name_by_id.insert(user_id, username.to_string());
-        store.by_name.insert(
-            username.to_string(),
-            UserRecord {
-                user_id,
-                username: username.to_string(),
-                role,
-                password_hash,
-            },
-        );
+        store.by_name.insert(username.to_string(), record.clone());
+        record
+    }
+
+    /// Connects the database. `saved` are the accounts it already holds: they are loaded,
+    /// and new sign-ups continue after the highest saved id, so an id is never handed out
+    /// twice. Accounts seeded in memory keep their own entry (the environment wins). The
+    /// admin and issuer accounts whose password came from the environment are saved.
+    /// Call it once, before the server starts taking requests.
+    pub async fn attach_repo(
+        &self,
+        repo: Arc<dyn UserRepo>,
+        saved: Vec<StoredUser>,
+    ) -> Result<(), String> {
+        {
+            let mut store = self.0.store.lock().expect("auth store");
+            for user in saved {
+                store.next_id = store.next_id.max(user.user_id + 1);
+                if store.by_name.contains_key(&user.username) {
+                    continue;
+                }
+                store.name_by_id.insert(user.user_id, user.username.clone());
+                store.by_name.insert(user.username.clone(), user);
+            }
+        }
+        let seeds = self.0.durable_seeds.lock().expect("seeds").clone();
+        for seed in seeds {
+            repo.upsert(seed)
+                .await
+                .map_err(|error| format!("saving a seeded account: {error:?}"))?;
+        }
+        self.0
+            .repo
+            .set(repo)
+            .map_err(|_| "a user repo is already attached".to_string())
     }
 
     /// True while the gateway may still accept the `x-dev-user` header.
@@ -440,26 +549,64 @@ async fn signup(
         .await
         .map_err(|_| AuthError::internal())??;
 
-    let user = {
-        let mut store = state.0.store.lock().expect("auth store");
-        if store.by_name.contains_key(&username) {
-            return Err(AuthError::username_taken());
+    let user = match state.0.repo.get() {
+        // Saved first, then remembered: if the save fails, nothing was created.
+        Some(repo) => {
+            let user_id = {
+                let mut store = state.0.store.lock().expect("auth store");
+                if store.by_name.contains_key(&username) {
+                    return Err(AuthError::username_taken());
+                }
+                let user_id = store.next_id;
+                store.next_id += 1;
+                user_id
+            };
+            // Sign-up always makes a normal user (docs/AUTH.md A3).
+            let record = UserRecord {
+                user_id,
+                username: username.clone(),
+                role: Role::User,
+                password_hash,
+            };
+            repo.insert(record.clone())
+                .await
+                .map_err(|error| match error {
+                    RepoError::UsernameTaken => AuthError::username_taken(),
+                    RepoError::Failed(why) => {
+                        eprintln!("auth: could not save a new account: {why}");
+                        AuthError::internal()
+                    }
+                })?;
+            let mut store = state.0.store.lock().expect("auth store");
+            store.name_by_id.insert(user_id, username.clone());
+            store.by_name.insert(username.clone(), record);
+            PublicUser {
+                user_id,
+                username,
+                role: Role::User,
+            }
         }
-        let user_id = store.next_id;
-        store.next_id += 1;
-        // Sign-up always makes a normal user (docs/AUTH.md A3).
-        let record = UserRecord {
-            user_id,
-            username: username.clone(),
-            role: Role::User,
-            password_hash,
-        };
-        store.name_by_id.insert(user_id, username.clone());
-        store.by_name.insert(username.clone(), record);
-        PublicUser {
-            user_id,
-            username,
-            role: Role::User,
+        None => {
+            let mut store = state.0.store.lock().expect("auth store");
+            if store.by_name.contains_key(&username) {
+                return Err(AuthError::username_taken());
+            }
+            let user_id = store.next_id;
+            store.next_id += 1;
+            // Sign-up always makes a normal user (docs/AUTH.md A3).
+            let record = UserRecord {
+                user_id,
+                username: username.clone(),
+                role: Role::User,
+                password_hash,
+            };
+            store.name_by_id.insert(user_id, username.clone());
+            store.by_name.insert(username.clone(), record);
+            PublicUser {
+                user_id,
+                username,
+                role: Role::User,
+            }
         }
     };
     let token = state.issue_token(&user)?;
@@ -777,5 +924,146 @@ mod tests {
         };
         assert!(user.require_role(&[Role::Admin]).is_err());
         assert!(user.require_role(&[Role::User, Role::Admin]).is_ok());
+    }
+
+    // ---- saved accounts (a fake database stands in for PostgreSQL) ----
+
+    #[derive(Default)]
+    struct FakeRepo {
+        users: Mutex<Vec<StoredUser>>,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl UserRepo for FakeRepo {
+        fn insert(&self, user: StoredUser) -> RepoFuture<()> {
+            let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
+            let mut users = self.users.lock().unwrap();
+            let result = if down {
+                Err(RepoError::Failed("the database is down".into()))
+            } else if users
+                .iter()
+                .any(|u| u.username == user.username || u.user_id == user.user_id)
+            {
+                Err(RepoError::UsernameTaken)
+            } else {
+                users.push(user);
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn upsert(&self, user: StoredUser) -> RepoFuture<()> {
+            let mut users = self.users.lock().unwrap();
+            users.retain(|u| u.username != user.username);
+            users.push(user);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    fn fresh_state() -> AuthState {
+        AuthState::new(
+            b"test-secret-test-secret-test-secret-123",
+            DEFAULT_TOKEN_TTL,
+            true,
+        )
+    }
+
+    async fn signup(app: &Router, name: &str) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::json!({"username": name, "password": "password-123"});
+        let (status, json, _) = call(app, post_json("/api/auth/signup", body)).await;
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn accounts_and_ids_survive_a_restart() {
+        let repo = Arc::new(FakeRepo::default());
+        let first = fresh_state();
+        first.attach_repo(repo.clone(), vec![]).await.unwrap();
+        let app = router(first);
+        let (status, alice) = signup(&app, "alice").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(alice["user"]["user_id"], 200);
+
+        // "Restart": a brand new state that loads what the database holds.
+        let saved = repo.users.lock().unwrap().clone();
+        let second = fresh_state();
+        second.attach_repo(repo.clone(), saved).await.unwrap();
+        let app = router(second);
+
+        // Alice can still log in, and she is still user 200.
+        let login = serde_json::json!({"username": "alice", "password": "password-123"});
+        let (status, json, _) = call(&app, post_json("/api/auth/login", login)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["user"]["user_id"], 200);
+
+        // A different person does not get her id, and cannot take her name.
+        let (status, bob) = signup(&app, "bob").await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(bob["user"]["user_id"], 201);
+        assert_eq!(signup(&app, "alice").await.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_creates_nothing() {
+        let repo = Arc::new(FakeRepo::default());
+        let state = fresh_state();
+        state.attach_repo(repo.clone(), vec![]).await.unwrap();
+        let app = router(state);
+
+        repo.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, json) = signup(&app, "carol").await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["reason"], "internal_error");
+        assert!(repo.users.lock().unwrap().is_empty());
+
+        // The name was not used up: signing up again works once the database is back.
+        repo.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(signup(&app, "carol").await.0, StatusCode::CREATED);
+        assert_eq!(repo.users.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loading_keeps_seeded_accounts_and_continues_the_ids() {
+        let state = state();
+        let saved = vec![
+            // An old saved admin with another password: the seeded one must win.
+            StoredUser {
+                user_id: 100,
+                username: "admin".into(),
+                role: Role::Admin,
+                password_hash: "not-the-seeded-hash".into(),
+            },
+            StoredUser {
+                user_id: 350,
+                username: "zed".into(),
+                role: Role::User,
+                password_hash: hash_password("password-123").unwrap(),
+            },
+        ];
+        state
+            .attach_repo(Arc::new(FakeRepo::default()), saved)
+            .await
+            .unwrap();
+        let app = router(state);
+
+        let login = serde_json::json!({"username": "admin", "password": "admin-pass-1"});
+        let (status, _, _) = call(&app, post_json("/api/auth/login", login)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (_, next) = signup(&app, "yan").await;
+        assert_eq!(next["user"]["user_id"], 351);
+    }
+
+    #[tokio::test]
+    async fn only_environment_seeded_accounts_are_saved() {
+        let repo = Arc::new(FakeRepo::default());
+        let state = fresh_state();
+        // A demo account: in memory only.
+        state.seed_user(1, "trader1", "trader-pass-1", Role::User);
+        // An account whose password came from the environment: saved.
+        let real = state.seed_user(100, "admin", "a-real-password-1", Role::Admin);
+        state.0.durable_seeds.lock().unwrap().push(real.clone());
+
+        state.attach_repo(repo.clone(), vec![]).await.unwrap();
+        assert_eq!(*repo.users.lock().unwrap(), vec![real]);
     }
 }

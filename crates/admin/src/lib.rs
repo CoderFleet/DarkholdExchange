@@ -6,11 +6,14 @@
 //! admin page and the engine can never disagree.
 //!
 //! Publishing locks a tier and hands its `MarketConfig` to a [`Publisher`], which is where the
-//! engine's "create market" command plugs in. Events and tiers live in memory for now.
+//! engine's "create market" command plugs in. Events and tiers are kept in memory. If an
+//! [`AdminRepo`] is attached (the gateway does this when `DATABASE_URL` is set) every change is
+//! also saved there and the saved data is loaded at start-up, so events, tiers and their ids
+//! survive a restart. Market ids are never reused: the engine remembers the markets it created.
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRef, Path, State};
@@ -41,6 +44,47 @@ const FIRST_MARKET_ID: MarketId = 100;
 pub type PublishFuture = Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
 /// Called once when a tier is published. Returns `Err` if the engine could not create the market.
 pub type Publisher = Arc<dyn Fn(MarketConfig) -> PublishFuture + Send + Sync>;
+
+/// An event as it is saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredEvent {
+    pub event_id: u32,
+    pub name: String,
+    pub venue: Option<String>,
+}
+
+/// A tier as it is saved. `published` tiers are the ones the engine already has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredTier {
+    pub market_id: MarketId,
+    pub event_id: u32,
+    pub tier_name: String,
+    pub config: MarketConfig,
+    pub published: bool,
+}
+
+/// Why saving failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoError {
+    /// The event already has a tier with this name (compared ignoring capitals).
+    Duplicate,
+    /// Anything else (the database is down, ...). The text is only for the server log.
+    Failed(String),
+}
+
+/// What a save returns. Written out by hand so the trait can be a `dyn` object.
+pub type RepoFuture<T> = Pin<Box<dyn Future<Output = Result<T, RepoError>> + Send>>;
+
+/// Where events and tiers are saved. The `dx-store` crate implements it with PostgreSQL; the
+/// tests use a fake. Attach one with [`AdminState::attach_repo`].
+pub trait AdminRepo: Send + Sync {
+    /// Saves a new event.
+    fn save_event(&self, event: StoredEvent) -> RepoFuture<()>;
+    /// Saves a tier, replacing the saved one with the same market id (so the same call saves
+    /// a new draft and, later, the published tier). `Err(Duplicate)` if another tier of the
+    /// event has the same name.
+    fn save_tier(&self, tier: StoredTier) -> RepoFuture<()>;
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +118,8 @@ struct Data {
 pub struct AdminState {
     data: Arc<Mutex<Data>>,
     publisher: Publisher,
+    /// Where changes are saved. Empty (memory only) until `attach_repo` is called.
+    repo: Arc<OnceLock<Arc<dyn AdminRepo>>>,
 }
 
 impl AdminState {
@@ -85,7 +131,54 @@ impl AdminState {
                 next_market_id: FIRST_MARKET_ID,
             })),
             publisher,
+            repo: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Connects the database. `events` and `tiers` are what it already holds: they are loaded,
+    /// and new events and tiers continue after the highest saved ids. Call it once, before the
+    /// server starts taking requests.
+    pub async fn attach_repo(
+        &self,
+        repo: Arc<dyn AdminRepo>,
+        mut events: Vec<StoredEvent>,
+        tiers: Vec<StoredTier>,
+    ) -> Result<(), String> {
+        {
+            let mut data = self.data.lock().expect("admin data");
+            events.sort_by_key(|event| event.event_id);
+            for event in events {
+                data.next_event_id = data.next_event_id.max(event.event_id + 1);
+                data.events.push(EventRec {
+                    event_id: event.event_id,
+                    name: event.name,
+                    venue: event.venue,
+                    tiers: Vec::new(),
+                });
+            }
+            let mut tiers = tiers;
+            tiers.sort_by_key(|tier| tier.market_id);
+            for tier in tiers {
+                data.next_market_id = data.next_market_id.max(tier.market_id + 1);
+                let event = data
+                    .events
+                    .iter_mut()
+                    .find(|event| event.event_id == tier.event_id)
+                    .ok_or_else(|| format!("saved tier {} has no event", tier.market_id))?;
+                event.tiers.push(TierRec {
+                    tier_name: tier.tier_name,
+                    config: tier.config,
+                    status: if tier.published {
+                        TierStatus::Published
+                    } else {
+                        TierStatus::Draft
+                    },
+                });
+            }
+        }
+        self.repo
+            .set(repo)
+            .map_err(|_| "an admin repo is already attached".to_string())
     }
 }
 
@@ -126,6 +219,19 @@ impl AdminError {
     }
     fn not_found() -> Self {
         Self::api(StatusCode::NOT_FOUND, "not_found")
+    }
+    fn tier_exists() -> Self {
+        Self::api(StatusCode::CONFLICT, "tier_exists")
+    }
+    /// Saving failed. The details go to the server log, not to the client.
+    fn storage_failed(error: RepoError) -> Self {
+        match error {
+            RepoError::Duplicate => Self::tier_exists(),
+            RepoError::Failed(why) => {
+                eprintln!("admin: could not save: {why}");
+                Self::api(StatusCode::INTERNAL_SERVER_ERROR, "storage_failed")
+            }
+        }
     }
 }
 
@@ -345,16 +451,36 @@ async fn create_event(
         Some(venue) if !venue.trim().is_empty() => Some(clean_name(&venue)?),
         _ => None,
     };
-    let mut data = app.admin.data.lock().expect("admin data");
+    // Take the next id now, then save, then remember. If the save fails nothing was created
+    // (the id is simply skipped).
+    let event_id = {
+        let mut data = app.admin.data.lock().expect("admin data");
+        let event_id = data.next_event_id;
+        data.next_event_id += 1;
+        event_id
+    };
     let event = EventRec {
-        event_id: data.next_event_id,
+        event_id,
         name,
         venue,
         tiers: Vec::new(),
     };
-    data.next_event_id += 1;
+    if let Some(repo) = app.admin.repo.get() {
+        repo.save_event(StoredEvent {
+            event_id,
+            name: event.name.clone(),
+            venue: event.venue.clone(),
+        })
+        .await
+        .map_err(AdminError::storage_failed)?;
+    }
     let view = event_view(&event, false);
-    data.events.push(event);
+    app.admin
+        .data
+        .lock()
+        .expect("admin data")
+        .events
+        .push(event);
     Ok((StatusCode::CREATED, Json(view)))
 }
 
@@ -368,8 +494,55 @@ async fn create_tier(
     let request = read_body(body)?;
     let tier_name = clean_name(&request.name)?;
 
+    // Check everything and take the next market id while holding the lock ...
+    let tier = {
+        let mut data = app.admin.data.lock().expect("admin data");
+        let market_id = data.next_market_id;
+        let event = data
+            .events
+            .iter()
+            .find(|event| event.event_id == event_id)
+            .ok_or_else(AdminError::not_found)?;
+        if event
+            .tiers
+            .iter()
+            .any(|tier| tier.tier_name.eq_ignore_ascii_case(&tier_name))
+        {
+            return Err(AdminError::tier_exists());
+        }
+        let config = build_config(
+            market_id,
+            event_id,
+            format!("{} {}", event.name, tier_name),
+            request.face_value_minor,
+            request.tick_size_minor,
+            request.holding_limit,
+            request.taker_fee_bps,
+        )?;
+        data.next_market_id += 1;
+        TierRec {
+            tier_name,
+            config,
+            status: TierStatus::Draft,
+        }
+    };
+
+    // ... then save it, without the lock. If the save fails nothing was created.
+    if let Some(repo) = app.admin.repo.get() {
+        repo.save_tier(StoredTier {
+            market_id: tier.config.id,
+            event_id,
+            tier_name: tier.tier_name.clone(),
+            config: tier.config.clone(),
+            published: false,
+        })
+        .await
+        .map_err(AdminError::storage_failed)?;
+    }
+
+    // Finally remember it. Two requests with the same name can both pass the first check, so
+    // look again: the second one is refused.
     let mut data = app.admin.data.lock().expect("admin data");
-    let market_id = data.next_market_id;
     let event = data
         .events
         .iter_mut()
@@ -378,27 +551,12 @@ async fn create_tier(
     if event
         .tiers
         .iter()
-        .any(|tier| tier.tier_name.eq_ignore_ascii_case(&tier_name))
+        .any(|other| other.tier_name.eq_ignore_ascii_case(&tier.tier_name))
     {
-        return Err(AdminError::api(StatusCode::CONFLICT, "tier_exists"));
+        return Err(AdminError::tier_exists());
     }
-    let config = build_config(
-        market_id,
-        event_id,
-        format!("{} {}", event.name, tier_name),
-        request.face_value_minor,
-        request.tick_size_minor,
-        request.holding_limit,
-        request.taker_fee_bps,
-    )?;
-    let tier = TierRec {
-        tier_name,
-        config,
-        status: TierStatus::Draft,
-    };
     let view = tier_view(&tier);
     event.tiers.push(tier);
-    data.next_market_id += 1;
     Ok((StatusCode::CREATED, Json(view)))
 }
 
@@ -445,22 +603,47 @@ async fn publish_tier(
     let result = (app.admin.publisher)(config.clone()).await;
 
     // Step 3, under the lock: lock the tier for good, or put it back as a draft.
+    let saved = {
+        let mut data = app.admin.data.lock().expect("admin data");
+        let event_id = data
+            .events
+            .iter()
+            .find(|event| event.tiers.iter().any(|tier| tier.config.id == market_id))
+            .map(|event| event.event_id)
+            .ok_or_else(AdminError::not_found)?;
+        let tier = find_tier(&mut data, market_id)?;
+        match result {
+            Ok(()) => {
+                tier.config = config;
+                tier.status = TierStatus::Published;
+                StoredTier {
+                    market_id,
+                    event_id,
+                    tier_name: tier.tier_name.clone(),
+                    config: tier.config.clone(),
+                    published: true,
+                }
+            }
+            Err(_) => {
+                tier.status = TierStatus::Draft;
+                return Err(AdminError::api(
+                    StatusCode::BAD_GATEWAY,
+                    "market_setup_failed",
+                ));
+            }
+        }
+    };
+
+    // Step 4, without the lock: save the new status. The engine already has the market, so if
+    // this fails the tier stays published in memory and the admin is told it was not saved.
+    if let Some(repo) = app.admin.repo.get() {
+        repo.save_tier(saved)
+            .await
+            .map_err(AdminError::storage_failed)?;
+    }
     let mut data = app.admin.data.lock().expect("admin data");
     let tier = find_tier(&mut data, market_id)?;
-    match result {
-        Ok(()) => {
-            tier.config = config;
-            tier.status = TierStatus::Published;
-            Ok(Json(tier_view(tier)))
-        }
-        Err(_) => {
-            tier.status = TierStatus::Draft;
-            Err(AdminError::api(
-                StatusCode::BAD_GATEWAY,
-                "market_setup_failed",
-            ))
-        }
-    }
+    Ok(Json(tier_view(tier)))
 }
 
 fn find_tier(data: &mut Data, market_id: MarketId) -> Result<&mut TierRec, AdminError> {
@@ -528,6 +711,16 @@ mod tests {
     }
 
     async fn harness(fail_publish: bool) -> Harness {
+        harness_with(fail_publish, None, vec![], vec![]).await
+    }
+
+    /// Like `harness`, with a database attached (and what it already holds).
+    async fn harness_with(
+        fail_publish: bool,
+        repo: Option<Arc<FakeRepo>>,
+        saved_events: Vec<StoredEvent>,
+        saved_tiers: Vec<StoredTier>,
+    ) -> Harness {
         let auth = AuthState::new(
             b"test-secret-test-secret-test-secret-123",
             std::time::Duration::from_secs(3600),
@@ -547,7 +740,14 @@ mod tests {
                 Ok(())
             })
         });
-        let app = dx_auth::router(auth.clone()).merge(router(AdminState::new(publisher), auth));
+        let admin = AdminState::new(publisher);
+        if let Some(repo) = repo {
+            admin
+                .attach_repo(repo, saved_events, saved_tiers)
+                .await
+                .unwrap();
+        }
+        let app = dx_auth::router(auth.clone()).merge(router(admin, auth));
         let login = |name: &str, password: &str| {
             json_request(
                 "POST",
@@ -791,5 +991,184 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    // ---- saved events and tiers (a fake database stands in for PostgreSQL) ----
+
+    #[derive(Default)]
+    struct FakeRepo {
+        events: Mutex<Vec<StoredEvent>>,
+        tiers: Mutex<Vec<StoredTier>>,
+        down: std::sync::atomic::AtomicBool,
+    }
+
+    impl AdminRepo for FakeRepo {
+        fn save_event(&self, event: StoredEvent) -> RepoFuture<()> {
+            let result = if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(RepoError::Failed("the database is down".into()))
+            } else {
+                self.events.lock().unwrap().push(event);
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+
+        fn save_tier(&self, tier: StoredTier) -> RepoFuture<()> {
+            let mut tiers = self.tiers.lock().unwrap();
+            let result = if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+                Err(RepoError::Failed("the database is down".into()))
+            } else if tiers.iter().any(|other| {
+                other.market_id != tier.market_id
+                    && other.event_id == tier.event_id
+                    && other.tier_name.eq_ignore_ascii_case(&tier.tier_name)
+            }) {
+                Err(RepoError::Duplicate)
+            } else {
+                tiers.retain(|other| other.market_id != tier.market_id);
+                tiers.push(tier);
+                Ok(())
+            };
+            Box::pin(async move { result })
+        }
+    }
+
+    async fn publish(h: &Harness, market_id: u64) -> (StatusCode, serde_json::Value) {
+        call(
+            &h.app,
+            json_request(
+                "POST",
+                &format!("/api/admin/tiers/{market_id}/publish"),
+                Some(&h.admin_token),
+                serde_json::json!({}),
+            ),
+        )
+        .await
+    }
+
+    async fn all_events(h: &Harness) -> serde_json::Value {
+        let (status, body) = call(
+            &h.app,
+            get_request("/api/admin/events", Some(&h.admin_token)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        body
+    }
+
+    #[tokio::test]
+    async fn events_and_tiers_survive_a_restart() {
+        let repo = Arc::new(FakeRepo::default());
+        let h = harness_with(false, Some(repo.clone()), vec![], vec![]).await;
+        let event = new_event(&h).await;
+        let event_id = event["event_id"].as_u64().unwrap();
+        let (_, tier) = new_tier(&h, event_id, "General", 500_000).await;
+        let market_id = tier["market_id"].as_u64().unwrap();
+        assert_eq!(publish(&h, market_id).await.0, StatusCode::OK);
+        let (_, draft) = new_tier(&h, event_id, "VIP", 1_000_000).await;
+
+        // "Restart": a brand new server that loads what the database holds.
+        let saved_events = repo.events.lock().unwrap().clone();
+        let saved_tiers = repo.tiers.lock().unwrap().clone();
+        let h2 = harness_with(false, Some(repo.clone()), saved_events, saved_tiers).await;
+
+        let list = all_events(&h2).await;
+        assert_eq!(list.as_array().unwrap().len(), 1);
+        let tiers = list[0]["tiers"].as_array().unwrap();
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[0]["status"], "published");
+        assert_eq!(tiers[1]["status"], "draft");
+        // A published tier stays locked, the draft can still be published.
+        assert_eq!(publish(&h2, market_id).await.0, StatusCode::CONFLICT);
+        let draft_id = draft["market_id"].as_u64().unwrap();
+        assert_eq!(publish(&h2, draft_id).await.0, StatusCode::OK);
+
+        // New ids continue after the saved ones: no id is ever handed out twice.
+        let event2 = new_event(&h2).await;
+        assert_eq!(event2["event_id"].as_u64().unwrap(), event_id + 1);
+        let (_, tier2) = new_tier(
+            &h2,
+            event2["event_id"].as_u64().unwrap(),
+            "General",
+            500_000,
+        )
+        .await;
+        assert_eq!(tier2["market_id"].as_u64().unwrap(), draft_id + 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_creates_nothing() {
+        let repo = Arc::new(FakeRepo::default());
+        let h = harness_with(false, Some(repo.clone()), vec![], vec![]).await;
+        repo.down.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (status, body) = call(
+            &h.app,
+            json_request(
+                "POST",
+                "/api/admin/events",
+                Some(&h.admin_token),
+                serde_json::json!({"name": "Day 1"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("storage_failed"))
+        );
+        assert_eq!(all_events(&h).await.as_array().unwrap().len(), 0);
+
+        // Once the database is back, everything works again.
+        repo.down.store(false, std::sync::atomic::Ordering::SeqCst);
+        let event = new_event(&h).await;
+        let event_id = event["event_id"].as_u64().unwrap();
+        repo.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = new_tier(&h, event_id, "General", 500_000).await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("storage_failed"))
+        );
+        let list = all_events(&h).await;
+        assert_eq!(list[0]["tiers"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_database_has_the_last_word_on_duplicate_tier_names() {
+        let repo = Arc::new(FakeRepo::default());
+        let h = harness_with(false, Some(repo.clone()), vec![], vec![]).await;
+        let event = new_event(&h).await;
+        let event_id = event["event_id"].as_u64().unwrap();
+        // Another request got there first: the database has the tier, this server does not yet.
+        repo.tiers.lock().unwrap().push(StoredTier {
+            market_id: 999,
+            event_id: event_id as u32,
+            tier_name: "general".into(),
+            config: build_config(999, event_id as u32, "x".into(), 500_000, None, None, None)
+                .unwrap(),
+            published: false,
+        });
+        let (status, body) = new_tier(&h, event_id, "General", 500_000).await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (StatusCode::CONFLICT, Some("tier_exists"))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_save_after_publishing_is_reported() {
+        let repo = Arc::new(FakeRepo::default());
+        let h = harness_with(false, Some(repo.clone()), vec![], vec![]).await;
+        let event = new_event(&h).await;
+        let (_, tier) = new_tier(&h, event["event_id"].as_u64().unwrap(), "General", 500_000).await;
+        let market_id = tier["market_id"].as_u64().unwrap();
+
+        repo.down.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (status, body) = publish(&h, market_id).await;
+        assert_eq!(
+            (status, body["reason"].as_str()),
+            (StatusCode::INTERNAL_SERVER_ERROR, Some("storage_failed"))
+        );
+        // The engine has the market, so the tier is locked as published here.
+        assert_eq!(h.seen.lock().unwrap().len(), 1);
+        assert_eq!(all_events(&h).await[0]["tiers"][0]["status"], "published");
     }
 }

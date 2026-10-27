@@ -109,6 +109,30 @@ fn admin_state(writer: WriterHandle) -> dx_admin::AdminState {
     dx_admin::AdminState::new(market_publisher(writer))
 }
 
+/// Accounts, events and tiers are saved in PostgreSQL when `DATABASE_URL` is set, so they
+/// survive a restart (the engine's money and markets already do, through the log). Without it
+/// they stay in memory, which is fine for a local try-out but not for a real run: after a
+/// restart the engine would still hold the old accounts' money while their ids are handed out
+/// again. So a real run (`DX_DEV_AUTH=0`) refuses to start without a database.
+async fn attach_database(auth: &dx_auth::AuthState, admin: &dx_admin::AdminState) {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) => {
+            if let Err(error) = dx_store::attach(&url, auth, admin).await {
+                panic!("database: {error}");
+            }
+            println!("database: accounts, events and tiers are saved in PostgreSQL");
+        }
+        Err(_) if !auth.dev_auth_enabled() => {
+            panic!("DATABASE_URL must be set when DX_DEV_AUTH=0 (see docs/AUTH.md)")
+        }
+        Err(_) => eprintln!(
+            "database: DATABASE_URL is not set, so accounts and events are kept in memory only \
+             and are lost on restart. If the write-ahead log is on, delete the data folder \
+             before restarting, or new sign-ups will be given the old accounts' ids and money."
+        ),
+    }
+}
+
 fn writer_error(error: WriterError) -> ApiError {
     match error {
         WriterError::QueueFull => api_error(StatusCode::TOO_MANY_REQUESTS, ReasonCode::QueueFull),
@@ -223,6 +247,7 @@ async fn main() {
     let admin = admin_state(writer.clone());
     // Login, sign-up and /api/me (docs/AUTH.md), and the check every other endpoint uses.
     let auth = dx_auth::AuthState::from_env();
+    attach_database(&auth, &admin).await;
     let state = AppState {
         writer,
         metrics,
