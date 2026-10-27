@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wal::{WalOp, WalSession};
-use dkx_escrow::{AdminRuling, DisputeRecord, EscrowRecord};
+use dkx_escrow::{AdminRuling, DisputeRecord};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
@@ -272,11 +272,11 @@ enum WriterRequest {
     },
     // ── Escrow operations ──────────────────────────────────────────────────
     AllEscrows {
-        reply: oneshot::Sender<Vec<EscrowRecord>>,
+        reply: oneshot::Sender<Vec<dkx_escrow::EscrowRecord>>,
     },
     GetEscrow {
         id: u64,
-        reply: oneshot::Sender<Option<EscrowRecord>>,
+        reply: oneshot::Sender<Option<dkx_escrow::EscrowRecord>>,
     },
     EscrowAccept {
         user_id: UserId,
@@ -584,12 +584,15 @@ impl WriterHandle {
 
     // ── Escrow handle methods ──────────────────────────────────────────────
 
-    pub(crate) async fn all_escrows(&self) -> Result<Vec<EscrowRecord>, WriterError> {
+    pub(crate) async fn all_escrows(&self) -> Result<Vec<dkx_escrow::EscrowRecord>, WriterError> {
         self.request(|reply| WriterRequest::AllEscrows { reply })
             .await
     }
 
-    pub(crate) async fn get_escrow(&self, id: u64) -> Result<Option<EscrowRecord>, WriterError> {
+    pub(crate) async fn get_escrow(
+        &self,
+        id: u64,
+    ) -> Result<Option<dkx_escrow::EscrowRecord>, WriterError> {
         self.request(|reply| WriterRequest::GetEscrow { id, reply })
             .await
     }

@@ -136,6 +136,7 @@ fn escrow_holds_then_releases_cash_and_passes() {
         notional: 5_000,
         fee: 50,
         fee_payer: 1,
+        escrow: true,
     };
     ledger.hold_escrow(settlement).unwrap();
 
@@ -194,6 +195,7 @@ fn escrow_refund_returns_both_sides() {
         notional: 5_000,
         fee: 50,
         fee_payer: 1,
+        escrow: true,
     };
     ledger.hold_escrow(settlement).unwrap();
     ledger.refund_escrow(settlement).unwrap();

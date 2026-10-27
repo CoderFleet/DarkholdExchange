@@ -1944,7 +1944,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
                 side,
                 price_ticks,
                 qty,
-                escrow: false, // <-- Added here
+                escrow: false,
             }),
         );
         assert_eq!(
@@ -1965,7 +1965,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
             side: Side::Buy,
             qty: 1,
             protect_price_ticks: 5_200,
-            escrow: false, // <-- Added here
+            escrow: false,
         }),
     );
     assert_eq!(sweep.status, OrderStatus::Filled, "seed sweep: {sweep:?}");
@@ -1979,7 +1979,7 @@ fn seed_demo(core: &mut Core) -> Vec<Fill> {
             side: Side::Sell,
             price_ticks: 5_100,
             qty: 1,
-            escrow: false, // <-- Added here
+            escrow: false,
         }),
     );
     assert_eq!(

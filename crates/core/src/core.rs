@@ -1189,6 +1189,7 @@ impl Core {
             notional,
             fee,
             fee_payer: buyer_id,
+            escrow: false,
         };
         if self.ledger.settle_trade(settlement).is_err() {
             self.poisoned = true;
@@ -1608,6 +1609,7 @@ fn escrow_settlement(record: &EscrowRecord) -> TradeSettlement {
         notional: record.notional,
         fee: record.fee,
         fee_payer: record.fee_payer,
+        escrow: true,
     }
 }
 

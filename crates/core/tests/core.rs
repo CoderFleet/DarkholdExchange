@@ -86,6 +86,7 @@ fn escrow_limit(client_order_id: u64, side: Side, price_ticks: Ticks, qty: Qty) 
         side,
         price_ticks,
         qty,
+        escrow: false,
     })
 }
 
