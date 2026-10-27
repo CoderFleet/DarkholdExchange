@@ -171,3 +171,51 @@ both win.
 saves the tier as published. If the server crashes between the two, the tier is saved as a draft
 while the engine already has the market, and publishing it again fails. This needs a manual fix
 for now.
+
+
+## 6. Issuer: creating passes
+
+Passes are only ever created by issuing. Before this, the only way was the dev endpoint
+`/api/dev/issue`, which exists only while `DX_DEV_AUTH=1`. The issuer endpoints work in a real run.
+
+Both need a login token whose role is `issuer`. No token (the `x-dev-user` header does not count,
+even in dev mode) answers `401 unauthorized`, any other role answers `403 forbidden`.
+
+### 6.1 Issue passes
+
+```http
+POST /api/issuer/issue
+Authorization: Bearer <issuer token>
+Content-Type: application/json
+```
+
+```json
+{ "username": "dana", "market_id": 1, "qty": 3, "client_request_id": 5001 }
+```
+
+Response `200`: `{ "journal_id": 26 }`.
+
+- `username` is matched the same way as at login (capitals and spaces around it do not matter).
+- `qty` is 1 to 1,000 per request. A bigger batch takes several requests, so a typo cannot flood a
+  market. Otherwise `400 invalid_quantity`.
+- Sending the same `client_request_id` again for the same user and market returns the same
+  `journal_id` and creates nothing, so a retry after a timeout is safe.
+- Errors: `404 unknown_user`, `404 unknown_market`.
+- Each issue is written to the write-ahead log like any other engine change, and the gateway
+  prints one line (issuer id, quantity, market, user, journal id).
+
+### 6.2 Supply
+
+```http
+GET /api/issuer/supply
+Authorization: Bearer <issuer token>
+```
+
+Response `200`: a list, one row per market, sorted by market id:
+
+```json
+[{ "market_id": 1, "name": "Day 1 General", "passes_held": 15 }]
+```
+
+`passes_held` is how many passes users hold now (available and reserved). Passes are never
+destroyed, so this is also how many were issued so far.

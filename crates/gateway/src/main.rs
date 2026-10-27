@@ -99,6 +99,10 @@ fn forbidden() -> ApiError {
     auth_error(StatusCode::FORBIDDEN, "forbidden")
 }
 
+fn unknown_user() -> ApiError {
+    auth_error(StatusCode::NOT_FOUND, "unknown_user")
+}
+
 fn market_publisher(writer: WriterHandle) -> dx_admin::Publisher {
     Arc::new(move |config| {
         let writer = writer.clone();
@@ -211,6 +215,27 @@ struct DevIssue {
     client_request_id: ClientOrderId,
 }
 
+/// Most passes one issue request may create. A typo (an extra zero) cannot flood a market, and
+/// a bigger batch simply takes several requests.
+const MAX_ISSUE_QTY: Qty = 1_000;
+
+#[derive(Deserialize)]
+struct IssuePasses {
+    username: String,
+    market_id: MarketId,
+    qty: Qty,
+    client_request_id: ClientOrderId,
+}
+
+#[derive(Serialize)]
+struct SupplyRow {
+    market_id: MarketId,
+    name: String,
+    /// Passes that users hold right now (available and reserved). Passes are only ever created
+    /// by issuing, so this is the number issued so far.
+    passes_held: u64,
+}
+
 fn seeded_core() -> (Core, Vec<Fill>) {
     let mut core = Core::new(seed_markets()).expect("valid seed markets");
     let seed_fills = seed_demo(&mut core);
@@ -294,6 +319,8 @@ async fn main() {
         .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
         .route("/api/dev/issue", post(dev_issue))
+        .route("/api/issuer/issue", post(issuer_issue))
+        .route("/api/issuer/supply", get(issuer_supply))
         .route("/ws", get(ws))
         .route("/ws/market/{market_id}", get(ws_market))
         .with_state(state)
@@ -648,6 +675,73 @@ async fn dev_issue(
     Ok(Json(JournalResponse { journal_id }))
 }
 
+/// Credits passes to a user. Only a logged-in `issuer` may call it, in dev mode too: unlike the
+/// `/api/dev/*` endpoints it never accepts the `x-dev-user` header, so every issue is tied to a
+/// real login. Sending the same `client_request_id` again changes nothing (the ledger replies
+/// with the first answer), so a retried request cannot create passes twice.
+async fn issuer_issue(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<IssuePasses>, JsonRejection>,
+) -> Result<Json<JournalResponse>, ApiError> {
+    let issuer_id = require_issuer(&state.auth, &headers)?;
+    let body = json_body(payload)?;
+    if body.qty == 0 || body.qty > MAX_ISSUE_QTY {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidQuantity,
+        ));
+    }
+    let user_id = state
+        .auth
+        .user_id_of(&body.username)
+        .ok_or_else(unknown_user)?;
+    let journal_id = state
+        .writer
+        .issue(user_id, body.market_id, body.qty, body.client_request_id)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    println!(
+        "issuer {issuer_id}: {} passes of market {} to user {user_id} (journal {journal_id})",
+        body.qty, body.market_id
+    );
+    Ok(Json(JournalResponse { journal_id }))
+}
+
+/// For the issuer console: every market and how many of its passes users hold.
+async fn issuer_supply(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SupplyRow>>, ApiError> {
+    require_issuer(&state.auth, &headers)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    let snapshot = state
+        .writer
+        .solvency(state.auth.user_ids())
+        .await
+        .map_err(writer_error)?;
+    let roots = snapshot.roots();
+    let mut rows: Vec<SupplyRow> = markets
+        .into_iter()
+        .map(|market| {
+            let asset = dx_types::Asset::Pass {
+                market_id: market.config.id,
+            };
+            SupplyRow {
+                market_id: market.config.id,
+                name: market.config.name,
+                passes_held: roots
+                    .iter()
+                    .find(|root| root.asset == asset)
+                    .map_or(0, |root| root.total_liabilities),
+            }
+        })
+        .collect();
+    rows.sort_by_key(|row| row.market_id);
+    Ok(Json(rows))
+}
+
 /// Who is calling: a logged-in user (token) or, in dev only, whoever the old header says.
 #[derive(Debug, PartialEq, Eq)]
 enum Caller {
@@ -702,6 +796,19 @@ fn authorize_user(
         }
         Caller::Token { .. } => Err(forbidden()),
         Caller::Dev(_) => Ok(()),
+    }
+}
+
+/// The caller must be logged in as an `issuer`. No token (even in dev mode) is 401, any other
+/// role is 403. Returns the issuer's user id.
+fn require_issuer(auth: &dx_auth::AuthState, headers: &HeaderMap) -> Result<UserId, ApiError> {
+    match identify(auth, headers)? {
+        Caller::Token {
+            user_id,
+            role: dx_auth::Role::Issuer,
+        } => Ok(user_id),
+        Caller::Token { .. } => Err(forbidden()),
+        Caller::Dev(_) => Err(unauthorized()),
     }
 }
 
@@ -2383,5 +2490,128 @@ mod tests {
             (error.status, error.raw_reason),
             (StatusCode::FORBIDDEN, Some("forbidden"))
         );
+    }
+
+    #[test]
+    fn only_a_logged_in_issuer_passes_the_issuer_check() {
+        let auth = auth_state(true);
+        let bearer = |role| {
+            let token = token_for(&auth, 101, role);
+            headers(&[("authorization", &format!("Bearer {token}"))])
+        };
+        assert_eq!(
+            require_issuer(&auth, &bearer(dx_auth::Role::Issuer)).unwrap(),
+            101
+        );
+        for role in [dx_auth::Role::User, dx_auth::Role::Admin] {
+            let error = require_issuer(&auth, &bearer(role)).unwrap_err();
+            assert_eq!(
+                (error.status, error.raw_reason),
+                (StatusCode::FORBIDDEN, Some("forbidden"))
+            );
+        }
+        // The dev header is never enough, even while dev auth is on, and so is no header at all.
+        for map in [headers(&[("x-dev-user", "101")]), headers(&[])] {
+            let error = require_issuer(&auth, &map).unwrap_err();
+            assert_eq!(
+                (error.status, error.raw_reason),
+                (StatusCode::UNAUTHORIZED, Some("unauthorized"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_issuer_credits_passes_by_username_and_a_retry_changes_nothing() {
+        let (state, _rx) = test_state();
+        state
+            .auth
+            .seed_user(7, "buyer", "password-123", dx_auth::Role::User);
+        let token = token_for(&state.auth, 101, dx_auth::Role::Issuer);
+        let map = headers(&[("authorization", &format!("Bearer {token}"))]);
+        let issue = |username: &str, market_id: MarketId, qty: Qty, request: ClientOrderId| {
+            issuer_issue(
+                State(state.clone()),
+                map.clone(),
+                Ok(Json(IssuePasses {
+                    username: username.into(),
+                    market_id,
+                    qty,
+                    client_request_id: request,
+                })),
+            )
+        };
+        let passes_of_7 = || async {
+            state
+                .writer
+                .balances(7)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|balance| balance.asset == dx_types::Asset::Pass { market_id: 1 })
+                .map_or(0, |balance| balance.available)
+        };
+
+        // The name is matched ignoring capitals and spaces.
+        let Json(first) = issue(" Buyer ", 1, 3, 900).await.unwrap();
+        assert_eq!(passes_of_7().await, 3);
+
+        // The same request again gives the same answer and creates nothing.
+        let Json(again) = issue("buyer", 1, 3, 900).await.unwrap();
+        assert_eq!(again.journal_id, first.journal_id);
+        assert_eq!(passes_of_7().await, 3);
+
+        // A new request id is a new issue.
+        let _ = issue("buyer", 1, 2, 901).await.unwrap();
+        assert_eq!(passes_of_7().await, 5);
+
+        // Bad requests are refused and change nothing.
+        for qty in [0, MAX_ISSUE_QTY + 1] {
+            let error = issue("buyer", 1, qty, 902).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        let error = issue("nobody", 1, 1, 903).await.unwrap_err();
+        assert_eq!(
+            (error.status, error.raw_reason),
+            (StatusCode::NOT_FOUND, Some("unknown_user"))
+        );
+        let error = issue("buyer", 99, 1, 904).await.unwrap_err();
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(passes_of_7().await, 5);
+    }
+
+    #[tokio::test]
+    async fn the_supply_view_counts_the_passes_users_hold() {
+        let (state, _rx) = test_state();
+        state
+            .auth
+            .seed_user(7, "buyer", "password-123", dx_auth::Role::User);
+        let token = token_for(&state.auth, 101, dx_auth::Role::Issuer);
+        let map = headers(&[("authorization", &format!("Bearer {token}"))]);
+
+        let Json(before) = issuer_supply(State(state.clone()), map.clone())
+            .await
+            .unwrap();
+        let held = |rows: &[SupplyRow]| {
+            rows.iter()
+                .find(|row| row.market_id == MARKET)
+                .map(|row| row.passes_held)
+        };
+        // `test_state` already gave user 2 five passes of this market.
+        assert_eq!(held(&before), Some(5));
+        assert!(
+            before
+                .windows(2)
+                .all(|pair| pair[0].market_id < pair[1].market_id)
+        );
+
+        state.writer.issue(7, MARKET, 4, 1).await.unwrap().unwrap();
+        let Json(after) = issuer_supply(State(state.clone()), map).await.unwrap();
+        assert_eq!(held(&after), Some(9));
+
+        // An ordinary user cannot see it.
+        let user_token = token_for(&state.auth, 7, dx_auth::Role::User);
+        let user_map = headers(&[("authorization", &format!("Bearer {user_token}"))]);
+        let error = issuer_supply(State(state), user_map).await.err().unwrap();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 }
