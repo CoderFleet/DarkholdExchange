@@ -60,6 +60,7 @@ cargo build --release -p dx-gateway -p dx-simulator
 
 GATEWAY_ADDR="$HOST:$PORT" \
     DX_COMMAND_QUEUE_CAPACITY="$QUEUE_CAPACITY" \
+    DX_RATE_LIMIT="${DX_LOAD_RATE_LIMIT:-off}" \
     DX_WAL_DIR="$wal_dir" \
     target/release/dx-gateway >"$log" 2>&1 &
 gateway_pid=$!
