@@ -2652,14 +2652,14 @@ struct EscrowStateQuery {
 }
 
 #[derive(Debug, Serialize)]
-struct EscrowReceiptView {
+struct Stage6EscrowReceiptView {
     bytes_hex: String,
     signature_hex: String,
     public_key_hex: String,
 }
 
 #[derive(Debug, Serialize)]
-struct EscrowView {
+struct Stage6EscrowView {
     id: u64,
     trade_id: u64,
     market_id: u32,
@@ -2671,12 +2671,12 @@ struct EscrowView {
     state: String,
     delivered_at: u64,
     deadline: u64,
-    receipt: EscrowReceiptView,
+    receipt: Stage6EscrowReceiptView,
     role: String,
 }
 
-fn escrow_to_view(e: &dkx_escrow::EscrowRecord, role: &str, pub_key: &str) -> EscrowView {
-    EscrowView {
+fn escrow_to_view(e: &dkx_escrow::EscrowRecord, role: &str, pub_key: &str) -> Stage6EscrowView {
+    Stage6EscrowView {
         id: e.id,
         trade_id: e.trade_id,
         market_id: e.market_id,
@@ -2688,7 +2688,7 @@ fn escrow_to_view(e: &dkx_escrow::EscrowRecord, role: &str, pub_key: &str) -> Es
         state: format!("{:?}", e.state),
         delivered_at: e.delivered_at,
         deadline: e.deadline,
-        receipt: EscrowReceiptView {
+        receipt: Stage6EscrowReceiptView {
             bytes_hex: hex::encode(&e.receipt_bytes),
             signature_hex: hex::encode(&e.receipt_sig),
             public_key_hex: pub_key.to_string(),
@@ -2706,7 +2706,7 @@ async fn escrow_list(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<EscrowStateQuery>,
-) -> Result<Json<Vec<EscrowView>>, ApiError> {
+) -> Result<Json<Vec<Stage6EscrowView>>, ApiError> {
     let user_id = caller_user(&state, &headers)?;
     let escrows = state.writer.all_escrows().await.map_err(writer_error)?;
     let pub_key = state.writer.escrow_public_key().await.unwrap_or_default();
@@ -2731,7 +2731,7 @@ async fn escrow_get(
     Path(id): Path<u64>,
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<EscrowView>, ApiError> {
+) -> Result<Json<Stage6EscrowView>, ApiError> {
     let user_id = caller_user(&state, &headers)?;
     let e = state
         .writer
