@@ -17,10 +17,11 @@ use dkx_escrow::{AdminRuling, DisputeRecord};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    AcceptDutchAuction, Asset, AuctionAccept, Balance, BookDelta, BookSnapshot, ClientOrderId,
-    Command, CommandResponse, CreateDutchAuction, DutchAuction, EscrowRecord, Fill, MarketConfig,
-    MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, Seq, TradeId, UserId,
-    WsServerMessage,
+    AcceptDutchAuction, Asset, AuctionAccept, Balance, BatchAuction, BatchAuctionFill,
+    BidRecord, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, CommitBid,
+    CreateBatchAuction, CreateDutchAuction, DutchAuction, EscrowRecord, Fill, MarketConfig,
+    MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, RevealBid, Seq,
+    SettleBatchAuction, TradeId, UserId, WsServerMessage,
 };
 use hdrhistogram::Histogram;
 use tokio::sync::{broadcast, oneshot};
@@ -264,6 +265,42 @@ enum WriterRequest {
     Auction {
         auction_id: u64,
         reply: oneshot::Sender<Option<DutchAuction>>,
+    },
+    CreateBatchAuction {
+        seller_id: UserId,
+        request: CreateBatchAuction,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<BatchAuction, ReasonCode>>,
+    },
+    CommitBatchBid {
+        bidder_id: UserId,
+        request: CommitBid,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<BidRecord, ReasonCode>>,
+    },
+    RevealBatchBid {
+        bidder_id: UserId,
+        request: RevealBid,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<BidRecord, ReasonCode>>,
+    },
+    SettleBatchAuction {
+        caller_id: UserId,
+        request: SettleBatchAuction,
+        now_ms: u64,
+        reply: oneshot::Sender<Result<Vec<BatchAuctionFill>, ReasonCode>>,
+    },
+    BatchAuctions {
+        market_id: Option<MarketId>,
+        reply: oneshot::Sender<Vec<BatchAuction>>,
+    },
+    BatchAuction {
+        auction_id: u64,
+        reply: oneshot::Sender<Option<BatchAuction>>,
+    },
+    BatchBids {
+        auction_id: u64,
+        reply: oneshot::Sender<Vec<BidRecord>>,
     },
     Baseline {
         market_filter: Option<Vec<MarketId>>,
@@ -566,6 +603,90 @@ impl WriterHandle {
         auction_id: u64,
     ) -> Result<Option<DutchAuction>, WriterError> {
         self.request(|reply| WriterRequest::Auction { auction_id, reply })
+            .await
+    }
+
+    pub(crate) async fn create_batch_auction(
+        &self,
+        seller_id: UserId,
+        request: CreateBatchAuction,
+        now_ms: u64,
+    ) -> Result<Result<BatchAuction, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::CreateBatchAuction {
+            seller_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn commit_batch_bid(
+        &self,
+        bidder_id: UserId,
+        request: CommitBid,
+        now_ms: u64,
+    ) -> Result<Result<BidRecord, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::CommitBatchBid {
+            bidder_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn reveal_batch_bid(
+        &self,
+        bidder_id: UserId,
+        request: RevealBid,
+        now_ms: u64,
+    ) -> Result<Result<BidRecord, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::RevealBatchBid {
+            bidder_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn settle_batch_auction(
+        &self,
+        caller_id: UserId,
+        request: SettleBatchAuction,
+        now_ms: u64,
+    ) -> Result<Result<Vec<BatchAuctionFill>, ReasonCode>, WriterError> {
+        self.request(|reply| WriterRequest::SettleBatchAuction {
+            caller_id,
+            request,
+            now_ms,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn batch_auctions(
+        &self,
+        market_id: Option<MarketId>,
+    ) -> Result<Vec<BatchAuction>, WriterError> {
+        self.request(|reply| WriterRequest::BatchAuctions { market_id, reply })
+            .await
+    }
+
+    pub(crate) async fn batch_auction(
+        &self,
+        auction_id: u64,
+    ) -> Result<Option<BatchAuction>, WriterError> {
+        self.request(|reply| WriterRequest::BatchAuction { auction_id, reply })
+            .await
+    }
+
+    pub(crate) async fn batch_bids(
+        &self,
+        auction_id: u64,
+    ) -> Result<Vec<BidRecord>, WriterError> {
+        self.request(|reply| WriterRequest::BatchBids { auction_id, reply })
             .await
     }
 
@@ -1219,6 +1340,83 @@ fn writer_loop(
             }
             WriterRequest::Auction { auction_id, reply } => {
                 let _ = reply.send(core.dutch_auction(auction_id).cloned());
+            }
+            WriterRequest::CreateBatchAuction {
+                seller_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::CreateBatchAuction {
+                    seller_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.create_batch_auction(seller_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::CommitBatchBid {
+                bidder_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::CommitBatchBid {
+                    bidder_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.commit_batch_bid(bidder_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::RevealBatchBid {
+                bidder_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::RevealBatchBid {
+                    bidder_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.reveal_batch_bid(bidder_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::SettleBatchAuction {
+                caller_id,
+                request,
+                now_ms,
+                reply,
+            } => {
+                let wal_op = WalOp::SettleBatchAuction {
+                    caller_id,
+                    request: request.clone(),
+                    now_ms,
+                };
+                let result = core.settle_batch_auction(caller_id, request, now_ms);
+                if result.is_ok() {
+                    append_wal(&mut wal, &wal_op, core.state_hash());
+                }
+                let _ = reply.send(result);
+            }
+            WriterRequest::BatchAuctions { market_id, reply } => {
+                let _ = reply.send(core.batch_auctions(market_id));
+            }
+            WriterRequest::BatchAuction { auction_id, reply } => {
+                let _ = reply.send(core.batch_auction(auction_id).cloned());
+            }
+            WriterRequest::BatchBids { auction_id, reply } => {
+                let _ = reply.send(core.batch_bids(auction_id));
             }
             WriterRequest::Baseline {
                 market_filter,

@@ -6,6 +6,7 @@
 mod api;
 mod asset;
 mod auction;
+mod batch_auction;
 mod book;
 mod command;
 mod error;
@@ -20,6 +21,7 @@ mod wire;
 pub use api::*;
 pub use asset::*;
 pub use auction::*;
+pub use batch_auction::*;
 pub use book::*;
 pub use command::*;
 pub use error::*;
