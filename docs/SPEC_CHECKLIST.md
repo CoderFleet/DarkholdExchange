@@ -22,7 +22,7 @@
 | Escrow with signed delivery receipts, disputes, and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. A buyer can open a dispute after delivery and an admin ruling resolves it to a buyer refund or seller release. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
 | Hash-chained public audit log + browser verification | 🟡 | Hash primitives and browser verifier exist and are tested, but no audit records are produced or exposed, and there is no audit UI. |
-| Per-identity/per-IP rate limits + adaptive proof-of-work | 🟡 | Token-bucket rate limits per IP, per user and for login/sign-up are done (429 + `Retry-After`, `docs/AUTH.md` section 8). Adaptive proof-of-work is not built yet. |
+| Per-identity/per-IP rate limits + adaptive proof-of-work | ✅ | Token-bucket rate limits per IP, per user and for login/sign-up (429 + `Retry-After`, `docs/AUTH.md` section 8). Addresses that keep hitting them must solve signed, single-use, rising-difficulty puzzles (428; `docs/AUTH.md` section 9). |
 | Bot/scalper simulator + bots-vs-humans switch | 🟡 | `dx-simulator` / `dx-load` can generate load, but there is no attack/defence UI switch. |
 | Order-book replay/scrubber | 🟡 | Core replay is covered by a test; there is no replay API or UI scrubber. |
 | Live metrics/latency panel | ✅ | Gateway histograms + `/api/metrics/latency` + `/speed` panel are merged. |
@@ -58,7 +58,7 @@
 | 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
 | 15 | Hash-chained audit log | 🟡 | `crates/hash/src/audit.rs` + `web/src/lib/hash.ts` + golden vectors. No records/endpoint/UI. | Record sequenced commands, expose `GET /api/audit`, verify the chain on `/verify`. |
 | 16 | Per-user/per-IP rate limits | ✅ | `crates/limits` token buckets, applied by `crates/gateway/src/rate.rs`; 429 + `Retry-After`; env-configurable; off for load tests. | Keep numbers under review after the load test. |
-| 17 | Adaptive proof-of-work | ❌ | No challenge endpoint or client solver. | Add challenge/verify flow and browser Web Worker solver. |
+| 17 | Adaptive proof-of-work | ✅ | `crates/pow` (signed single-use challenges, strikes), `GET /api/pow/challenge`, 428 `pow_required`, browser Web Worker solver in `web/src/pow/`. | Tune the difficulty after the load test. |
 | 18 | Bot/scalper simulator + defence switch | 🟡 | `dx-simulator`, `dx-load`, `scripts/load-test.sh`, recorded results. | Add attack/defence scenarios and a UI toggle if the demo needs it. |
 | 19 | Order-book replay/scrubber | 🟡 | Core replay test; no live replay API. | Add snapshot + delta replay endpoint and a UI time scrubber. |
 | 20 | Live metrics/latency panel | ✅ | `/api/metrics/latency`, gateway histograms, `/speed`, `latency.*`, `SpeedPanel.jsx`. | Populate it by placing orders during the demo. |
@@ -92,7 +92,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 |---|---|
 | **T1 — Rudransh** | WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Adaptive PoW; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -139,7 +139,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
 3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds. Buyer disputes and admin rulings are already implemented.
 4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-5. **Fairness (T3 — Stuti):** adaptive proof-of-work and the bot-defence UI. Per-identity/per-IP rate limits are done.
+5. **Fairness (T3 — Stuti):** rate limits and adaptive proof-of-work are done (rows 16 and 17). The bot-defence UI (bot simulator page) is still to do.
 6. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
 7. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 

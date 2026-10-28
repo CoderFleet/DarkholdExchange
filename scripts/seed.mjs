@@ -10,6 +10,8 @@
 //
 // Usage:  node scripts/seed.mjs        (or: just seed)
 
+import { createHash } from 'node:crypto'
+
 const API = (process.env.DX_API ?? 'http://localhost:8080').replace(/\/+$/, '')
 // The same names the gateway reads. The default only matches a dev run (DX_DEV_AUTH on).
 const ISSUER_USER = process.env.DX_ISSUER_USER ?? 'issuer'
@@ -40,16 +42,45 @@ if (!whole(ROUND, 1, 1_000_000)) fail('DX_SEED_ROUND must be a whole number from
 
 /** Sends one request. Returns { status, body }. Stops the script if the gateway cannot be reached. */
 async function call(path, options = {}) {
-  // The gateway rate-limits; if it says "wait N seconds" the script waits and tries again.
+  // The gateway rate-limits. On "429 wait N seconds" the script waits and tries again; on
+  // "428 solve a puzzle first" it solves one (docs/AUTH.md section 9) and tries again.
+  let puzzle
   for (let attempt = 0; ; attempt += 1) {
-    const answer = await send(path, options)
-    if (answer.status !== 429 || attempt >= 5) return answer
-    await new Promise((resolve) => setTimeout(resolve, Math.max(1, answer.retryAfter) * 1000))
+    const answer = await send(path, { ...options, puzzle })
+    puzzle = undefined
+    if (attempt >= 5) return answer
+    if (answer.status === 428 && answer.body?.reason === 'pow_required') {
+      puzzle = await solvePuzzle()
+    } else if (answer.status === 429) {
+      await new Promise((resolve) => setTimeout(resolve, Math.max(1, answer.retryAfter) * 1000))
+    } else {
+      return answer
+    }
   }
 }
 
-async function send(path, { method = 'GET', token, body } = {}) {
+/** Asks for a puzzle and solves it: the SHA-256 of "<challenge>~<nonce>" must start with enough zero bits. */
+async function solvePuzzle() {
+  const offer = await send('/api/pow/challenge', {})
+  if (offer.status !== 200) fail(`cannot get a puzzle: HTTP ${offer.status}`)
+  const { challenge, bits } = offer.body
+  for (let nonce = 0; ; nonce += 1) {
+    const hash = createHash('sha256').update(`${challenge}~${nonce}`).digest()
+    let zeros = 0
+    for (const byte of hash) {
+      if (byte === 0) zeros += 8
+      else {
+        zeros += Math.clz32(byte) - 24
+        break
+      }
+    }
+    if (zeros >= bits) return `${challenge}~${nonce}`
+  }
+}
+
+async function send(path, { method = 'GET', token, body, puzzle } = {}) {
   const headers = {}
+  if (puzzle) headers['x-pow'] = puzzle
   if (body !== undefined) headers['content-type'] = 'application/json'
   if (token) headers.authorization = `Bearer ${token}`
   let response
