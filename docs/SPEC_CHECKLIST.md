@@ -47,8 +47,8 @@
 | 3 | Per-identity holding limits | ✅ | Core tracks open buys, held passes, and pending escrow passes for the buyer. | — |
 | 4 | Double-entry ledger, reservations before matching | ✅ | `crates/ledger`, atomic settlement, conservation and negative-balance tests. | — |
 | 5 | Idempotency keys and replay-safe retries | ✅ | Core idempotency cache + tests. | — |
-| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT, admin/issuer roles, durable accounts when `DATABASE_URL` is set. Private terminal/wallet/history routes require a login; the client never sends an impersonating dev header. | Check WS handshake auth (row 7). |
-| 7 | WebSocket auth | ❌ | WS accepts `?user_id=` and does not verify a JWT. | Authenticate the upgrade request; reject spoofed identities. |
+| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT, admin/issuer roles, durable accounts when `DATABASE_URL` is set. Private terminal/wallet/history routes require a login; the client never sends an impersonating dev header. | - |
+| 7 | WebSocket auth | ✅ | `/ws` and `/ws/market/{id}` verify `?token=<jwt>` before upgrading; a bad token or a `user_id` that is not the token's user is refused (401/403). A bare `?user_id=` counts only while `DX_DEV_AUTH` is on; with neither the connection is an anonymous viewer of public market data. | Private per-user messages (T2) must require a token, not an anonymous viewer. |
 | 8 | L2 snapshot + sequenced diffs + gap resync | ✅ | Gateway publisher, worker rebuild, market terminal. | — |
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
 | 10 | Dutch auction | ✅ | `crates/types/src/auction.rs` (integer decay curve), core create/accept/expire with CAS quantity, reserved seller passes, atomic settlement, WAL replay, and the `/auctions` UI. | Optional: background expiry timer and seller cancellation before the deadline. |
@@ -90,9 +90,9 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
+| **T1 — Rudransh** | optional Playwright place/match/cancel smoke test. |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -126,7 +126,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 - **Market 3 is the seeded escrow market:** it starts with an empty book and seeded pass inventory.
   Old WALs from before the market-3 seed change fail their state-hash checkpoint; clear `data/log`
   in development.
-- **WebSocket identity is unauthenticated:** `WsQuery.user_id` is accepted from the URL.
+- **WebSocket feed is public:** an anonymous viewer may connect to the market feed. A future private user WebSocket must refuse anonymous viewers.
 - **`web/full-smoke-run.mjs` is not part of the repo:** it has a hard-coded temp path and imports
   `playwright` instead of the declared `@playwright/test`. Keep it untracked or rewrite it as a real
   Playwright test.
@@ -135,13 +135,12 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **WS auth (T1/T3):** authenticate the WebSocket upgrade and reject spoofed user IDs.
-2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds. Buyer disputes and admin rulings are already implemented.
-4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-5. **Fairness (T3 — Stuti):** rate limits and adaptive proof-of-work are done (rows 16 and 17). The bot-defence UI (bot simulator page) is still to do.
-6. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-7. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
+1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
+2. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds. Buyer disputes and admin rulings are already implemented.
+3. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+4. **Fairness (T3 — Stuti):** rate limits and adaptive proof-of-work are done (rows 16 and 17). The bot-defence UI (bot simulator page) is still to do.
+5. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
 
