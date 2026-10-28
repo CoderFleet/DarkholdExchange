@@ -1,3 +1,9 @@
+# One command starts everything:   docker compose up --build
+#   then open http://localhost:8000
+#
+# For development, `docker compose up -d db` (just db-up) still starts only the database.
+# The values marked "demo" are fine on your own computer only. Put real ones in a .env file
+# (see .env.example) before running this anywhere other people can reach.
 services:
   db:
     image: postgres:16
@@ -12,5 +18,38 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://darkhold:darkhold@db:5432/darkhold
+      # A real run: no dev header, a fixed signing secret, passwords for the seeded accounts.
+      DX_DEV_AUTH: "0"
+      DX_JWT_SECRET: ${DX_JWT_SECRET:-demo-only-signing-secret-change-me-0123456789}
+      DX_ADMIN_PASSWORD: ${DX_ADMIN_PASSWORD:-demo-admin-password}
+      DX_ISSUER_PASSWORD: ${DX_ISSUER_PASSWORD:-demo-issuer-password}
+      # Caddy is in front, so the real visitor address is the last X-Forwarded-For entry.
+      DX_TRUST_PROXY: "1"
+    volumes: [wal:/var/lib/darkhold]
+    restart: unless-stopped
+    # No ports: only Caddy (the web service) can reach the gateway.
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/web.Dockerfile
+    depends_on:
+      gateway:
+        condition: service_healthy
+    # Only this computer can open it. Remove "127.0.0.1:" to let others on your network in.
+    ports: ["127.0.0.1:${DX_HTTP_PORT:-8000}:80"]
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  wal:

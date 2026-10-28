@@ -28,7 +28,7 @@
 | Live metrics/latency panel | ✅ | Gateway histograms + `/api/metrics/latency` + `/speed` panel are merged. |
 | PostgreSQL read models | 🟡 | `dkx-projection` and migrations exist; the gateway does not use them yet. |
 | WAL + crash recovery | ✅ | Gateway writer group-commits every non-cached command, successful deposit/issuance, and market creation as fsynced operation records with a post-state checkpoint at least every 256 operations. Startup replays and verifies the checkpoints. Live SIGKILL restart preserved the same state hash and book. |
-| Nginx/Caddy + Docker deployment | ❌ | `docker-compose.yml` only starts PostgreSQL. There is no app container, proxy, or one-command deployment. |
+| Nginx/Caddy + Docker deployment | ✅ | `docker compose up --build` starts PostgreSQL, the gateway and Caddy + the website (docs/DEPLOY.md). Built and run in Docker; seeded, logged in, live feed through the proxy. HTTPS needs a real domain. |
 | 1,000+ orders/s, µs engine p99, <10 ms e2e p99 | ✅ | WAL-on 2026-10-26 runs: 995.50 placements/s and 999.90 fills/s; p99 7.54 ms place, 8.88 ms fill. Recorded under `bench/results/`. Not enforced in CI. |
 | Differential testing vs reference matcher | ❌ | Deferred by T1; not planned for the current demo. |
 | Deterministic replay from the log | ✅ | Gateway recovery replays WAL operations into the seeded core and checks stored post-state checkpoints. Workspace tests and a live SIGKILL restart produce the same final hash. |
@@ -64,7 +64,7 @@
 | 20 | Live metrics/latency panel | ✅ | `/api/metrics/latency`, gateway histograms, `/speed`, `latency.*`, `SpeedPanel.jsx`. | Populate it by placing orders during the demo. |
 | 21 | PostgreSQL read models | 🟡 | `crates/dkx-projection`, migrations, SQL queries. Not wired into gateway. | Start the projection worker behind a flag; add integration test. |
 | 22 | WAL + crash recovery | ✅ | `dkx-wal` record/hash-chain/recovery plus gateway `wal.rs`; writer group-commits commands, deposits, issuance, and market creation, with a post-state checkpoint at least every 256 operations. Live check placed 261 commands (crossing a state checkpoint) plus a resting order, `SIGKILL`ed the gateway, restarted, and matched `/api/state/hash` and the book exactly. | Full-log replay is wired; periodic snapshots/compaction are still a follow-up. |
-| 23 | Docker/Caddy/nginx deployment | ❌ | Compose only includes `db`. | Add app image, proxy config, health checks, one-command demo. |
+| 23 | Docker/Caddy/nginx deployment | ✅ | `deploy/gateway.Dockerfile`, `deploy/web.Dockerfile`, `deploy/Caddyfile`, full `docker-compose.yml` with health checks and restart policy. Built and run in Docker on 2026-10-28; seeded, logged in, live feed through the proxy. | HTTPS needs a real domain; no automated container test in CI yet. |
 | 24 | Performance targets | ✅ | `bench/results/` records WAL-on 2026-10-26 runs: 995.50 placements/s, 999.90 fills/s, 7.54 ms place ack p99, 8.88 ms fill ack p99. | Add CI thresholds or clearly document the substitute. |
 | 25 | Differential matcher test | ❌ | No reference matcher. Deferred by T1. | Not planned for the current demo; revisit only if matching correctness needs stronger verification. |
 | 26 | Deterministic WAL replay | ✅ | `wal::replay` rebuilds state and verifies periodic post-state checkpoints; writer recovery tests and the live restart check pass. | — |
@@ -92,7 +92,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 |---|---|
 | **T1 — Rudransh** | optional Playwright place/match/cancel smoke test. |
 | **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup. |
+| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; k6/Locust thresholds; Playwright setup. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -140,7 +140,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 3. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
 4. **Fairness (T3 — Stuti):** rate limits and adaptive proof-of-work are done (rows 16 and 17). The bot-defence UI (bot simulator page) is still to do.
 5. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
+6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection. (Docker/Caddy deployment is done.)
 
 ## Submission honesty
 
