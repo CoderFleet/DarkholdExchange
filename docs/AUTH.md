@@ -88,6 +88,25 @@ reads needs the `Authorization` header. Role-restricted endpoints (`/api/admin/*
 
 ---
 
+### 2.5 WebSocket feeds
+
+`/ws` and `/ws/market/{id}` take `?token=<jwt>` (decision A7). The check runs before the
+connection is upgraded, so a refused connection never opens.
+
+| Query | Result |
+|---|---|
+| valid `token` | connected as the token's user |
+| valid `token` and a `user_id` that is not that user | 403 `forbidden` |
+| bad, expired or foreign-secret `token` | 401 `unauthorized` (never replaced by `user_id`) |
+| `user_id` only, `DX_DEV_AUTH` on | connected as that id (old dev behaviour) |
+| `user_id` only, `DX_DEV_AUTH` off | 401 `unauthorized` |
+| nothing | anonymous viewer of public market data |
+
+The website passes the token from the login store to the feed worker, which has no access to it.
+Known limits: the token sits in the address, so it can show in server or proxy logs; a browser
+does not show a failed handshake's status, so the feed worker keeps retrying (with growing
+waits) after a 401 until the page logs out.
+
 ## 3. Errors
 
 Same shape as `PROTOCOL.md` §3: `{ "reason": "<ReasonCode>" }`.
@@ -134,8 +153,7 @@ it. Each change is small, backward compatible, in its own PR, and passes CI befo
    terminal has no Identity dropdown and trades only as the logged-in user. The navbar hides
    private links while anonymous; `/auctions` stays readable but its create/accept controls
    require a login. Real runs set `DX_DEV_AUTH=0`.
-   Still open: the public market-data WebSocket does not verify a token (row 7 of the checklist);
-   it only carries market data, not account data.
+   The WebSocket feeds check the token too (section 2.5).
 
 
 ## 5. Saving accounts, events and tiers

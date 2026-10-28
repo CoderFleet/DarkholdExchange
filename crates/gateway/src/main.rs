@@ -201,6 +201,8 @@ struct CancelQuery {
 #[derive(Deserialize)]
 struct WsQuery {
     user_id: Option<UserId>,
+    /// The login token. Browsers cannot set headers on a WebSocket, so it travels in the address.
+    token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1599,12 +1601,38 @@ async fn statements_current(
     }))
 }
 
+/// Who is connecting to a feed (docs/AUTH.md section 2.5). `None` is an anonymous viewer, who may
+/// watch the public market data.
+///
+/// * A valid `token` says who it is. A bad token is refused, and so is a `user_id` that names
+///   someone else: nobody can connect as another user.
+/// * Without a token, a bare `user_id` is believed only while `DX_DEV_AUTH` is on (the old dev
+///   behaviour). In a real run it is refused.
+/// * Neither: an anonymous viewer.
+fn ws_user(auth: &dx_auth::AuthState, query: &WsQuery) -> Result<Option<UserId>, ApiError> {
+    if let Some(token) = &query.token {
+        let user = auth
+            .verify_token(token.trim())
+            .map_err(|_| unauthorized())?;
+        return match query.user_id {
+            Some(claimed) if claimed != user.user_id => Err(forbidden()),
+            _ => Ok(Some(user.user_id)),
+        };
+    }
+    match query.user_id {
+        Some(claimed) if auth.dev_auth_enabled() => Ok(Some(claimed)),
+        Some(_) => Err(unauthorized()),
+        None => Ok(None),
+    }
+}
+
 async fn ws(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
-) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, query.user_id, None))
+) -> Result<impl IntoResponse, ApiError> {
+    let user_id = ws_user(&state.auth, &query)?;
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, None)))
 }
 
 async fn ws_market(
@@ -1613,6 +1641,7 @@ async fn ws_market(
     State(state): State<AppState>,
     Query(query): Query<WsQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
+    let user_id = ws_user(&state.auth, &query)?;
     let known_market = state
         .writer
         .market_exists(market_id)
@@ -1621,7 +1650,7 @@ async fn ws_market(
     if !known_market {
         return Err(api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownMarket));
     }
-    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, query.user_id, Some(market_id))))
+    Ok(ws.on_upgrade(move |socket| handle_socket(socket, state, user_id, Some(market_id))))
 }
 
 struct WsClientGuard {
@@ -2523,6 +2552,66 @@ mod tests {
         // Dev mode still needs an explicit dev header; it never defaults to user 1.
         assert!(authorize_user(&auth_state(true), &HeaderMap::new(), 7).is_err());
         assert!(authorize_user(&auth_state(true), &headers(&[("x-dev-user", "7")]), 7).is_ok());
+    }
+
+    #[test]
+    fn a_feed_connection_is_identified_by_its_token_and_never_by_a_claimed_id() {
+        let ws_query = |user_id, token: Option<String>| WsQuery { user_id, token };
+        let dev = auth_state(true);
+        let real = auth_state(false);
+        let token = token_for(&dev, 7, dx_auth::Role::User);
+        let real_token = token_for(&real, 7, dx_auth::Role::User);
+        let refused = |result: Result<Option<UserId>, ApiError>| {
+            let error = result.unwrap_err();
+            (error.status, error.raw_reason)
+        };
+
+        // A valid token says who it is, with or without the matching id.
+        assert_eq!(
+            ws_user(&dev, &ws_query(None, Some(token.clone()))).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            ws_user(&dev, &ws_query(Some(7), Some(token.clone()))).unwrap(),
+            Some(7)
+        );
+        assert_eq!(
+            ws_user(&real, &ws_query(None, Some(real_token.clone()))).unwrap(),
+            Some(7)
+        );
+        // Someone else's id next to a valid token is refused, in dev mode too.
+        for auth in [&dev, &real] {
+            let token = token_for(auth, 7, dx_auth::Role::User);
+            assert_eq!(
+                refused(ws_user(auth, &ws_query(Some(8), Some(token)))),
+                (StatusCode::FORBIDDEN, Some("forbidden"))
+            );
+        }
+        // A bad token is refused, never replaced by the id, even in dev mode.
+        assert_eq!(
+            refused(ws_user(&dev, &ws_query(Some(7), Some("junk".into())))),
+            (StatusCode::UNAUTHORIZED, Some("unauthorized"))
+        );
+        // A token made with another secret is a bad token.
+        let stranger = dx_auth::AuthState::new(
+            b"some-other-secret-some-other-secret-1",
+            std::time::Duration::from_secs(60),
+            false,
+        );
+        let foreign = token_for(&stranger, 7, dx_auth::Role::User);
+        assert_eq!(
+            refused(ws_user(&real, &ws_query(None, Some(foreign)))),
+            (StatusCode::UNAUTHORIZED, Some("unauthorized"))
+        );
+        // A bare id counts only in dev mode.
+        assert_eq!(ws_user(&dev, &ws_query(Some(5), None)).unwrap(), Some(5));
+        assert_eq!(
+            refused(ws_user(&real, &ws_query(Some(5), None))),
+            (StatusCode::UNAUTHORIZED, Some("unauthorized"))
+        );
+        // No identity at all is an anonymous viewer, in both modes.
+        assert_eq!(ws_user(&dev, &ws_query(None, None)).unwrap(), None);
+        assert_eq!(ws_user(&real, &ws_query(None, None)).unwrap(), None);
     }
 
     #[test]

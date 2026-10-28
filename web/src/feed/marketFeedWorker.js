@@ -27,8 +27,8 @@ let reconnectAttempt = 0
 let shouldReconnect = false
 let session = 0
 
-/** @type {{ userId: number, marketId: number, depth: number }} */
-let connection = { userId: 1, marketId: 1, depth: DEFAULT_DEPTH }
+/** @type {{ userId: number, marketId: number, depth: number, token: string | null }} */
+let connection = { userId: 1, marketId: 1, depth: DEFAULT_DEPTH, token: null }
 
 const emitStatus = (status) => {
   self.postMessage({ type: 'status', status })
@@ -48,7 +48,12 @@ const emitMessage = (message) => {
 
 const websocketUrl = () => {
   const protocol = self.location.protocol === 'https:' ? 'wss' : 'ws'
-  return `${protocol}://${self.location.host}/ws/market/${connection.marketId}?user_id=${connection.userId}`
+  // A logged-in user proves who they are with the login token. Without one, fall back to the
+  // plain id, which the server believes only in dev mode (docs/AUTH.md section 2.5).
+  const who = connection.token
+    ? `token=${encodeURIComponent(connection.token)}`
+    : `user_id=${connection.userId}`
+  return `${protocol}://${self.location.host}/ws/market/${connection.marketId}?${who}`
 }
 
 const sendSubscription = () => {
@@ -149,6 +154,7 @@ const connect = (options) => {
     depth: Number.isFinite(options.depth)
       ? Math.max(1, Math.min(200, Number(options.depth)))
       : DEFAULT_DEPTH,
+      token: typeof options.token === 'string' && options.token ? options.token : null,
   }
   reconnectAttempt = 0
   shouldReconnect = true
