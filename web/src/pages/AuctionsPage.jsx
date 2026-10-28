@@ -101,13 +101,11 @@ export function AuctionsPage() {
 
   const load = useCallback(async () => {
     try {
-      const [auctionPage, batchPage, marketList] = await Promise.all([
+      const [auctionPage, marketList] = await Promise.all([
         getAuctions(),
-        getBatchAuctions(),
         getMarkets(),
       ])
       setAuctions(auctionPage.items)
-      setBatchAuctions(batchPage.items)
       setMarkets(marketList)
       setForm((current) => {
         if (current.marketId || marketList.length === 0) return current
@@ -133,6 +131,15 @@ export function AuctionsPage() {
       setOffset(auctionPage.now_ms - Date.now())
       setStatus('ready')
       setError(null)
+
+      // Batch auctions: best-effort — don't crash the page if endpoint is missing
+      try {
+        const batchPage = await getBatchAuctions()
+        setBatchAuctions(batchPage.items)
+      } catch (batchErr) {
+        console.warn('Batch auctions endpoint unavailable:', batchErr)
+        setBatchAuctions([])
+      }
     } catch (nextError) {
       setError(nextError.message)
       setStatus('error')
