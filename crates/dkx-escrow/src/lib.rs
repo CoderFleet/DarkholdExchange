@@ -121,7 +121,7 @@ pub fn verify_receipt(
     receipt_bytes: &[u8],
     signature_bytes: &[u8],
 ) -> Result<bool, EscrowError> {
-    if receipt_bytes.len() != 66 || !receipt_bytes.starts_with(b"DKX-RCPT-v1") {
+    if receipt_bytes.len() != 67 || !receipt_bytes.starts_with(b"DKX-RCPT-v1") {
         return Err(EscrowError::MalformedReceiptBytes);
     }
     let sig_array: [u8; 64] = signature_bytes

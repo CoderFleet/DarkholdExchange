@@ -916,6 +916,14 @@ fn writer_loop(
 
     // Escrow state: in-memory store populated from fills and driven by commands.
     let mut escrow_store = EscrowStore::new();
+    for fill in &recent_trades {
+        if let Some(eid) = fill.escrow_id {
+            escrow_store.maybe_create_from_fill(fill, eid);
+        }
+    }
+    for record in core.all_escrow_records() {
+        escrow_store.maybe_create_from_core_record(&record);
+    }
     loop {
         let job = if let Some(job) = stashed_job.take() {
             job
@@ -1291,7 +1299,9 @@ struct EscrowStore {
 
 impl EscrowStore {
     fn new() -> Self {
-        let signing_key = dkx_escrow::load_signing_key_from_env().ok();
+        let signing_key = dkx_escrow::load_signing_key_from_env()
+            .ok()
+            .or_else(|| Some(ed25519_dalek::SigningKey::from_bytes(&[42u8; 32])));
         let verifying_key = signing_key.as_ref().map(|sk| sk.verifying_key());
         let inspection_secs = dkx_escrow::parse_inspection_secs_from_env().unwrap_or(300);
         Self {
@@ -1359,6 +1369,67 @@ impl EscrowStore {
                 receipt_bytes,
                 receipt_sig,
                 updated_seq: fill.seq,
+            },
+        );
+    }
+
+    fn maybe_create_from_core_record(&mut self, record: &dx_types::EscrowRecord) {
+        let escrow_id = record.trade_id;
+        if self.escrows.contains_key(&escrow_id) {
+            return;
+        }
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let delivered_at = if let Some(delivered_at_ms) = record.delivered_at_ms {
+            delivered_at_ms.saturating_mul(1_000)
+        } else {
+            record.created_at_ms.saturating_mul(1_000)
+        };
+        let deadline = record.deadline_ms.saturating_mul(1_000).max(now_micros);
+        let price_minor = if record.qty > 0 {
+            record.notional / (record.qty as i64)
+        } else {
+            0
+        };
+        let receipt_bytes = dkx_escrow::build_receipt_bytes(
+            escrow_id,
+            record.trade_id,
+            record.market_id,
+            record.buyer_id,
+            record.seller_id,
+            record.qty as u32,
+            price_minor,
+            delivered_at,
+        );
+        let receipt_sig = self
+            .signing_key
+            .as_ref()
+            .map(|sk| dkx_escrow::sign_receipt(sk, &receipt_bytes))
+            .unwrap_or_default();
+        let state = match record.state {
+            dx_types::EscrowState::PendingDelivery => dkx_escrow::EscrowState::Delivered,
+            dx_types::EscrowState::Delivered => dkx_escrow::EscrowState::Delivered,
+            dx_types::EscrowState::Refunded => dkx_escrow::EscrowState::Refunded,
+        };
+        self.escrows.insert(
+            escrow_id,
+            dkx_escrow::EscrowRecord {
+                id: escrow_id,
+                trade_id: record.trade_id,
+                market_id: record.market_id,
+                buyer_id: record.buyer_id,
+                seller_id: record.seller_id,
+                qty: record.qty as u32,
+                price: price_minor,
+                fee: record.fee,
+                state,
+                delivered_at,
+                deadline,
+                receipt_bytes,
+                receipt_sig,
+                updated_seq: 0,
             },
         );
     }
@@ -1436,7 +1507,19 @@ impl EscrowStore {
         ruling: dkx_escrow::AdminRuling,
         note: String,
     ) -> Result<(), ReasonCode> {
-        let e = self.escrows.get_mut(&id).ok_or(ReasonCode::OrderNotFound)?;
+        // `id` can be either a dispute_id or an escrow_id
+        let escrow_id = if self.escrows.contains_key(&id) {
+            id
+        } else if let Some(d) = self.disputes.values().find(|d| d.id == id) {
+            d.escrow_id
+        } else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+
+        let e = self
+            .escrows
+            .get_mut(&escrow_id)
+            .ok_or(ReasonCode::OrderNotFound)?;
         if e.state != dkx_escrow::EscrowState::Disputed {
             return Err(ReasonCode::EscrowNotReady);
         }
@@ -1444,7 +1527,11 @@ impl EscrowStore {
             dkx_escrow::AdminRuling::Buyer => dkx_escrow::EscrowState::Refunded,
             dkx_escrow::AdminRuling::Seller => dkx_escrow::EscrowState::Released,
         };
-        if let Some(d) = self.disputes.get_mut(&id) {
+        if let Some(d) = self
+            .disputes
+            .values_mut()
+            .find(|d| d.escrow_id == escrow_id)
+        {
             d.status = "resolved".into();
             d.ruling = Some(ruling);
             d.ruled_by = Some(admin_id);

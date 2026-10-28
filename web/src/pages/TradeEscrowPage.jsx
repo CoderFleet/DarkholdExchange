@@ -7,12 +7,15 @@ import {
 } from '../api'
 import { formatMoney } from '../format'
 import { useAuthStore } from '../stores/useAuthStore'
+import { useWalletStore } from '../stores/useWalletStore'
 
 const ESCROW_STEPS = ['Created', 'FundsLocked', 'Delivered', 'Released']
 
 export function TradeEscrowPage({ tradeId }) {
   const authUser = useAuthStore((state) => state.user)
-  const currentUserId = authUser?.id ?? 1
+  const walletUserId = useWalletStore((state) => state.userId)
+  const setWalletUserId = useWalletStore((state) => state.setUserId)
+  const currentUserId = authUser?.user_id ?? authUser?.id ?? walletUserId ?? 1
 
   const [escrow, setEscrow] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -34,14 +37,14 @@ export function TradeEscrowPage({ tradeId }) {
     setLoading(true)
     setError(null)
     try {
-      const data = await getEscrowById(tradeId)
+      const data = await getEscrowById(tradeId, currentUserId)
       setEscrow(data)
     } catch (err) {
       setError(err.message || 'Escrow details not found')
     } finally {
       setLoading(false)
     }
-  }, [tradeId])
+  }, [tradeId, currentUserId])
   
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -79,7 +82,7 @@ useEffect(() => {
     if (!escrow) return
     setActionBusy(true)
     try {
-      await acceptEscrow(escrow.id)
+      await acceptEscrow(escrow.id, currentUserId)
       await fetchEscrow()
     } catch (err) {
       alert(err.message || 'Failed to accept escrow')
@@ -93,7 +96,7 @@ useEffect(() => {
     if (!escrow) return
     setActionBusy(true)
     try {
-      await rejectEscrow(escrow.id, rejectReason, rejectNote)
+      await rejectEscrow(escrow.id, rejectReason, rejectNote, currentUserId)
       setShowRejectModal(false)
       await fetchEscrow()
     } catch (err) {
@@ -145,9 +148,38 @@ useEffect(() => {
 
   return (
     <div className="trade-escrow-page" style={{ padding: '2rem', maxWidth: '850px', margin: '0 auto' }}>
-      <div style={{ marginBottom: '1.5rem' }}>
-        <span className="eyebrow">Escrow Trade #{escrow.trade_id}</span>
-        <h2>Escrow Inspection & Settlement</h2>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '1.5rem' }}>
+        <div>
+          <span className="eyebrow">Escrow Trade #{escrow.trade_id}</span>
+          <h2>Escrow Inspection & Settlement</h2>
+        </div>
+        {!authUser && (
+          <div style={{ textAlign: 'right' }}>
+            <label style={{ fontSize: '0.8rem', color: '#9ca3af', display: 'block', marginBottom: '0.25rem' }}>
+              Simulate View As Trader:
+            </label>
+            <select
+              value={currentUserId}
+              onChange={(e) => setWalletUserId(Number(e.target.value))}
+              style={{
+                background: '#1f2937',
+                border: '1px solid #4b5563',
+                color: '#fff',
+                padding: '0.3rem 0.6rem',
+                borderRadius: '4px',
+                fontSize: '0.85rem',
+              }}
+            >
+              {[1, 2, 3, 4, 5, 6, escrow.buyer_id, escrow.seller_id]
+                .filter((v, i, a) => a.indexOf(v) === i)
+                .map((id) => (
+                  <option key={id} value={id}>
+                    Trader #{id} {id === escrow.buyer_id ? '(Buyer)' : id === escrow.seller_id ? '(Seller)' : ''}
+                  </option>
+                ))}
+            </select>
+          </div>
+        )}
       </div>
 
       {/* Disputed or Resolved Banners */}

@@ -102,23 +102,43 @@ fn test_normal_fill_with_100_bps_fee() {
 }
 
 #[test]
-fn test_escrow_fill_rejected_until_stage_6() {
+fn test_escrow_fill_success_stage_6() {
     let mut ledger = Ledger::new();
+    let buyer = 1;
+    let seller = 2;
+    let market = 10;
+    let price: Paise = 10_000;
+    let qty = 1;
+    let notional = price * qty;
+
+    ledger
+        .topup(buyer, 20_000, IdemKey(1))
+        .expect("buyer topup");
+    ledger
+        .issue_pass(market, seller, 2, IdemKey(2))
+        .expect("seller issue");
+    ledger
+        .reserve_cash(buyer, notional, 10, IdemKey(3))
+        .expect("reserve cash");
+    ledger
+        .reserve_pass(seller, market, qty, 20, IdemKey(4))
+        .expect("reserve pass");
+
     let fill = Fill {
-        market: 1,
-        buyer: 1,
-        seller: 2,
+        market,
+        buyer,
+        seller,
         buyer_order: 10,
         seller_order: 20,
-        price: 1000,
-        qty: 1,
+        price,
+        qty,
         escrow: true,
         seq: 1,
         ts_micros: 1000,
     };
 
     let res = ledger.post_fill(&fill, IdemKey(99));
-    assert_eq!(res, Err(LedgerError::EscrowNotReady));
+    assert!(matches!(res, Ok(SettleOutcome::Escrowed(_))));
 }
 
 #[test]

@@ -706,11 +706,16 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
     Math.max(bounds.floor, snapshot?.last_trade_price ?? mid),
   )
 
+  const escrowPublicKey = useWalletStore((state) => state.escrowPublicKey)
+  const escrowLoading = useWalletStore((state) => state.escrowLoading)
+  const registerSigningKey = useWalletStore((state) => state.registerSigningKey)
+
   const [side, setSide] = useState(Side.Buy)
   const [orderType, setOrderType] = useState('limit')
   const [price, setPrice] = useState(String(initialPrice))
   const [qty, setQty] = useState('1')
   const [useEscrow, setUseEscrow] = useState(false)
+  const [keyNotice, setKeyNotice] = useState(null)
 
   const priceTicks = Number(price)
   const quantity = Number(qty)
@@ -733,6 +738,17 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
 
   // Escrow is only available when the market has it enabled and taker is buying
   const escrowAvailable = market.escrow_enabled && side === Side.Buy
+  const sellerNeedsKey = market.escrow_enabled && side === Side.Sell && !escrowPublicKey
+
+  const handleRegisterKey = async () => {
+    try {
+      setKeyNotice(null)
+      await registerSigningKey()
+      setKeyNotice('Seller key registered successfully! You can now place sell orders.')
+    } catch (err) {
+      setKeyNotice(`Failed to register key: ${err.message}`)
+    }
+  }
 
   const handleSubmit = async (event) => {
     event.preventDefault()
@@ -857,6 +873,35 @@ function OrderTicket({ market, snapshot, submitting, onSubmit }) {
               Escrow <em style={{ color: '#9ca3af' }}>— hold funds until you accept the pass</em>
             </span>
           </label>
+        )}
+
+        {sellerNeedsKey && (
+          <div
+            style={{
+              background: '#451a03',
+              border: '1px solid #b45309',
+              borderRadius: '6px',
+              padding: '0.75rem',
+              marginBottom: '1rem',
+              fontSize: '0.85rem',
+              color: '#fef3c7',
+            }}
+          >
+            <strong style={{ display: 'block', marginBottom: '0.25rem' }}>Seller Signing Key Required</strong>
+            <span>This market uses escrow settlement. Sellers must register a delivery signing key before posting asks.</span>
+            <div style={{ marginTop: '0.5rem' }}>
+              <button
+                type="button"
+                className="ghost-button"
+                onClick={handleRegisterKey}
+                disabled={escrowLoading}
+                style={{ fontSize: '0.8rem', padding: '0.3rem 0.6rem' }}
+              >
+                {escrowLoading ? 'Registering…' : '🔑 Register Seller Key Now'}
+              </button>
+            </div>
+            {keyNotice && <div style={{ marginTop: '0.5rem', color: '#6ee7b7' }}>{keyNotice}</div>}
+          </div>
         )}
 
         <div className="estimate">

@@ -4,4 +4,8 @@ import type { Side } from "./Side";
 /**
  * A settled fill. `seq` is the global command sequence that produced it.
  */
-export type Fill = { trade_id: number, market_id: number, maker_order_id: number, taker_order_id: number, maker_user_id: number, taker_user_id: number, maker_side: Side, price_ticks: number, qty: number, seq: number, };
+export type Fill = { trade_id: number, market_id: number, maker_order_id: number, taker_order_id: number, maker_user_id: number, taker_user_id: number, maker_side: Side, price_ticks: number, qty: number, seq: number, 
+/**
+ * Set when the fill was settled into escrow; absent for spot fills.
+ */
+escrow_id?: number | null, };

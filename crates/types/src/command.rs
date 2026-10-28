@@ -14,7 +14,7 @@ pub struct PlaceLimit {
     pub price_ticks: Ticks,
     pub qty: Qty,
     /// When true and the market has escrow_enabled, the fill enters escrow.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub escrow: bool,
 }
 
@@ -28,7 +28,7 @@ pub struct PlaceMarket {
     /// Buy: maximum price. Sell: minimum price.
     pub protect_price_ticks: Ticks,
     /// When true and the market has escrow_enabled, the fill enters escrow.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub escrow: bool,
 }
 

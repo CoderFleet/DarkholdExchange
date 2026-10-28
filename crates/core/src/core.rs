@@ -943,6 +943,13 @@ impl Core {
         self.escrow.get(&trade_id)
     }
 
+    /// All escrow records currently tracked by the core.
+    pub fn all_escrow_records(&self) -> Vec<EscrowRecord> {
+        let mut records: Vec<_> = self.escrow.values().cloned().collect();
+        records.sort_by_key(|record| record.trade_id);
+        records
+    }
+
     /// Escrow records where `user_id` is the buyer or seller, oldest first.
     pub fn escrow_records(&self, user_id: UserId) -> Vec<EscrowRecord> {
         let mut records: Vec<_> = self

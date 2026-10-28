@@ -5,4 +5,8 @@ export type PlaceMarket = { client_order_id: number, market_id: number, side: Si
 /**
  * Buy: maximum price. Sell: minimum price.
  */
-protect_price_ticks: number, };
+protect_price_ticks: number, 
+/**
+ * When true and the market has escrow_enabled, the fill enters escrow.
+ */
+escrow?: boolean, };

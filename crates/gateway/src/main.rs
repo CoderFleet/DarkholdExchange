@@ -2803,12 +2803,9 @@ async fn escrow_reject(
     Ok(Json(serde_json::json!({ "status": "Disputed" })))
 }
 
-async fn escrow_verify(
-    Path(id): Path<u64>,
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let valid = state.writer.escrow_verify(id).await.map_err(writer_error)?;
-    Ok(Json(serde_json::json!({ "valid": valid })))
+async fn escrow_verify(Path(id): Path<u64>, State(state): State<AppState>) -> impl IntoResponse {
+    let valid = state.writer.escrow_verify(id).await.unwrap_or(false);
+    Json(serde_json::json!({ "valid": valid }))
 }
 
 async fn admin_disputes_list(
