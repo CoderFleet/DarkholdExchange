@@ -918,7 +918,10 @@ fn writer_loop(
     let mut escrow_store = EscrowStore::new();
     for fill in &recent_trades {
         if let Some(eid) = fill.escrow_id {
-            let tick_size = core.config(fill.market_id).map(|c| c.tick_size_minor).unwrap_or(100);
+            let tick_size = core
+                .config(fill.market_id)
+                .map(|c| c.tick_size_minor)
+                .unwrap_or(100);
             escrow_store.maybe_create_from_fill(fill, eid, tick_size);
         }
     }
@@ -964,7 +967,10 @@ fn writer_loop(
                 // Populate escrow store from any newly escrowed fills
                 for fill in recent_trades.iter().rev().take(32) {
                     if let Some(eid) = fill.escrow_id {
-                        let tick_size = core.config(fill.market_id).map(|c| c.tick_size_minor).unwrap_or(100);
+                        let tick_size = core
+                            .config(fill.market_id)
+                            .map(|c| c.tick_size_minor)
+                            .unwrap_or(100);
                         escrow_store.maybe_create_from_fill(fill, eid, tick_size);
                     }
                 }
