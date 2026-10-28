@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import fc from 'fast-check';
 import {
   GENESIS_PREV_HASH,
   bytesToHex,
@@ -179,5 +180,162 @@ describe('hash helper (Web / TypeScript)', () => {
     records[1].price = 9999n;
     const isCorruptValid = await verifyAuditChain(records);
     expect(isCorruptValid).toBe(false);
+  });
+
+  // Fast-check property test for Merkle path verification and tamper rejection
+  it('property-based: for random balances every valid Merkle proof verifies, and changing balance, salt or sibling makes it fail', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.uint8Array({ minLength: 16, maxLength: 16 }),
+        fc.bigInt({ min: 0n, max: 0xffffffffffffffffn }),
+        fc.bigInt({ min: 0n, max: 1_000_000_000_000n }),
+        fc.array(
+          fc.record({
+            siblingHash: fc.uint8Array({ minLength: 32, maxLength: 32 }),
+            siblingSum: fc.bigInt({ min: 0n, max: 1_000_000_000_000n }),
+            siblingDirection: fc.constantFrom<'Left', 'Right'>('Left', 'Right'),
+          }),
+          { minLength: 1, maxLength: 6 }
+        ),
+        async (salt, userId, balance, path) => {
+          const leafHash = await hashMerkleLeaf(salt, userId, balance);
+
+          // Calculate correct root
+          let currHash = leafHash;
+          let currSum = balance;
+          for (const step of path) {
+            let parent;
+            if (step.siblingDirection === 'Left') {
+              parent = await hashMerkleNode(
+                step.siblingHash,
+                step.siblingSum,
+                currHash,
+                currSum
+              );
+            } else {
+              parent = await hashMerkleNode(
+                currHash,
+                currSum,
+                step.siblingHash,
+                step.siblingSum
+              );
+            }
+            currHash = parent.hash;
+            currSum = parent.sum;
+          }
+
+          // 1. Valid proof must pass
+          const valid = await verifyMerklePath(
+            leafHash,
+            balance,
+            path,
+            currHash,
+            currSum
+          );
+          expect(valid).toBe(true);
+
+          // 2. Tampered balance must fail
+          const tamperedBalance = await verifyMerklePath(
+            leafHash,
+            balance + 1n,
+            path,
+            currHash,
+            currSum
+          );
+          expect(tamperedBalance).toBe(false);
+
+          // 3. Tampered salt must produce different leaf hash and fail
+          const tamperedSalt = new Uint8Array(salt);
+          tamperedSalt[0] ^= 0xff;
+          const tamperedLeafHash = await hashMerkleLeaf(tamperedSalt, userId, balance);
+          const tamperedSaltResult = await verifyMerklePath(
+            tamperedLeafHash,
+            balance,
+            path,
+            currHash,
+            currSum
+          );
+          expect(tamperedSaltResult).toBe(false);
+
+          // 4. Tampered sibling hash/sum must fail
+          const tamperedPath: MerklePathStep[] = path.map((s, idx) => {
+            if (idx === 0) {
+              const badHash = new Uint8Array(s.siblingHash);
+              badHash[0] ^= 0xff;
+              return { ...s, siblingHash: badHash };
+            }
+            return s;
+          });
+          const tamperedSiblingResult = await verifyMerklePath(
+            leafHash,
+            balance,
+            tamperedPath,
+            currHash,
+            currSum
+          );
+          expect(tamperedSiblingResult).toBe(false);
+        }
+      ),
+      { numRuns: 20 }
+    );
+  });
+
+  // Fast-check property test for audit log chain verification and tamper detection
+  it('property-based: editing an audit record breaks verification at that row', async () => {
+    await fc.assert(
+      fc.asyncProperty(
+        fc.array(
+          fc.record({
+            kind: fc.integer({ min: 1, max: 5 }),
+            market: fc.integer({ min: 1, max: 100 }),
+            qty: fc.integer({ min: 1, max: 1000 }),
+            price: fc.bigInt({ min: 0n, max: 1_000_000_000n }),
+          }),
+          { minLength: 2, maxLength: 8 }
+        ),
+        async (entries) => {
+          let prev = GENESIS_PREV_HASH;
+          const records: AuditRecord[] = [];
+
+          for (let i = 0; i < entries.length; i++) {
+            const seq = BigInt(i + 1);
+            const tsMicros = 1_000_000n + seq;
+            const hash = await hashAuditEntry(
+              seq,
+              tsMicros,
+              prev,
+              entries[i].kind,
+              entries[i].market,
+              entries[i].qty,
+              entries[i].price
+            );
+            records.push({
+              seq,
+              tsMicros,
+              prev,
+              kind: entries[i].kind,
+              market: entries[i].market,
+              qty: entries[i].qty,
+              price: entries[i].price,
+              hash,
+            });
+            prev = hash;
+          }
+
+          // Initial valid chain
+          const valid = await verifyAuditChain(records);
+          expect(valid).toBe(true);
+
+          // Editing any record breaks chain verification
+          const editIdx = Math.floor(records.length / 2);
+          const corrupted = records.map((r, idx) =>
+            idx === editIdx ? { ...r, price: r.price + 100n } : r
+          );
+          const corruptValid = await verifyAuditChain(corrupted);
+          expect(corruptValid).toBe(false);
+        }
+      ),
+      { numRuns: 15 }
+    );
   });
 });

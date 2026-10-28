@@ -110,7 +110,16 @@ fn unknown_user() -> ApiError {
 fn market_publisher(writer: WriterHandle) -> dx_admin::Publisher {
     Arc::new(move |config| {
         let writer = writer.clone();
-        Box::pin(async move { writer.create_market(config).await })
+        Box::pin(async move {
+            let market_id = config.id;
+            let face_value = config.face_value_minor;
+            let res = writer.create_market(config).await;
+            if res.is_ok() {
+                // Audit note: Kind 5 MarketPublished
+                let _ = writer.record_audit_note(5, market_id, 0, face_value).await;
+            }
+            res
+        })
     })
 }
 
@@ -367,6 +376,11 @@ async fn main() {
         .route("/api/escrow/{id}/verify", post(escrow_verify))
         .route("/api/admin/disputes", get(admin_disputes_list))
         .route("/api/admin/disputes/{id}/rule", post(admin_disputes_rule))
+        // Stage 7 Proof & Audit endpoints
+        .route("/api/proof/solvency", get(proof_solvency))
+        .route("/api/proof/balance", get(proof_balance))
+        .route("/api/audit/log", get(audit_log))
+        .route("/api/audit/head", get(audit_head))
         .route("/ws", get(ws))
         .route("/ws/market/{market_id}", get(ws_market))
         .with_state(state)
@@ -696,6 +710,82 @@ async fn solvency_current(
         roots,
         proofs,
     }))
+}
+
+// ─── Stage 7 Public Audit Chain & Solvency Proof Handlers ─────────────────
+
+#[derive(Deserialize)]
+struct AuditLogQuery {
+    from_seq: Option<u64>,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct AuditRecordView {
+    seq: u64,
+    ts_micros: u64,
+    prev_hash_hex: String,
+    kind: u8,
+    market_id: u32,
+    qty: u32,
+    price_paise: i64,
+    hash_hex: String,
+}
+
+fn audit_record_view(r: dkx_hash::AuditRecord) -> AuditRecordView {
+    AuditRecordView {
+        seq: r.seq,
+        ts_micros: r.ts_micros,
+        prev_hash_hex: hex::encode(r.prev),
+        kind: r.kind,
+        market_id: r.market,
+        qty: r.qty,
+        price_paise: r.price,
+        hash_hex: hex::encode(r.hash),
+    }
+}
+
+async fn audit_log(
+    State(state): State<AppState>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<Json<Vec<AuditRecordView>>, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let records = state
+        .writer
+        .audit_log(query.from_seq, limit)
+        .await
+        .map_err(writer_error)?;
+    Ok(Json(records.into_iter().map(audit_record_view).collect()))
+}
+
+async fn audit_head(
+    State(state): State<AppState>,
+) -> Result<Json<Option<AuditRecordView>>, ApiError> {
+    let head = state.writer.audit_head().await.map_err(writer_error)?;
+    Ok(Json(head.map(audit_record_view)))
+}
+
+async fn proof_solvency(
+    State(state): State<AppState>,
+) -> Result<Json<writer::SolvencyRootData>, ApiError> {
+    let root = state.writer.proof_solvency().await.map_err(writer_error)?;
+    Ok(Json(root))
+}
+
+async fn proof_balance(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<writer::BalanceProofData>, ApiError> {
+    let user_id = caller_user(&state, &headers)?;
+    let proof = state
+        .writer
+        .proof_balance(user_id)
+        .await
+        .map_err(writer_error)?;
+    match proof {
+        Some(p) => Ok(Json(p)),
+        None => Err(api_error(StatusCode::NOT_FOUND, ReasonCode::OrderNotFound)),
+    }
 }
 
 async fn dev_deposit(

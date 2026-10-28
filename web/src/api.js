@@ -466,4 +466,34 @@ export const settleBatchAuction = (auctionId, body) =>
 export const getBatchBids = (auctionId) =>
   request(`/api/batch-auctions/${auctionId}/bids`)
 
+// ── Stage 7 Proof & Audit ───────────────────────────────────────────────────
+
+/**
+ * @returns {Promise<{ seq: number, root_hash_hex: string, total_paise: number, leaf_count: number, published_at: number }>}
+ */
+export const getSolvencyProof = () => request('/api/proof/solvency')
+
+/**
+ * @returns {Promise<{ leaf: { user_id: number, balance_paise: number, salt_hex: string }, path: Array<{ hash_hex: string, sum_paise: number, is_left: boolean }>, root_hash_hex: string, total_paise: number, seq: number }>}
+ */
+export const getBalanceProof = () => request('/api/proof/balance')
+
+/**
+ * @param {{ from_seq?: number, limit?: number }} [query]
+ * @returns {Promise<Array<{ seq: number, ts_micros: number, prev_hash_hex: string, kind: number, market_id: number, qty: number, price_paise: number, hash_hex: string }>>}
+ */
+export const getAuditLog = (query = {}) => {
+  const params = new URLSearchParams()
+  if (query.from_seq != null) params.set('from_seq', String(query.from_seq))
+  if (query.limit != null) params.set('limit', String(query.limit))
+  const qs = params.toString() ? `?${params.toString()}` : ''
+  return request(`/api/audit/log${qs}`)
+}
+
+/**
+ * @returns {Promise<{ seq: number, ts_micros: number, prev_hash_hex: string, kind: number, market_id: number, qty: number, price_paise: number, hash_hex: string } | null>}
+ */
+export const getAuditHead = () => request('/api/audit/head')
+
+
 

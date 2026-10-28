@@ -14,6 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::wal::{WalOp, WalSession};
 use dkx_escrow::{AdminRuling, DisputeRecord};
+use dkx_hash::{
+    AuditRecord, GENESIS_PREV_HASH, hash_audit_entry, hash_merkle_leaf, hash_merkle_node,
+    pair_with_empty,
+};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
@@ -24,6 +28,7 @@ use dx_types::{
     SettleBatchAuction, TradeId, UserId, WsServerMessage,
 };
 use hdrhistogram::Histogram;
+use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, oneshot};
 
 pub(crate) const RECENT_TRADES_LIMIT: usize = 200;
@@ -344,6 +349,60 @@ enum WriterRequest {
     EscrowPublicKey {
         reply: oneshot::Sender<String>,
     },
+    AuditLog {
+        from_seq: Option<u64>,
+        limit: usize,
+        reply: oneshot::Sender<Vec<AuditRecord>>,
+    },
+    AuditHead {
+        reply: oneshot::Sender<Option<AuditRecord>>,
+    },
+    RecordAuditNote {
+        kind: u8,
+        market_id: u32,
+        qty: u32,
+        price_paise: i64,
+        reply: oneshot::Sender<AuditRecord>,
+    },
+    ProofSolvency {
+        reply: oneshot::Sender<SolvencyRootData>,
+    },
+    ProofBalance {
+        user_id: UserId,
+        reply: oneshot::Sender<Option<BalanceProofData>>,
+    },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SolvencyRootData {
+    pub seq: u64,
+    pub root_hash_hex: String,
+    pub total_paise: u64,
+    pub leaf_count: usize,
+    pub published_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BalanceLeafData {
+    pub user_id: u64,
+    pub balance_paise: u64,
+    pub salt_hex: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PathStepData {
+    pub hash_hex: String,
+    pub sum_paise: u64,
+    pub is_left: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BalanceProofData {
+    pub leaf: BalanceLeafData,
+    pub path: Vec<PathStepData>,
+    pub root_hash_hex: String,
+    pub total_paise: u64,
+    pub seq: u64,
 }
 
 struct WriterJob {
@@ -773,6 +832,54 @@ impl WriterHandle {
             .await
     }
 
+    pub(crate) async fn audit_log(
+        &self,
+        from_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<AuditRecord>, WriterError> {
+        self.request(|reply| WriterRequest::AuditLog {
+            from_seq,
+            limit,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn audit_head(&self) -> Result<Option<AuditRecord>, WriterError> {
+        self.request(|reply| WriterRequest::AuditHead { reply })
+            .await
+    }
+
+    pub(crate) async fn record_audit_note(
+        &self,
+        kind: u8,
+        market_id: u32,
+        qty: u32,
+        price_paise: i64,
+    ) -> Result<AuditRecord, WriterError> {
+        self.request(|reply| WriterRequest::RecordAuditNote {
+            kind,
+            market_id,
+            qty,
+            price_paise,
+            reply,
+        })
+        .await
+    }
+
+    pub(crate) async fn proof_solvency(&self) -> Result<SolvencyRootData, WriterError> {
+        self.request(|reply| WriterRequest::ProofSolvency { reply })
+            .await
+    }
+
+    pub(crate) async fn proof_balance(
+        &self,
+        user_id: UserId,
+    ) -> Result<Option<BalanceProofData>, WriterError> {
+        self.request(|reply| WriterRequest::ProofBalance { user_id, reply })
+            .await
+    }
+
     async fn request<T>(
         &self,
         build: impl FnOnce(oneshot::Sender<T>) -> WriterRequest,
@@ -1032,6 +1139,44 @@ fn writer_loop(
     let mut snapshot_cache = SnapshotCache::default();
     let mut stashed_job: Option<WriterJob> = None;
 
+    // Stage 7 Audit chain and solvency state
+    let mut audit_chain: Vec<AuditRecord> = Vec::new();
+    let mut next_audit_seq: u64 = 1;
+    let mut last_audit_hash: [u8; 32] = GENESIS_PREV_HASH;
+    let mut user_salts: HashMap<UserId, [u8; 16]> = HashMap::new();
+    let mut current_solvency_tree: Option<SolvencyTreeData> = None;
+    let mut last_tree_build_time = Instant::now() - Duration::from_secs(40); // Force initial build on start
+
+    let record_audit = |audit_chain: &mut Vec<AuditRecord>,
+                        next_audit_seq: &mut u64,
+                        last_audit_hash: &mut [u8; 32],
+                        kind: u8,
+                        market: u32,
+                        qty: u32,
+                        price: i64| {
+        let seq = *next_audit_seq;
+        *next_audit_seq += 1;
+        let ts_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let prev = *last_audit_hash;
+        let hash = hash_audit_entry(seq, ts_micros, &prev, kind, market, qty, price);
+        *last_audit_hash = hash;
+        let record = AuditRecord {
+            seq,
+            ts_micros,
+            prev,
+            kind,
+            market,
+            qty,
+            price,
+            hash,
+        };
+        audit_chain.push(record.clone());
+        record
+    };
+
     // Escrow state: in-memory store populated from fills and driven by commands.
     let mut escrow_store = EscrowStore::new();
     for fill in &recent_trades {
@@ -1047,6 +1192,13 @@ fn writer_loop(
         escrow_store.maybe_create_from_core_record(&record);
     }
     loop {
+        // Periodic 30s Merkle tree rebuild
+        if last_tree_build_time.elapsed() >= Duration::from_secs(30)
+            || current_solvency_tree.is_none()
+        {
+            current_solvency_tree = Some(build_stage7_tree(&core, &mut user_salts));
+            last_tree_build_time = Instant::now();
+        }
         let job = if let Some(job) = stashed_job.take() {
             job
         } else {
@@ -1067,6 +1219,7 @@ fn writer_loop(
                 now_ms,
                 reply,
             } => {
+                let prev_fills_count = recent_trades.len();
                 let disconnected = process_command_batch(
                     &mut core,
                     &tx,
@@ -1082,6 +1235,27 @@ fn writer_loop(
                     now_ms,
                     reply,
                 );
+                // Audit log trades (Kind 1)
+                let new_fills_count = recent_trades.len().saturating_sub(prev_fills_count);
+                if new_fills_count > 0 {
+                    let start_idx = recent_trades.len() - new_fills_count;
+                    for fill in &recent_trades[start_idx..] {
+                        let tick_size = core
+                            .config(fill.market_id)
+                            .map(|c| c.tick_size_minor)
+                            .unwrap_or(100);
+                        let price_paise = (fill.price_ticks as i64).saturating_mul(tick_size);
+                        record_audit(
+                            &mut audit_chain,
+                            &mut next_audit_seq,
+                            &mut last_audit_hash,
+                            1, // Trade
+                            fill.market_id,
+                            fill.qty as u32,
+                            price_paise,
+                        );
+                    }
+                }
                 // Populate escrow store from any newly escrowed fills
                 for fill in recent_trades.iter().rev().take(32) {
                     if let Some(eid) = fill.escrow_id {
@@ -1213,6 +1387,15 @@ fn writer_loop(
                 let result = core.issue_passes(user_id, market_id, qty, client_request_id);
                 if result.is_ok() {
                     append_wal(&mut wal, &wal_op, core.state_hash());
+                    record_audit(
+                        &mut audit_chain,
+                        &mut next_audit_seq,
+                        &mut last_audit_hash,
+                        2, // Issue
+                        market_id,
+                        qty as u32,
+                        0,
+                    );
                 }
                 let _ = reply.send(result);
             }
@@ -1259,8 +1442,22 @@ fn writer_loop(
                     &signature,
                     now_ms,
                 );
-                if result.is_ok() {
+                if let Ok(ref record) = result {
                     append_wal(&mut wal, &wal_op, core.state_hash());
+                    let price_paise = if record.qty > 0 {
+                        record.notional / (record.qty as i64)
+                    } else {
+                        0
+                    };
+                    record_audit(
+                        &mut audit_chain,
+                        &mut next_audit_seq,
+                        &mut last_audit_hash,
+                        3, // EscrowReleased
+                        record.market_id,
+                        record.qty as u32,
+                        price_paise,
+                    );
                 }
                 let _ = reply.send(result);
             }
@@ -1276,8 +1473,22 @@ fn writer_loop(
                     now_ms,
                 };
                 let result = core.refund_escrow(actor_user_id, trade_id, now_ms);
-                if result.is_ok() {
+                if let Ok(ref record) = result {
                     append_wal(&mut wal, &wal_op, core.state_hash());
+                    let price_paise = if record.qty > 0 {
+                        record.notional / (record.qty as i64)
+                    } else {
+                        0
+                    };
+                    record_audit(
+                        &mut audit_chain,
+                        &mut next_audit_seq,
+                        &mut last_audit_hash,
+                        4, // EscrowRefunded
+                        record.market_id,
+                        record.qty as u32,
+                        price_paise,
+                    );
                 }
                 let _ = reply.send(result);
             }
@@ -1541,6 +1752,68 @@ fn writer_loop(
             }
             WriterRequest::EscrowPublicKey { reply } => {
                 let _ = reply.send(escrow_store.public_key_hex());
+            }
+            WriterRequest::AuditLog {
+                from_seq,
+                limit,
+                reply,
+            } => {
+                let limit = limit.clamp(1, 200);
+                let start_seq = from_seq.unwrap_or(1);
+                let records: Vec<AuditRecord> = audit_chain
+                    .iter()
+                    .filter(|r| r.seq >= start_seq)
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                let _ = reply.send(records);
+            }
+            WriterRequest::AuditHead { reply } => {
+                let _ = reply.send(audit_chain.last().cloned());
+            }
+            WriterRequest::RecordAuditNote {
+                kind,
+                market_id,
+                qty,
+                price_paise,
+                reply,
+            } => {
+                let record = record_audit(
+                    &mut audit_chain,
+                    &mut next_audit_seq,
+                    &mut last_audit_hash,
+                    kind,
+                    market_id,
+                    qty,
+                    price_paise,
+                );
+                let _ = reply.send(record);
+            }
+            WriterRequest::ProofSolvency { reply } => {
+                let root_data = if let Some(ref tree) = current_solvency_tree {
+                    SolvencyRootData {
+                        seq: tree.seq,
+                        root_hash_hex: hex::encode(tree.root_hash),
+                        total_paise: tree.total_paise,
+                        leaf_count: tree.leaves.len(),
+                        published_at: tree.published_at,
+                    }
+                } else {
+                    SolvencyRootData {
+                        seq: 0,
+                        root_hash_hex: hex::encode([0u8; 32]),
+                        total_paise: 0,
+                        leaf_count: 0,
+                        published_at: 0,
+                    }
+                };
+                let _ = reply.send(root_data);
+            }
+            WriterRequest::ProofBalance { user_id, reply } => {
+                let proof_data = current_solvency_tree
+                    .as_ref()
+                    .and_then(|tree| tree.proof(user_id));
+                let _ = reply.send(proof_data);
             }
         }
     }
@@ -1844,6 +2117,174 @@ impl EscrowStore {
             }
         }
         Ok(escrow_id)
+    }
+}
+
+// ─── Stage 7 Solvency Merkle-Sum Tree ───────────────────────────────────────
+
+#[derive(Clone, Debug)]
+struct Stage7Leaf {
+    user_id: UserId,
+    salt: [u8; 16],
+    balance_paise: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SolvencyTreeData {
+    seq: u64,
+    total_paise: u64,
+    root_hash: [u8; 32],
+    leaves: Vec<Stage7Leaf>,
+    levels: Vec<Vec<dkx_hash::MerkleNode>>,
+    published_at: u64,
+}
+
+impl SolvencyTreeData {
+    fn proof(&self, user_id: UserId) -> Option<BalanceProofData> {
+        let leaf_idx = self
+            .leaves
+            .binary_search_by_key(&user_id, |l| l.user_id)
+            .ok()?;
+        let leaf = &self.leaves[leaf_idx];
+
+        let mut path = Vec::new();
+        let height = self.levels.len().saturating_sub(1);
+        for level in 0..height {
+            let idx = leaf_idx >> level;
+            let sibling_idx = idx ^ 1;
+            let (sibling_hash, sibling_sum, is_left) = match self.levels[level].get(sibling_idx) {
+                Some(sib) => (sib.hash, sib.sum, sibling_idx < idx),
+                None => ([0u8; 32], 0u64, false), // Empty node on right
+            };
+            path.push(PathStepData {
+                hash_hex: hex::encode(sibling_hash),
+                sum_paise: sibling_sum,
+                is_left,
+            });
+        }
+
+        Some(BalanceProofData {
+            leaf: BalanceLeafData {
+                user_id: leaf.user_id,
+                balance_paise: leaf.balance_paise,
+                salt_hex: hex::encode(leaf.salt),
+            },
+            path,
+            root_hash_hex: hex::encode(self.root_hash),
+            total_paise: self.total_paise,
+            seq: self.seq,
+        })
+    }
+}
+
+fn build_stage7_tree(core: &Core, user_salts: &mut HashMap<UserId, [u8; 16]>) -> SolvencyTreeData {
+    let mut leaves: Vec<Stage7Leaf> = Vec::new();
+
+    let all_balances = core.solvency_balances().unwrap_or_default();
+    let mut cash_by_user: HashMap<UserId, u64> = HashMap::new();
+    for (user_id, asset, balance) in all_balances {
+        if asset == Asset::Cash {
+            *cash_by_user.entry(user_id).or_insert(0) += balance;
+        }
+    }
+
+    // Include all known users with salts or cash
+    for uid in user_salts.keys() {
+        cash_by_user.entry(*uid).or_insert(0);
+    }
+
+    for (user_id, balance_paise) in cash_by_user {
+        let salt = *user_salts.entry(user_id).or_insert_with(|| {
+            let mut s = [0u8; 16];
+            let rand_val = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(1);
+            let mut hasher = Sha256::new();
+            hasher.update(b"DKX-USER-SALT-v1");
+            hasher.update(user_id.to_be_bytes());
+            hasher.update(rand_val.to_be_bytes());
+            let digest = hasher.finalize();
+            s.copy_from_slice(&digest[..16]);
+            s
+        });
+
+        leaves.push(Stage7Leaf {
+            user_id,
+            salt,
+            balance_paise,
+        });
+    }
+
+    leaves.sort_by_key(|l| l.user_id);
+
+    let published_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let seq = core.last_seq();
+
+    if leaves.is_empty() {
+        return SolvencyTreeData {
+            seq,
+            total_paise: 0,
+            root_hash: [0u8; 32],
+            leaves,
+            levels: vec![vec![dkx_hash::MerkleNode {
+                hash: [0u8; 32],
+                sum: 0,
+            }]],
+            published_at,
+        };
+    }
+
+    let mut current_level: Vec<dkx_hash::MerkleNode> = leaves
+        .iter()
+        .map(|leaf| dkx_hash::MerkleNode {
+            hash: hash_merkle_leaf(&leaf.salt, leaf.user_id, leaf.balance_paise),
+            sum: leaf.balance_paise,
+        })
+        .collect();
+
+    let mut levels = vec![current_level.clone()];
+
+    while current_level.len() > 1 {
+        let mut next_level = Vec::with_capacity(current_level.len().div_ceil(2));
+        for chunk in current_level.chunks(2) {
+            let node = if chunk.len() == 2 {
+                hash_merkle_node(&chunk[0].hash, chunk[0].sum, &chunk[1].hash, chunk[1].sum)
+                    .unwrap_or(dkx_hash::MerkleNode {
+                        hash: [0u8; 32],
+                        sum: chunk[0].sum.saturating_add(chunk[1].sum),
+                    })
+            } else {
+                pair_with_empty(&chunk[0]).unwrap_or(dkx_hash::MerkleNode {
+                    hash: [0u8; 32],
+                    sum: chunk[0].sum,
+                })
+            };
+            next_level.push(node);
+        }
+        levels.push(next_level.clone());
+        current_level = next_level;
+    }
+
+    let root_node = levels
+        .last()
+        .and_then(|lvl| lvl.first())
+        .cloned()
+        .unwrap_or(dkx_hash::MerkleNode {
+            hash: [0u8; 32],
+            sum: 0,
+        });
+
+    SolvencyTreeData {
+        seq,
+        total_paise: root_node.sum,
+        root_hash: root_node.hash,
+        leaves,
+        levels,
+        published_at,
     }
 }
 

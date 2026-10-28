@@ -77,6 +77,7 @@ export function AppShell() {
           <Route path="/auctions" element={<AuctionsPage />} />
           <Route path="/speed" element={<App initialView="speed" />} />
           <Route path="/verify" element={<VerifyPage />} />
+          <Route path="/proof" element={<VerifyPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/signup" element={<SignupPage />} />
           <Route
