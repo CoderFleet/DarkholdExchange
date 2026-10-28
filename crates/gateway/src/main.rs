@@ -126,9 +126,16 @@ async fn attach_database(auth: &dx_auth::AuthState, admin: &dx_admin::AdminState
     match std::env::var("DATABASE_URL") {
         Ok(url) => {
             if let Err(error) = dx_store::attach(&url, auth, admin).await {
-                panic!("database: {error}");
+                if auth.dev_auth_enabled() {
+                    eprintln!(
+                        "database: could not connect to PostgreSQL ({error}). Falling back to in-memory mode."
+                    );
+                } else {
+                    panic!("database: {error}");
+                }
+            } else {
+                println!("database: accounts, events and tiers are saved in PostgreSQL");
             }
-            println!("database: accounts, events and tiers are saved in PostgreSQL");
         }
         Err(_) if !auth.dev_auth_enabled() => {
             panic!("DATABASE_URL must be set when DX_DEV_AUTH=0 (see docs/AUTH.md)")
