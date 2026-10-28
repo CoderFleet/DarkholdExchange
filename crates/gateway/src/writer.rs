@@ -1251,10 +1251,38 @@ fn writer_loop(
                 });
             }
             WriterRequest::AllEscrows { reply } => {
-                let _ = reply.send(escrow_store.all());
+                let items = escrow_store.all();
+                let mut records = Vec::new();
+                for (record, auto_released) in items {
+                    if auto_released {
+                        let wal_op = WalOp::AdminSettleEscrow {
+                            trade_id: record.trade_id,
+                            refund_to_buyer: false,
+                        };
+                        let settle_res = core.admin_settle_escrow(record.trade_id, false);
+                        if settle_res.is_ok() {
+                            append_wal(&mut wal, &wal_op, core.state_hash());
+                        }
+                    }
+                    records.push(record);
+                }
+                let _ = reply.send(records);
             }
             WriterRequest::GetEscrow { id, reply } => {
-                let _ = reply.send(escrow_store.get(id));
+                let res = escrow_store.get(id).map(|(record, auto_released)| {
+                    if auto_released {
+                        let wal_op = WalOp::AdminSettleEscrow {
+                            trade_id: record.trade_id,
+                            refund_to_buyer: false,
+                        };
+                        let settle_res = core.admin_settle_escrow(record.trade_id, false);
+                        if settle_res.is_ok() {
+                            append_wal(&mut wal, &wal_op, core.state_hash());
+                        }
+                    }
+                    record
+                });
+                let _ = reply.send(res);
             }
             WriterRequest::EscrowAccept { user_id, id, reply } => {
                 let result = escrow_store.accept(user_id, id);
@@ -1446,8 +1474,14 @@ impl EscrowStore {
             .map(|sk| dkx_escrow::sign_receipt(sk, &receipt_bytes))
             .unwrap_or_default();
         let state = match record.state {
-            dx_types::EscrowState::PendingDelivery => dkx_escrow::EscrowState::Delivered,
-            dx_types::EscrowState::Delivered => dkx_escrow::EscrowState::Delivered,
+            dx_types::EscrowState::PendingDelivery => {
+                if now_micros >= deadline {
+                    dkx_escrow::EscrowState::Released
+                } else {
+                    dkx_escrow::EscrowState::Delivered
+                }
+            }
+            dx_types::EscrowState::Delivered => dkx_escrow::EscrowState::Released,
             dx_types::EscrowState::Refunded => dkx_escrow::EscrowState::Refunded,
         };
         self.escrows.insert(
@@ -1471,11 +1505,34 @@ impl EscrowStore {
         );
     }
 
-    fn all(&self) -> Vec<dkx_escrow::EscrowRecord> {
-        self.escrows.values().cloned().collect()
+    fn all(&mut self) -> Vec<(dkx_escrow::EscrowRecord, bool)> {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let mut results = Vec::new();
+        for e in self.escrows.values_mut() {
+            let mut auto_released = false;
+            if e.state == dkx_escrow::EscrowState::Delivered && now_micros >= e.deadline {
+                e.state = dkx_escrow::EscrowState::Released;
+                auto_released = true;
+            }
+            results.push((e.clone(), auto_released));
+        }
+        results
     }
-    fn get(&self, id: u64) -> Option<dkx_escrow::EscrowRecord> {
-        self.escrows.get(&id).cloned()
+    fn get(&mut self, id: u64) -> Option<(dkx_escrow::EscrowRecord, bool)> {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let e = self.escrows.get_mut(&id)?;
+        let mut auto_released = false;
+        if e.state == dkx_escrow::EscrowState::Delivered && now_micros >= e.deadline {
+            e.state = dkx_escrow::EscrowState::Released;
+            auto_released = true;
+        }
+        Some((e.clone(), auto_released))
     }
 
     fn accept(&mut self, user_id: UserId, id: u64) -> Result<(), ReasonCode> {
@@ -1483,7 +1540,11 @@ impl EscrowStore {
         if e.buyer_id != user_id {
             return Err(ReasonCode::NotOrderOwner);
         }
-        if e.state != dkx_escrow::EscrowState::Delivered {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        if e.state != dkx_escrow::EscrowState::Delivered || now_micros >= e.deadline {
             return Err(ReasonCode::EscrowNotReady);
         }
         e.state = dkx_escrow::EscrowState::Released;
@@ -1501,7 +1562,11 @@ impl EscrowStore {
         if e.buyer_id != user_id {
             return Err(ReasonCode::NotOrderOwner);
         }
-        if e.state != dkx_escrow::EscrowState::Delivered {
+        let now_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        if e.state != dkx_escrow::EscrowState::Delivered || now_micros >= e.deadline {
             return Err(ReasonCode::EscrowNotReady);
         }
         e.state = dkx_escrow::EscrowState::Disputed;

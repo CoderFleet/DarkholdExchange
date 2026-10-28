@@ -39,6 +39,7 @@ export const useWalletStore = create((set, get) => ({
       escrowPublicKey: null,
     })
     get().fetchWallet()
+    get().fetchEscrow()
   },
 
   resetAccount: () => {

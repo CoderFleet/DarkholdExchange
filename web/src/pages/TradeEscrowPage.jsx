@@ -59,11 +59,16 @@ useEffect(() => {
     return
   }
 
+  let autoReleasedTriggered = false
   const updateTimer = () => {
     const nowMicros = Date.now() * 1000
     const diffMicros = Number(escrow.deadline) - nowMicros
     const secs = Math.max(0, Math.floor(diffMicros / 1_000_000))
     setRemainingSecs(secs)
+    if (secs === 0 && !autoReleasedTriggered) {
+      autoReleasedTriggered = true
+      fetchEscrow()
+    }
   }
 
   updateTimer()
@@ -73,10 +78,11 @@ useEffect(() => {
     clearInterval(interval)
     setRemainingSecs(null)
   }
-}, [escrow?.deadline, escrow?.state])
+}, [escrow?.deadline, escrow?.state, fetchEscrow])
 
   const isBuyer = escrow ? Number(escrow.buyer_id) === Number(currentUserId) : false
   const isSeller = escrow ? Number(escrow.seller_id) === Number(currentUserId) : false
+  const isExpired = remainingSecs === 0 && isDelivered
 
   const handleAccept = async () => {
     if (!escrow) return
@@ -324,20 +330,31 @@ useEffect(() => {
             }}
           >
             <div>
-              <strong style={{ display: 'block' }}>Inspection Window Countdown</strong>
-              <span style={{ fontSize: '0.8rem', color: '#9ca3af' }}>
-                Auto-releases to seller when timer expires if no problem is reported.
+              <strong style={{ display: 'block' }}>
+                {isExpired ? 'Inspection Window Ended' : 'Inspection Window Countdown'}
+              </strong>
+              <span style={{ fontSize: '0.8rem', color: isExpired ? '#34d399' : '#9ca3af' }}>
+                {isExpired
+                  ? 'Inspection window has ended. Funds have been automatically released to the seller.'
+                  : 'Auto-releases to seller when timer expires if no problem is reported.'}
               </span>
             </div>
-            <div className="mono" style={{ fontSize: '1.5rem', color: '#fbbf24', fontWeight: 'bold' }}>
-              {formatCountdown(remainingSecs)}
+            <div
+              className="mono"
+              style={{
+                fontSize: '1.5rem',
+                color: isExpired ? '#34d399' : '#fbbf24',
+                fontWeight: 'bold',
+              }}
+            >
+              {isExpired ? 'AUTO-RELEASED' : formatCountdown(remainingSecs)}
             </div>
           </div>
         )}
       </div>
 
       {/* Buyer Action Controls */}
-      {isBuyer && isDelivered && (
+      {isBuyer && isDelivered && !isExpired && (
         <div className="panel" style={{ padding: '1.5rem', marginBottom: '1.5rem', background: '#111827', borderRadius: '8px' }}>
           <h4 style={{ margin: '0 0 1rem 0' }}>Buyer Inspection Actions</h4>
           <p style={{ fontSize: '0.875rem', color: '#9ca3af', marginBottom: '1rem' }}>
@@ -367,7 +384,7 @@ useEffect(() => {
       )}
 
       {/* Seller View Notice */}
-      {isSeller && isDelivered && (
+      {isSeller && isDelivered && !isExpired && (
         <div className="panel" style={{ padding: '1.5rem', marginBottom: '1.5rem', background: '#111827', borderRadius: '8px' }}>
           <h4 style={{ margin: '0 0 0.5rem 0' }}>Seller Status</h4>
           <p style={{ margin: 0, fontSize: '0.875rem', color: '#9ca3af' }}>
