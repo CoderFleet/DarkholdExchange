@@ -9,6 +9,12 @@ High-frequency secondary marketplace with an in-memory limit order book.
     just load     # repeatable gateway load baseline
     just load-fills  # repeatable fill-heavy gateway baseline
 
+## Run it all with Docker
+
+    docker compose up --build     # then open http://localhost:8000
+
+Database, gateway and Caddy (website + proxy) in one command. See [docs/DEPLOY.md](docs/DEPLOY.md).
+
 ## Persistence
 
 The gateway is crash-safe by default. Every non-cached command, successful deposit/issuance,

@@ -1,0 +1,11 @@
+# Keeps the build context small and stops local files leaking into the images.
+.git
+.github
+**/target
+**/node_modules
+**/dist
+data
+.env
+*.log
+docs
+bench
