@@ -2769,6 +2769,8 @@ struct Stage6EscrowView {
     market_id: u32,
     buyer_id: UserId,
     seller_id: UserId,
+    buyer_username: Option<String>,
+    seller_username: Option<String>,
     qty: u32,
     price: i64,
     fee: i64,
@@ -2779,13 +2781,21 @@ struct Stage6EscrowView {
     role: String,
 }
 
-fn escrow_to_view(e: &dkx_escrow::EscrowRecord, role: &str, pub_key: &str) -> Stage6EscrowView {
+fn escrow_to_view(
+    e: &dkx_escrow::EscrowRecord,
+    role: &str,
+    pub_key: &str,
+    buyer_username: Option<String>,
+    seller_username: Option<String>,
+) -> Stage6EscrowView {
     Stage6EscrowView {
         id: e.id,
         trade_id: e.trade_id,
         market_id: e.market_id,
         buyer_id: e.buyer_id,
         seller_id: e.seller_id,
+        buyer_username,
+        seller_username,
         qty: e.qty,
         price: e.price,
         fee: e.fee,
@@ -2825,7 +2835,9 @@ async fn escrow_list(
             } else {
                 "seller"
             };
-            escrow_to_view(e, role, &pub_key)
+            let buyer_username = state.auth.username_of(e.buyer_id);
+            let seller_username = state.auth.username_of(e.seller_id);
+            escrow_to_view(e, role, &pub_key, buyer_username, seller_username)
         })
         .collect();
     Ok(Json(views))
@@ -2862,7 +2874,15 @@ async fn escrow_get(
     } else {
         "admin"
     };
-    Ok(Json(escrow_to_view(&e, role, &pub_key)))
+    let buyer_username = state.auth.username_of(e.buyer_id);
+    let seller_username = state.auth.username_of(e.seller_id);
+    Ok(Json(escrow_to_view(
+        &e,
+        role,
+        &pub_key,
+        buyer_username,
+        seller_username,
+    )))
 }
 
 #[derive(Debug, Deserialize)]

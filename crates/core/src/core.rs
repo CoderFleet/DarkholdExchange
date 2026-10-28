@@ -962,6 +962,51 @@ impl Core {
         records
     }
 
+    /// Admin resolution of a disputed escrow. Either refunds buyer or releases to seller.
+    pub fn admin_settle_escrow(
+        &mut self,
+        trade_id: TradeId,
+        refund_to_buyer: bool,
+    ) -> Result<EscrowRecord, ReasonCode> {
+        let mut record = self
+            .escrow
+            .get(&trade_id)
+            .cloned()
+            .ok_or(ReasonCode::OrderNotFound)?;
+        if record.state != EscrowState::PendingDelivery {
+            return Err(ReasonCode::EscrowNotReady);
+        }
+
+        if refund_to_buyer {
+            if self
+                .ledger
+                .refund_escrow(escrow_settlement(&record))
+                .is_err()
+            {
+                self.poisoned = true;
+                return Err(ReasonCode::InternalError);
+            }
+            record.state = EscrowState::Refunded;
+        } else {
+            if self
+                .ledger
+                .release_escrow(escrow_settlement(&record))
+                .is_err()
+            {
+                self.poisoned = true;
+                return Err(ReasonCode::InternalError);
+            }
+            record.state = EscrowState::Delivered;
+            if record.delivered_at_ms.is_none() {
+                record.delivered_at_ms = Some(self.current_time_ms);
+            }
+        }
+
+        self.escrow.insert(trade_id, record.clone());
+        self.bump_state_version();
+        Ok(record)
+    }
+
     /// Release escrow after verifying the seller's signed delivery receipt.
     pub fn release_escrow(
         &mut self,

@@ -279,6 +279,18 @@ useEffect(() => {
       <div className="panel" style={{ padding: '1.5rem', marginBottom: '1.5rem', background: '#111827', borderRadius: '8px' }}>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
           <div>
+            <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>Buyer</span>
+            <p style={{ margin: '0.25rem 0', fontWeight: 'bold' }}>
+              {escrow.buyer_username ? `@${escrow.buyer_username}` : `Trader #${escrow.buyer_id}`}
+            </p>
+          </div>
+          <div>
+            <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>Seller</span>
+            <p style={{ margin: '0.25rem 0', fontWeight: 'bold' }}>
+              {escrow.seller_username ? `@${escrow.seller_username}` : `Trader #${escrow.seller_id}`}
+            </p>
+          </div>
+          <div>
             <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>Quantity & Market</span>
             <p style={{ margin: '0.25rem 0', fontWeight: 'bold' }}>{escrow.qty} Pass (Market #{escrow.market_id})</p>
           </div>

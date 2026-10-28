@@ -63,6 +63,10 @@ pub(crate) enum WalOp {
         trade_id: TradeId,
         now_ms: u64,
     },
+    AdminSettleEscrow {
+        trade_id: TradeId,
+        refund_to_buyer: bool,
+    },
     CreateDutchAuction {
         seller_id: UserId,
         request: CreateDutchAuction,
@@ -243,6 +247,13 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
         } => {
             core.refund_escrow(*actor_user_id, *trade_id, *now_ms)
                 .map_err(|reason| format!("WAL escrow refund replay rejected: {reason:?}"))?;
+        }
+        WalOp::AdminSettleEscrow {
+            trade_id,
+            refund_to_buyer,
+        } => {
+            core.admin_settle_escrow(*trade_id, *refund_to_buyer)
+                .map_err(|reason| format!("WAL admin settle escrow replay rejected: {reason:?}"))?;
         }
         WalOp::CreateDutchAuction {
             seller_id,

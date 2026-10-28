@@ -417,6 +417,12 @@ impl AuthState {
         ids
     }
 
+    /// Returns the username for a user id, if known.
+    pub fn username_of(&self, user_id: UserId) -> Option<String> {
+        let store = self.0.store.lock().expect("auth store");
+        store.name_by_id.get(&user_id).cloned()
+    }
+
     /// The id of the account with this username, if there is one. Names are stored in lowercase,
     /// so capitals and spaces around the name do not matter. The issuer endpoint uses it, so
     /// an issuer can name the person to credit instead of knowing their number.

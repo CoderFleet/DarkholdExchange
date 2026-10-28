@@ -918,7 +918,8 @@ fn writer_loop(
     let mut escrow_store = EscrowStore::new();
     for fill in &recent_trades {
         if let Some(eid) = fill.escrow_id {
-            escrow_store.maybe_create_from_fill(fill, eid);
+            let tick_size = core.config(fill.market_id).map(|c| c.tick_size_minor).unwrap_or(100);
+            escrow_store.maybe_create_from_fill(fill, eid, tick_size);
         }
     }
     for record in core.all_escrow_records() {
@@ -963,7 +964,8 @@ fn writer_loop(
                 // Populate escrow store from any newly escrowed fills
                 for fill in recent_trades.iter().rev().take(32) {
                     if let Some(eid) = fill.escrow_id {
-                        escrow_store.maybe_create_from_fill(fill, eid);
+                        let tick_size = core.config(fill.market_id).map(|c| c.tick_size_minor).unwrap_or(100);
+                        escrow_store.maybe_create_from_fill(fill, eid, tick_size);
                     }
                 }
                 if disconnected {
@@ -1250,7 +1252,21 @@ fn writer_loop(
             }
             WriterRequest::EscrowAccept { user_id, id, reply } => {
                 let result = escrow_store.accept(user_id, id);
-                let _ = reply.send(result);
+                let res = match result {
+                    Ok(()) => {
+                        let wal_op = WalOp::AdminSettleEscrow {
+                            trade_id: id,
+                            refund_to_buyer: false,
+                        };
+                        let settle_res = core.admin_settle_escrow(id, false);
+                        if settle_res.is_ok() {
+                            append_wal(&mut wal, &wal_op, core.state_hash());
+                        }
+                        settle_res.map(|_| ())
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
             }
             WriterRequest::EscrowReject {
                 user_id,
@@ -1277,7 +1293,22 @@ fn writer_loop(
                 reply,
             } => {
                 let result = escrow_store.admin_rule(admin_id, id, ruling, note);
-                let _ = reply.send(result);
+                let res = match result {
+                    Ok(escrow_id) => {
+                        let refund_to_buyer = ruling == dkx_escrow::AdminRuling::Buyer;
+                        let wal_op = WalOp::AdminSettleEscrow {
+                            trade_id: escrow_id,
+                            refund_to_buyer,
+                        };
+                        let settle_res = core.admin_settle_escrow(escrow_id, refund_to_buyer);
+                        if settle_res.is_ok() {
+                            append_wal(&mut wal, &wal_op, core.state_hash());
+                        }
+                        settle_res.map(|_| ())
+                    }
+                    Err(e) => Err(e),
+                };
+                let _ = reply.send(res);
             }
             WriterRequest::EscrowPublicKey { reply } => {
                 let _ = reply.send(escrow_store.public_key_hex());
@@ -1321,7 +1352,7 @@ impl EscrowStore {
             .unwrap_or_default()
     }
 
-    fn maybe_create_from_fill(&mut self, fill: &Fill, escrow_id: u64) {
+    fn maybe_create_from_fill(&mut self, fill: &Fill, escrow_id: u64, tick_size_minor: i64) {
         if self.escrows.contains_key(&escrow_id) {
             return;
         }
@@ -1336,7 +1367,7 @@ impl EscrowStore {
         } else {
             (fill.maker_user_id, fill.taker_user_id)
         };
-        let price_minor = fill.price_ticks as i64;
+        let price_minor = (fill.price_ticks as i64).saturating_mul(tick_size_minor);
         let receipt_bytes = dkx_escrow::build_receipt_bytes(
             escrow_id,
             fill.trade_id,
@@ -1506,7 +1537,7 @@ impl EscrowStore {
         id: u64,
         ruling: dkx_escrow::AdminRuling,
         note: String,
-    ) -> Result<(), ReasonCode> {
+    ) -> Result<u64, ReasonCode> {
         // `id` is primarily the dispute_id from /api/admin/disputes/{id}/rule,
         // or optionally the escrow_id. Check dispute_id first to avoid collision.
         let escrow_id = if let Some(d) = self.disputes.values().find(|d| d.id == id) {
@@ -1546,7 +1577,7 @@ impl EscrowStore {
                 d.note = format!("{}\nAdmin: {}", d.note, note);
             }
         }
-        Ok(())
+        Ok(escrow_id)
     }
 }
 
