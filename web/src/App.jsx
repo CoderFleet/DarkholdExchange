@@ -413,21 +413,23 @@ function MarketTabs({ markets, snapshots, selectedMarketId }) {
             aria-current={selectedMarketId === market.id ? 'page' : undefined}
           >
             <span className="market-tab-top">
-              <span>{market.name}</span>
+              <span className="market-tab-name">{market.name}</span>
+              <span
+                className={`market-tab-last ${
+                  snapshot?.last_trade_price ? 'has-trade' : ''
+                }`}
+              >
+                {snapshot?.last_trade_price
+                  ? formatPrice(market, snapshot.last_trade_price)
+                  : 'No prints'}
+              </span>
+            </span>
+            <span className="market-tab-bottom">
               <span className="market-tab-id">M{market.id}</span>
-            </span>
-            <span className="market-tab-meta">
-              {formatMoney(market.face_value_minor)} face ·{' '}
-              {formatPercent(market.taker_fee_bps)} fee
-            </span>
-            <span
-              className={`market-tab-last ${
-                snapshot?.last_trade_price ? 'has-trade' : ''
-              }`}
-            >
-              {snapshot?.last_trade_price
-                ? formatPrice(market, snapshot.last_trade_price)
-                : 'No prints yet'}
+              <span className="market-tab-meta">
+                {formatMoney(market.face_value_minor)} face ·{' '}
+                {formatPercent(market.taker_fee_bps)} fee
+              </span>
             </span>
           </Link>
         )
