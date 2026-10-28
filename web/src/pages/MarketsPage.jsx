@@ -1,92 +1,80 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { getMarkets } from '../api'
-import { MarketCard } from '../components/MarketCard'
-import { filterMarketViews, marketOverview } from '../lib/marketOverview'
+import { EventCard } from '../components/EventCard'
+import { buildEventList, eventMatches } from '../lib/eventList'
+import { useEventData } from '../lib/useEventData'
 import './marketing.css'
-
-const POLL_MS = 5_000
+import './events.css'
 
 const FILTERS = [
-  { id: 'all', label: 'All markets' },
+  { id: 'all', label: 'All events' },
   { id: 'spot', label: 'Spot' },
   { id: 'escrow', label: 'Escrow' },
 ]
 
+// The events page: one card per event, showing its tiers and live prices. Opening a card goes to
+// the trading screen, where the event's tiers are the tabs.
 export function MarketsPage() {
-  const [views, setViews] = useState([])
-  const [status, setStatus] = useState('loading')
-  const [error, setError] = useState(null)
+  const { events, views, status, error, reload } = useEventData()
   const [query, setQuery] = useState('')
   const [kind, setKind] = useState('all')
 
-  const load = useCallback(async () => {
-    try {
-      const next = await getMarkets()
-      setViews(next)
-      setStatus('ready')
-      setError(null)
-    } catch (nextError) {
-      setStatus('error')
-      setError(nextError.message)
-    }
-  }, [])
-
-  useEffect(() => {
-    const initial = window.setTimeout(load, 0)
-    const poll = window.setInterval(load, POLL_MS)
-    return () => {
-      window.clearTimeout(initial)
-      window.clearInterval(poll)
-    }
-  }, [load])
-
-  const overview = useMemo(() => marketOverview(views), [views])
-  const visible = useMemo(
-    () => filterMarketViews(views, { query, kind }),
-    [views, query, kind],
+  const list = useMemo(
+    () =>
+      buildEventList(
+        events,
+        views.map((view) => view.config),
+      ),
+    [events, views],
   )
+  const snapshots = useMemo(
+    () => Object.fromEntries(views.map((view) => [view.config.id, view.snapshot])),
+    [views],
+  )
+  const shown = useMemo(() => list.filter((event) => eventMatches(event, query, kind)), [list, query, kind])
+  const tierCount = list.reduce((sum, event) => sum + event.tiers.length, 0)
+  const withPrints = views.filter((view) => view.snapshot?.last_trade_price != null).length
+  const loading = status === 'loading'
 
   return (
     <main className="markets-page">
       <header className="markets-header">
         <div>
           <span className="eyebrow">Execution books</span>
-          <h1>Markets</h1>
+          <h1>Events</h1>
           <p>
-            Every event pass trades against a live limit order book with a
-            server-enforced collar, integer ticks and a published fee.
+            Open an event to trade its passes and switch between its price tiers. Every tier trades
+            against a live limit order book with a server-enforced collar, integer ticks and a
+            published fee.
           </p>
         </div>
         <dl className="markets-metrics">
           <div>
-            <dt>Live books</dt>
-            <dd>{status === 'loading' ? '—' : overview.total}</dd>
+            <dt>Events</dt>
+            <dd>{loading ? '—' : list.length}</dd>
           </div>
           <div>
-            <dt>Spot / escrow</dt>
-            <dd>
-              {status === 'loading' ? '—' : `${overview.spot} / ${overview.escrow}`}
-            </dd>
+            <dt>Tiers</dt>
+            <dd>{loading ? '—' : tierCount}</dd>
           </div>
           <div>
             <dt>With prints</dt>
-            <dd>{status === 'loading' ? '—' : overview.withPrints}</dd>
+            <dd>{loading ? '—' : withPrints}</dd>
           </div>
         </dl>
       </header>
 
-      <section className="markets-toolbar" aria-label="Filter markets">
+      <section className="markets-toolbar" aria-label="Filter events">
         <label className="markets-search">
           <span>Search</span>
           <input
             type="search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
-            placeholder="Market, ID or event"
+            placeholder="Event, venue, tier or ID"
           />
         </label>
-        <div className="markets-filters" role="group" aria-label="Market kind">
+        <div className="markets-filters" role="group" aria-label="Event kind">
           {FILTERS.map((filter) => (
             <button
               key={filter.id}
@@ -104,25 +92,25 @@ export function MarketsPage() {
         </span>
       </section>
 
-      {status === 'error' && views.length === 0 ? (
+      {status === 'error' && list.length === 0 ? (
         <div className="markets-empty">
           <h2>Cannot reach the matching engine</h2>
           <p>{error}</p>
-          <button type="button" className="landing-button primary" onClick={load}>
+          <button type="button" className="landing-button primary" onClick={reload}>
             Try again
           </button>
           <Link to="/">Back to the landing page</Link>
         </div>
-      ) : status === 'loading' && views.length === 0 ? (
-        <div className="market-grid">
+      ) : loading && list.length === 0 ? (
+        <div className="event-grid">
           {Array.from({ length: 3 }, (_, index) => (
-            <div className="market-card skeleton" key={`skeleton-${index}`} />
+            <div className="event-card skeleton" key={`skeleton-${index}`} />
           ))}
         </div>
-      ) : visible.length === 0 ? (
+      ) : shown.length === 0 ? (
         <div className="markets-empty">
-          <h2>No markets match that filter</h2>
-          <p>Try a different name, market ID or event number.</p>
+          <h2>No events match that filter</h2>
+          <p>Try a different name, venue, tier or event number.</p>
           <button
             type="button"
             className="landing-button ghost"
@@ -135,9 +123,9 @@ export function MarketsPage() {
           </button>
         </div>
       ) : (
-        <div className="market-grid">
-          {visible.map((view) => (
-            <MarketCard key={view.config.id} view={view} />
+        <div className="event-grid">
+          {shown.map((event) => (
+            <EventCard key={event.eventId} event={event} snapshots={snapshots} />
           ))}
         </div>
       )}
