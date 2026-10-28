@@ -399,3 +399,71 @@ export const ruleAdminDispute = (id, ruling, note) =>
     body: JSON.stringify({ ruling, note }),
   })
 
+// ── Batch Auctions (Commit-Reveal) ──────────────────────────────────────────
+
+/**
+ * @param {{ market_id?: number }} [query]
+ * @returns {Promise<{ items: any[], now_ms: number }>}
+ */
+export const getBatchAuctions = (query = {}) => {
+  const params = new URLSearchParams()
+  if (query.market_id != null) params.set('market_id', String(query.market_id))
+  const qs = params.toString() ? `?${params.toString()}` : ''
+  return request(`/api/batch-auctions${qs}`)
+}
+
+/**
+ * @param {{ client_order_id: number, market_id: number, qty: number, floor_price_ticks: number, commit_duration_ms: number, reveal_duration_ms: number }} body
+ * @returns {Promise<any>}
+ */
+export const createBatchAuction = (body) =>
+  request('/api/batch-auctions', {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * @param {number} auctionId
+ * @param {{ client_order_id: number, commitment: string }} body
+ * @returns {Promise<any>}
+ */
+export const commitBatchBid = (auctionId, body) =>
+  request(`/api/batch-auctions/${auctionId}/commit`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * @param {number} auctionId
+ * @param {{ client_order_id: number, price_ticks: number, qty: number, salt: string }} body
+ * @returns {Promise<any>}
+ */
+export const revealBatchBid = (auctionId, body) =>
+  request(`/api/batch-auctions/${auctionId}/reveal`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * @param {number} auctionId
+ * @param {{ client_order_id: number }} body
+ * @returns {Promise<{ fills: any[] }>}
+ */
+export const settleBatchAuction = (auctionId, body) =>
+  request(`/api/batch-auctions/${auctionId}/settle`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * @param {number} auctionId
+ * @returns {Promise<any[]>}
+ */
+export const getBatchBids = (auctionId) =>
+  request(`/api/batch-auctions/${auctionId}/bids`)
+
+
