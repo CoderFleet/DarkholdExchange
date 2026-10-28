@@ -590,10 +590,17 @@ export function AuctionsPage() {
       {tab === 'batch' && (
         <>
           <section className="auction-panel">
-            <h3>Batch Auctions (Commit-Reveal Uniform Clearing)</h3>
+            <div className="panel-header">
+              <h3>Active Clearing Windows</h3>
+              <span className="panel-meta">{batchAuctions.length} active</span>
+            </div>
             {status === 'loading' && <p className="auction-empty">Loading…</p>}
             {status === 'ready' && batchAuctions.length === 0 && (
-              <p className="auction-empty">No batch auctions active. Create one below.</p>
+              <p className="auction-empty">
+                {isAdmin
+                  ? 'No active batch auction windows. Schedule one below.'
+                  : 'No batch auction windows are active right now. Check back when the exchange opens a clearing round.'}
+              </p>
             )}
             <div className="auction-grid">
               {batchAuctions.map((auction) => {
@@ -670,13 +677,20 @@ export function AuctionsPage() {
                             />
                           </label>
                         </div>
-                        <button
-                          type="button"
-                          disabled={busy || !userId || savedBid.committed}
-                          onClick={() => handleCommitBid(auction)}
-                        >
-                          {savedBid.committed ? 'Sealed Bid Committed' : 'Commit Sealed Bid (SHA-256)'}
-                        </button>
+                        {userId ? (
+                          <button
+                            type="button"
+                            disabled={busy || savedBid.committed}
+                            onClick={() => handleCommitBid(auction)}
+                          >
+                            {savedBid.committed ? 'Sealed Bid Committed' : 'Commit Sealed Bid (SHA-256)'}
+                          </button>
+                        ) : (
+                          <div className="auction-guest">
+                            <p>Log in to commit a sealed bid.</p>
+                            <Link to="/login" state={{ from: '/auctions' }}>Log in</Link>
+                          </div>
+                        )}
                       </div>
                     )}
 
@@ -697,8 +711,8 @@ export function AuctionsPage() {
                       </div>
                     )}
 
-                    {/* Settle Action (Available when reveal closes) */}
-                    {(auction.phase === 'reveal' || auction.phase === 'commit') && revealRemainingMs === 0 && (
+                    {/* Settle Action — admin only */}
+                    {isAdmin && (auction.phase === 'reveal' || auction.phase === 'commit') && revealRemainingMs === 0 && (
                       <div className="auction-actions">
                         <button
                           type="button"
@@ -717,7 +731,7 @@ export function AuctionsPage() {
                     )}
 
                     {isSeller && (
-                      <p className="auction-hint">You are the seller.</p>
+                      <p className="auction-hint">Exchange window.</p>
                     )}
                   </article>
                 )
@@ -727,7 +741,10 @@ export function AuctionsPage() {
 
           {isAdmin ? (
             <section className="auction-panel">
-              <h3>Schedule Batch Auction Window (Admin / Exchange)</h3>
+              <div className="panel-header">
+                <h3>Schedule Clearing Window</h3>
+                <span className="panel-meta">Admin only</span>
+              </div>
               <form className="auction-form" onSubmit={handleCreateBatch}>
                 <label>
                   Market
@@ -789,11 +806,21 @@ export function AuctionsPage() {
               )}
             </section>
           ) : (
-            <section className="auction-panel">
-              <h3>Exchange-Scheduled Clearing Windows</h3>
+            <section className="auction-panel batch-info-panel">
+              <div className="panel-header">
+                <h3>How Batch Auctions Work</h3>
+                <span className="panel-meta">Commit-Reveal · Uniform Price</span>
+              </div>
               <p className="auction-hint">
-                Batch auctions are scheduled exclusively by the exchange to pool all market liquidity and eliminate front-running. Traders submit sealed cryptographic bids during the commit window and reveal them simultaneously to clear at one fair, uniform price.
+                Batch clearing windows are scheduled exclusively by the exchange. All buyers submit sealed SHA-256 bids during the commit window, then simultaneously reveal them. The engine finds the uniform clearing price that maximises matched volume — no front-running, no timing advantage.
               </p>
+              <div className="batch-phases">
+                <span className="batch-phase-chip">1 · Commit</span>
+                <span className="batch-phase-arrow">→</span>
+                <span className="batch-phase-chip">2 · Reveal</span>
+                <span className="batch-phase-arrow">→</span>
+                <span className="batch-phase-chip">3 · Uniform Clear</span>
+              </div>
             </section>
           )}
         </>
