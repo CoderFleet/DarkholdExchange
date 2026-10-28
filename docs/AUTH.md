@@ -120,18 +120,22 @@ it. Each change is small, backward compatible, in its own PR, and passes CI befo
 1. **Auth endpoints:** a new crate, added to the gateway router with one `.merge(...)` line.
 2. **`dev_user()` in the gateway (done):** it is now `identify()` in `crates/gateway/src/main.rs`.
    If an `Authorization: Bearer` header is present it must hold a valid token, otherwise the answer
-   is 401 and the dev header is never used instead. With no token, `x-dev-user` still works while
-   `DX_DEV_AUTH=1` (the default), so the load simulator, the k6 scripts and every existing request
-   keep working unchanged. Endpoints that name a user in the address (`/api/users/{id}/balances`
-   and `/api/users/{id}/orders`) let a logged-in user read only their own data (admins may read
-   anyone's). `/api/dev/deposit` and `/api/dev/issue` answer 403 when `DX_DEV_AUTH=0`.
-3. **`web/src/api.js` `request()`:** if a saved token exists, add `Authorization: Bearer <token>`;
-   otherwise behave exactly as today. The existing `x-dev-user` headers stay until the switch-over.
+   is 401 and the dev header is never used instead. With no token, an **explicit** `x-dev-user`
+   header works while `DX_DEV_AUTH=1` (the default); there is no default dev user. The load
+   simulator sends the header explicitly. Endpoints that name a user in the address
+   (`/api/users/{id}/balances` and `/api/users/{id}/orders`) let a logged-in user read only their
+   own data (admins may read anyone's). `/api/dev/deposit` and `/api/dev/issue` answer 403 when
+   `DX_DEV_AUTH=0`.
+3. **`web/src/api.js` `request()`:** every call carries `Authorization: Bearer <token>` when a
+   session exists. The browser app never sends `x-dev-user`, so it cannot impersonate a trader.
 4. **Login, signup, role-protected routes, auth store:** new files.
-5. **Switch-over (done):** `/market`, the wallet and the history pages use the logged-in user. The
-   Identity dropdown shows only while nobody is logged in (dev). Real runs set `DX_DEV_AUTH=0`.
-   Still open: the WebSocket does not check the token yet, and in a real run `/market` shows
-   errors, instead of redirecting to the login page, when nobody is logged in.
+5. **Switch-over (done):** `/markets/:id`, `/wallet` and `/history` are behind `RequireRole`; an
+   anonymous visitor is redirected to `/login` and returned to the page after signing in. The
+   terminal has no Identity dropdown and trades only as the logged-in user. The navbar hides
+   private links while anonymous; `/auctions` stays readable but its create/accept controls
+   require a login. Real runs set `DX_DEV_AUTH=0`.
+   Still open: the public market-data WebSocket does not verify a token (row 7 of the checklist);
+   it only carries market data, not account data.
 
 
 ## 5. Saving accounts, events and tiers

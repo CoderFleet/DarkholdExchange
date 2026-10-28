@@ -47,7 +47,7 @@
 | 3 | Per-identity holding limits | ✅ | Core tracks open buys, held passes, and pending escrow passes for the buyer. | — |
 | 4 | Double-entry ledger, reservations before matching | ✅ | `crates/ledger`, atomic settlement, conservation and negative-balance tests. | — |
 | 5 | Idempotency keys and replay-safe retries | ✅ | Core idempotency cache + tests. | — |
-| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT and admin/issuer roles. Accounts are saved in PostgreSQL when `DATABASE_URL` is set (`docs/AUTH.md` section 5). | Check WS handshake auth. |
+| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT, admin/issuer roles, durable accounts when `DATABASE_URL` is set. Private terminal/wallet/history routes require a login; the client never sends an impersonating dev header. | Check WS handshake auth (row 7). |
 | 7 | WebSocket auth | ❌ | WS accepts `?user_id=` and does not verify a JWT. | Authenticate the upgrade request; reject spoofed identities. |
 | 8 | L2 snapshot + sequenced diffs + gap resync | ✅ | Gateway publisher, worker rebuild, market terminal. | — |
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |

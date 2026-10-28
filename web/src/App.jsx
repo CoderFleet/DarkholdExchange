@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   nextClientOrderId,
   placeLimit,
@@ -32,7 +32,6 @@ import { SpeedPanel } from './components/SpeedPanel'
 import { createLatencySample } from './lib/latency'
 import './App.css'
 
-const TRADER_IDS = [1, 2, 3, 4, 5, 6]
 const MAX_LATENCY_SAMPLES = 50
 const BOOK_LEVELS = 14
 
@@ -54,13 +53,23 @@ function App({ initialView = 'trade' }) {
   const connectFeed = useMarketFeedStore((state) => state.connect)
   const disconnectFeed = useMarketFeedStore((state) => state.disconnect)
 
+  const { marketId: marketIdParam } = useParams()
+  const routeMarketId = useMemo(() => {
+    const parsed = Number(marketIdParam)
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : null
+  }, [marketIdParam])
+  const selectedMarket = useMemo(
+    () => markets.find((market) => market.id === routeMarketId) ?? null,
+    [markets, routeMarketId],
+  )
+  const selectedMarketId = selectedMarket?.id ?? null
+
   const [balances, setBalances] = useState([])
   const [openOrders, setOpenOrders] = useState([])
-  const [selectedMarketId, setSelectedMarketId] = useState(null)
-  // Logged in: you are who you logged in as. Not logged in (dev only): the Identity dropdown picks.
+  const [marketsLoaded, setMarketsLoaded] = useState(false)
+  // Private pages are behind RequireRole, so this is always a real signed-in user.
   const authUser = useAuthStore((state) => state.user)
-  const [devUserId, setDevUserId] = useState(1)
-  const userId = authUser ? authUser.user_id : devUserId
+  const userId = authUser?.user_id ?? null
   const [toast, setToast] = useState(null)
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(null)
@@ -82,9 +91,10 @@ function App({ initialView = 'trade' }) {
   }, [])
 
   const loadAccount = useCallback(async (id) => {
+    if (id == null) return
     const [nextBalances, nextOrders] = await Promise.all([
       getBalances(id),
-      getOpenOrders(id),
+      getOpenOrders(),
     ])
     setBalances(nextBalances)
     setOpenOrders(nextOrders)
@@ -109,7 +119,7 @@ function App({ initialView = 'trade' }) {
       .then((views) => {
         if (cancelled) return
         hydrateMarkets(views)
-        setSelectedMarketId((current) => current ?? views[0]?.config.id ?? null)
+        setMarketsLoaded(true)
       })
       .catch((error) => {
         if (!cancelled) setBootError(error.message)
@@ -120,8 +130,9 @@ function App({ initialView = 'trade' }) {
   }, [hydrateMarkets])
 
   useEffect(() => {
+    if (userId == null) return undefined
     let cancelled = false
-    Promise.all([getBalances(userId), getOpenOrders(userId)])
+    Promise.all([getBalances(userId), getOpenOrders()])
       .then(([nextBalances, nextOrders]) => {
         if (cancelled) return
         setBalances(nextBalances)
@@ -135,14 +146,18 @@ function App({ initialView = 'trade' }) {
     }
   }, [userId])
 
-  // Runs on first load and whenever who we are changes (log in, log out, dropdown).
+  // Runs on first load and whenever who we are changes (log in, log out).
   // Points the wallet and history pages at that user and loads their wallet.
   useEffect(() => {
+    if (userId == null) {
+      useWalletStore.getState().resetAccount()
+      return
+    }
     useWalletStore.getState().setUserId(userId)
   }, [userId])
 
   useEffect(() => {
-    if (selectedMarketId == null) return undefined
+    if (activeView !== 'trade' || selectedMarketId == null) return undefined
     let cancelled = false
     loadTrades(selectedMarketId).catch((error) => {
       if (!cancelled) setToast({ kind: 'error', text: error.message })
@@ -150,7 +165,7 @@ function App({ initialView = 'trade' }) {
     return () => {
       cancelled = true
     }
-  }, [selectedMarketId, loadTrades])
+  }, [activeView, selectedMarketId, loadTrades])
 
   useEffect(() => {
     if (!lastTrade) return
@@ -166,14 +181,15 @@ function App({ initialView = 'trade' }) {
   }, [lastTrade, userId, loadAccount])
 
   useEffect(() => {
-    if (selectedMarketId == null) return
+    if (activeView !== 'trade' || selectedMarketId == null || userId == null) {
+      disconnectFeed()
+      return undefined
+    }
     connectFeed(userId, selectedMarketId)
-
     // The worker closes an old socket when connect() is called for a new
-    // market/user, so this effect only owns the logical selection.
-  }, [userId, selectedMarketId, connectFeed])
-
-  useEffect(() => () => disconnectFeed(), [disconnectFeed])
+    // market/user, and this effect releases it when the terminal unmounts.
+    return () => disconnectFeed()
+  }, [activeView, userId, selectedMarketId, connectFeed, disconnectFeed])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -181,16 +197,16 @@ function App({ initialView = 'trade' }) {
     return () => clearTimeout(timer)
   }, [toast])
 
-  const selectedMarket = useMemo(
-    () => markets.find((market) => market.id === selectedMarketId) ?? null,
-    [markets, selectedMarketId],
-  )
   const selectedSnapshot = selectedMarket ? snapshots[selectedMarket.id] : null
   const selectedTrades = selectedMarket
     ? tradesByMarket[selectedMarket.id] ?? []
     : []
 
   const runCommand = async (request) => {
+    if (userId == null) {
+      setToast({ kind: 'error', text: 'Log in to trade.' })
+      return null
+    }
     const sentAt = performance.now()
     try {
       const response = await request()
@@ -222,7 +238,7 @@ function App({ initialView = 'trade' }) {
   const submit = async (command) => {
     setSubmitting(true)
     try {
-      return await runCommand(() => postCommand(command, userId))
+      return await runCommand(() => postCommand(command))
     } finally {
       setSubmitting(false)
     }
@@ -232,30 +248,23 @@ function App({ initialView = 'trade' }) {
     setCancelling(orderId)
     try {
       await runCommand(() =>
-        cancelOrderRequest(orderId, nextClientOrderId(), userId),
+        cancelOrderRequest(orderId, nextClientOrderId()),
       )
     } finally {
       setCancelling(null)
     }
   }
 
-  const handleUserChange = (event) => {
-    const nextId = Number(event.target.value)
-    setDevUserId(nextId)
-    wallet.setUserId(nextId)
-    setBalances([])
-    setOpenOrders([])
-  }
-
   return (
     <div className="app-shell">
-      <Header
-        connection={feedStatus}
-        resyncing={resyncing}
-        userId={userId}
-        account={authUser}
-        onUserChange={handleUserChange}
-      />
+      {activeView === 'trade' && (
+        <MarketToolbar
+          connection={feedStatus}
+          resyncing={resyncing}
+          account={authUser}
+          marketName={selectedMarket?.name}
+        />
+      )}
 
       {bootError && <div className="banner error">{bootError}</div>}
 
@@ -282,7 +291,6 @@ function App({ initialView = 'trade' }) {
             markets={markets}
             snapshots={snapshots}
             selectedMarketId={selectedMarketId}
-            onSelect={setSelectedMarketId}
           />
 
           {selectedMarket ? (
@@ -326,20 +334,31 @@ function App({ initialView = 'trade' }) {
               </div>
             </>
           ) : (
-            <div className="loading-panel">
-              {bootError ? 'Gateway unavailable.' : 'Connecting to the exchange…'}
+            <div className="loading-panel market-missing">
+              {bootError ? (
+                <>
+                  <p>Gateway unavailable.</p>
+                  <Link to="/markets">Back to markets</Link>
+                </>
+              ) : !marketsLoaded ? (
+                'Connecting to the exchange…'
+              ) : (
+                <>
+                  <p>Market not found.</p>
+                  <Link to="/markets">Browse the markets</Link>
+                </>
+              )}
             </div>
           )}
         </>
       )}
 
-      <Footer />
       {toast && <Toast toast={toast} onClose={() => setToast(null)} />}
     </div>
   )
 }
 
-function Header({ connection, resyncing, userId, account, onUserChange }) {
+function MarketToolbar({ connection, resyncing, account, marketName }) {
   const label = resyncing
     ? 'Resyncing'
     : connection === 'live'
@@ -357,52 +376,41 @@ function Header({ connection, resyncing, userId, account, onUserChange }) {
         : 'connecting'
 
   return (
-    <header className="topbar">
-      <div className="brand">
-        <div className="brand-mark">DX</div>
-        <div>
-          <span className="eyebrow">Darkhold Exchange</span>
-          <h1>Pass market terminal</h1>
-          <p>Live matching · integer ticks · MessagePack feed</p>
-        </div>
-      </div>
-      <div className="topbar-controls">
+    <div className="market-toolbar">
+      <nav className="market-breadcrumb" aria-label="Breadcrumb">
+        <Link to="/markets">Markets</Link>
+        <span aria-hidden="true">/</span>
+        <span>{marketName ?? 'Terminal'}</span>
+      </nav>
+      <div className="market-toolbar-controls">
         <div className={`connection ${tone}`}>
           <span className="dot" />
           {label}
         </div>
         {account ? (
-          <span className="identity">Signed in as {account.username}</span>
-        ) : (
-          <label className="identity">
-            Identity
-            <select value={userId} onChange={onUserChange}>
-              {TRADER_IDS.map((id) => (
-                <option key={id} value={id}>
-                  Trader #{id}
-                </option>
-              ))}
-            </select>
-          </label>
-        )}
+          <span className="identity">
+            Signed in as {account.username}
+            <span className="identity-role">{account.role}</span>
+          </span>
+        ) : null}
       </div>
-    </header>
+    </div>
   )
 }
 
-function MarketTabs({ markets, snapshots, selectedMarketId, onSelect }) {
+function MarketTabs({ markets, snapshots, selectedMarketId }) {
   return (
     <nav className="market-tabs" aria-label="Markets">
       {markets.map((market) => {
         const snapshot = snapshots[market.id]
         return (
-          <button
+          <Link
             key={market.id}
-            type="button"
+            to={`/markets/${market.id}`}
             className={`market-tab ${
               selectedMarketId === market.id ? 'active' : ''
             }`}
-            onClick={() => onSelect(market.id)}
+            aria-current={selectedMarketId === market.id ? 'page' : undefined}
           >
             <span className="market-tab-top">
               <span>{market.name}</span>
@@ -421,7 +429,7 @@ function MarketTabs({ markets, snapshots, selectedMarketId, onSelect }) {
                 ? formatPrice(market, snapshot.last_trade_price)
                 : 'No prints yet'}
             </span>
-          </button>
+          </Link>
         )
       })}
     </nav>
@@ -470,6 +478,7 @@ function MarketHeader({ market, snapshot }) {
         <Stat
           label="Collar"
           value={`${formatPrice(market, floor)} – ${formatPrice(market, cap)}`}
+          className="collar"
         />
         <Stat label="Taker fee" value={formatPercent(market.taker_fee_bps)} />
       </div>
@@ -956,15 +965,6 @@ function SpeedView({ samples, lastSample, onClear }) {
         onClear={onClear}
       />
     </div>
-  )
-}
-
-function Footer() {
-  return (
-    <footer className="footer">
-      <span>Darkhold Exchange · Webster 2026</span>
-      <span>Single-writer core · i64 minor units · no floats</span>
-    </footer>
   )
 }
 

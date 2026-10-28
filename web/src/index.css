@@ -13,8 +13,9 @@
   --green: #43d98b;
   --red: #ff6b81;
   --amber: #f6c66b;
-  --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --sans: Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --display: 'Space Grotesk', 'Inter', system-ui, -apple-system, sans-serif;
 
   color-scheme: dark;
   font-family: var(--sans);
@@ -40,11 +41,22 @@ body,
 
 body {
   margin: 0;
+  overflow-x: clip;
   background:
     radial-gradient(1100px 620px at 12% -12%, rgba(139, 92, 246, 0.16), transparent 62%),
     radial-gradient(900px 520px at 100% -8%, rgba(67, 217, 139, 0.07), transparent 58%),
     var(--bg);
   color: var(--text);
+}
+
+.eyebrow {
+  display: block;
+  color: var(--purple);
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.17em;
+  text-transform: uppercase;
 }
 
 button,
@@ -66,6 +78,11 @@ h2,
 h3,
 p {
   margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--display);
 }
 
 ::selection {

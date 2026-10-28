@@ -5,7 +5,7 @@ import { setAuthToken, setUnauthorizedHandler } from '../authToken'
 const TOKEN_KEY = 'dx-auth-token'
 
 // Where each role lands after logging in.
-export const roleHome = (role) => ({ admin: '/admin', issuer: '/issuer' })[role] ?? '/market'
+export const roleHome = (role) => ({ admin: '/admin', issuer: '/issuer' })[role] ?? '/markets'
 
 // localStorage can be blocked, so every read and write is wrapped. Without it the app still works,
 // you just have to log in again after a refresh.

@@ -3,7 +3,8 @@
 //! REST is command-in / response-out. The WebSocket streams ordered deltas and
 //! trades; snapshots are only baselines and lag-recovery checkpoints. Identity
 //! comes from the login token (`Authorization: Bearer`, docs/AUTH.md). While `DX_DEV_AUTH` is on
-//! (the default locally), requests without a token may still use `x-dev-user` (default user 1).
+//! (the default locally), a request without a token may identify itself with an explicit
+//! `x-dev-user` header; there is no default dev user.
 
 mod rate;
 mod wal;
@@ -776,7 +777,7 @@ enum Caller {
 }
 
 /// A token, if there is one, always wins and must be valid: a bad token is refused, never
-/// quietly replaced by the dev header. Without a token the dev header works only while
+/// quietly replaced by the dev header. Without a token, an explicit dev header works only while
 /// `DX_DEV_AUTH` is on.
 fn identify(auth: &dx_auth::AuthState, headers: &HeaderMap) -> Result<Caller, ApiError> {
     if let Some(value) = headers.get(header::AUTHORIZATION) {
@@ -844,17 +845,20 @@ fn require_dev_auth(auth: &dx_auth::AuthState) -> Result<(), ApiError> {
     }
 }
 
+/// The old header is honoured only in dev, and only when it is sent explicitly. There is no
+/// default identity: a tokenless request without `x-dev-user` is refused instead of becoming
+/// user 1.
 fn legacy_dev_user(headers: &HeaderMap) -> Result<UserId, ApiError> {
-    if let Some(val) = headers
+    match headers
         .get("x-user-id")
         .or_else(|| headers.get("x-dev-user"))
     {
-        val.to_str()
+        Some(val) => val
+            .to_str()
             .ok()
             .and_then(|value| value.parse::<UserId>().ok())
-            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt))
-    } else {
-        Ok(1)
+            .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidReceipt)),
+        None => Err(unauthorized()),
     }
 }
 
@@ -2473,7 +2477,12 @@ mod tests {
             identify(&on, &headers(&[("x-dev-user", "5")])).unwrap(),
             Caller::Dev(5)
         );
-        assert_eq!(identify(&on, &HeaderMap::new()).unwrap(), Caller::Dev(1));
+        // No header and no token is not an identity, even in dev.
+        refused(
+            identify(&on, &HeaderMap::new()),
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+        );
 
         let off = auth_state(false);
         refused(
@@ -2510,8 +2519,9 @@ mod tests {
 
         // No token and no dev auth: refused.
         assert!(authorize_user(&auth, &HeaderMap::new(), 7).is_err());
-        // Dev mode keeps working as before.
-        assert!(authorize_user(&auth_state(true), &HeaderMap::new(), 7).is_ok());
+        // Dev mode still needs an explicit dev header; it never defaults to user 1.
+        assert!(authorize_user(&auth_state(true), &HeaderMap::new(), 7).is_err());
+        assert!(authorize_user(&auth_state(true), &headers(&[("x-dev-user", "7")]), 7).is_ok());
     }
 
     #[test]

@@ -23,13 +23,12 @@ describe('order commands', () => {
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    const response = await cancelOrderRequest(42, 99, 3)
+    const response = await cancelOrderRequest(42, 99)
 
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/orders/42?client_order_id=99',
       {
         method: 'DELETE',
-        headers: { 'x-dev-user': '3' },
       },
     )
     expect(response.status).toBe('Cancelled')
@@ -43,7 +42,7 @@ describe('order commands', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const command = { type: 'Cancel', order_id: 42, client_order_id: 99 }
-    const response = await postCommand(command, 3)
+    const response = await postCommand(command)
 
     expect(fetchMock).toHaveBeenCalledTimes(2)
     expect(fetchMock.mock.calls[1][0]).toBe('/api/commands')
@@ -56,7 +55,7 @@ describe('order commands', () => {
       .mockResolvedValueOnce(jsonResponse({ reason: 'insufficient_cash' }, 422))
     vi.stubGlobal('fetch', fetchMock)
 
-    await expect(postCommand({ type: 'Place' }, 3)).rejects.toThrow(
+    await expect(postCommand({ type: 'Place' })).rejects.toThrow(
       'insufficient cash',
     )
     expect(fetchMock).toHaveBeenCalledTimes(1)
