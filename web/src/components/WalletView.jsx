@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { formatMoney, formatQty } from '../format'
 
-const PRESET_AMOUNTS = [500, 1000, 2500, 5000, 10000]
+const PRESET_AMOUNTS = [500, 1000, 2500, 5000, 10000, 25000]
 
 export function WalletView({ wallet, onTopup, onRefresh }) {
   const [customRupees, setCustomRupees] = useState('')
@@ -65,54 +65,56 @@ export function WalletView({ wallet, onTopup, onRefresh }) {
             <span className="panel-meta">Instant · Max ₹1,00,000</span>
           </div>
 
-          <div className="preset-buttons">
-            {PRESET_AMOUNTS.map((amt) => (
-              <button
-                key={amt}
-                type="button"
-                className="preset-button"
-                disabled={loading}
-                onClick={() => handleTopup(amt)}
-              >
-                + ₹{amt.toLocaleString('en-IN')}
-              </button>
-            ))}
-          </div>
+          <div className="topup-body">
+            <div className="preset-buttons">
+              {PRESET_AMOUNTS.map((amt) => (
+                <button
+                  key={amt}
+                  type="button"
+                  className="preset-button"
+                  disabled={loading}
+                  onClick={() => handleTopup(amt)}
+                >
+                  + ₹{amt.toLocaleString('en-IN')}
+                </button>
+              ))}
+            </div>
 
-          <form
-            className="custom-topup-form"
-            onSubmit={(e) => {
-              e.preventDefault()
-              if (customRupees && Number(customRupees) > 0) {
-                handleTopup(Number(customRupees))
-              }
-            }}
-          >
-            <label className="field">
-              <span>Custom amount <em>Rupees (₹)</em></span>
-              <input
-                type="number"
-                min="10"
-                max="100000"
-                step="10"
-                placeholder="e.g. 1500"
-                value={customRupees}
-                onChange={(e) => setCustomRupees(e.target.value)}
-                disabled={loading}
-              />
-            </label>
-
-            <button
-              type="submit"
-              className="submit-button buy"
-              disabled={loading || !customRupees || Number(customRupees) <= 0}
+            <form
+              className="custom-topup-form"
+              onSubmit={(e) => {
+                e.preventDefault()
+                if (customRupees && Number(customRupees) > 0) {
+                  handleTopup(Number(customRupees))
+                }
+              }}
             >
-              {loading ? 'Processing…' : `Top Up ${customRupees ? `₹${Number(customRupees).toLocaleString('en-IN')}` : ''}`}
-            </button>
-          </form>
+              <label className="field">
+                <span>Custom amount <em>Rupees (₹)</em></span>
+                <input
+                  type="number"
+                  min="10"
+                  max="100000"
+                  step="10"
+                  placeholder="e.g. 1500"
+                  value={customRupees}
+                  onChange={(e) => setCustomRupees(e.target.value)}
+                  disabled={loading}
+                />
+              </label>
 
-          {topupSuccess && <div className="banner success">{topupSuccess}</div>}
-          {topupError && <div className="banner error">{topupError}</div>}
+              <button
+                type="submit"
+                className="submit-button buy"
+                disabled={loading || !customRupees || Number(customRupees) <= 0}
+              >
+                {loading ? 'Processing…' : `Top Up ${customRupees ? `₹${Number(customRupees).toLocaleString('en-IN')}` : ''}`}
+              </button>
+            </form>
+
+            {topupSuccess && <div className="banner success">{topupSuccess}</div>}
+            {topupError && <div className="banner error">{topupError}</div>}
+          </div>
         </section>
 
         {/* Passes Portfolio */}

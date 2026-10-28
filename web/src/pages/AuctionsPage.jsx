@@ -6,6 +6,11 @@ import {
   expireAuction,
   getAuctions,
   getMarkets,
+  getBatchAuctions,
+  createBatchAuction,
+  commitBatchBid,
+  revealBatchBid,
+  settleBatchAuction,
 } from '../api'
 import { formatPrice, formatQty } from '../format'
 import {
@@ -13,6 +18,7 @@ import {
   auctionPriceTicks,
   formatCountdown,
 } from '../lib/dutchAuction'
+import { computeCommitment, generateSalt } from '../lib/batchAuction'
 import { nextClientOrderId } from '../protocol'
 import { useAuthStore } from '../stores/useAuthStore'
 import '../shell.css'
@@ -40,7 +46,10 @@ const collarFor = (market) => {
 export function AuctionsPage() {
   const user = useAuthStore((state) => state.user)
   const userId = user?.user_id ?? null
+
+  const [tab, setTab] = useState('dutch') // 'dutch' | 'batch'
   const [auctions, setAuctions] = useState([])
+  const [batchAuctions, setBatchAuctions] = useState([])
   const [markets, setMarkets] = useState([])
   const [offset, setOffset] = useState(0)
   const [clock, setClock] = useState(() => Date.now())
@@ -50,6 +59,7 @@ export function AuctionsPage() {
   const [busy, setBusy] = useState(false)
   const [qtyById, setQtyById] = useState({})
 
+  // Form for Dutch
   const [form, setForm] = useState({
     marketId: '',
     qty: '2',
@@ -57,6 +67,37 @@ export function AuctionsPage() {
     floorTicks: '',
     durationSeconds: '60',
   })
+
+  // Form for Batch
+  const [batchForm, setBatchForm] = useState({
+    marketId: '',
+    qty: '10',
+    floorTicks: '',
+    commitSeconds: '30',
+    revealSeconds: '30',
+  })
+
+  // Bid state for Batch: { [auctionId]: { priceTicks, qty, commitmentHex, saltHex } }
+  const [batchBidsState, setBatchBidsState] = useState(() => {
+    try {
+      const stored = localStorage.getItem('dx_batch_bids')
+      return stored ? JSON.parse(stored) : {}
+    } catch {
+      return {}
+    }
+  })
+
+  const saveBatchBidState = (auctionId, data) => {
+    setBatchBidsState((prev) => {
+      const next = { ...prev, [auctionId]: { ...prev[auctionId], ...data } }
+      try {
+        localStorage.setItem('dx_batch_bids', JSON.stringify(next))
+      } catch (err) {
+        console.warn('Failed to cache batch bid', err)
+      }
+      return next
+    })
+  }
 
   const load = useCallback(async () => {
     try {
@@ -77,9 +118,28 @@ export function AuctionsPage() {
           floorTicks: String(collar.floor),
         }
       })
+      setBatchForm((current) => {
+        if (current.marketId || marketList.length === 0) return current
+        const market = marketList[0].config
+        const collar = collarFor(market)
+        return {
+          ...current,
+          marketId: String(market.id),
+          floorTicks: String(collar.floor),
+        }
+      })
       setOffset(auctionPage.now_ms - Date.now())
       setStatus('ready')
       setError(null)
+
+      // Batch auctions: best-effort — don't crash the page if endpoint is missing
+      try {
+        const batchPage = await getBatchAuctions()
+        setBatchAuctions(batchPage.items)
+      } catch (batchErr) {
+        console.warn('Batch auctions endpoint unavailable:', batchErr)
+        setBatchAuctions([])
+      }
     } catch (nextError) {
       setError(nextError.message)
       setStatus('error')
@@ -98,14 +158,15 @@ export function AuctionsPage() {
   }, [load])
 
   const nowMs = clock + offset
-
   const marketsById = useMemo(
-    () => new Map(markets.map((market) => [market.config.id, market.config])),
+    () => new Map(markets.map((m) => [m.config.id, m.config])),
     [markets],
   )
-
   const selectedMarket = form.marketId
     ? marketsById.get(Number(form.marketId))
+    : markets[0]?.config
+  const selectedBatchMarket = batchForm.marketId
+    ? marketsById.get(Number(batchForm.marketId))
     : markets[0]?.config
 
   const pickMarket = (marketId) => {
@@ -115,6 +176,16 @@ export function AuctionsPage() {
       ...current,
       marketId: String(marketId),
       startTicks: String(collar.cap),
+      floorTicks: String(collar.floor),
+    }))
+  }
+
+  const pickBatchMarket = (marketId) => {
+    const market = marketsById.get(Number(marketId))
+    const collar = market ? collarFor(market) : { floor: 0, cap: 0 }
+    setBatchForm((current) => ({
+      ...current,
+      marketId: String(marketId),
       floorTicks: String(collar.floor),
     }))
   }
@@ -138,7 +209,126 @@ export function AuctionsPage() {
         floor_price_ticks: Number(form.floorTicks),
         duration_ms: durationMs,
       })
-      setNotice(`Auction #${created.id} is live on ${created.market_name}.`)
+      setNotice(`Dutch auction #${created.id} is live on ${created.market_name}.`)
+      await load()
+    } catch (nextError) {
+      setError(nextError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleCreateBatch = async (event) => {
+    event.preventDefault()
+    if (userId == null) {
+      setError('Log in to start a batch auction.')
+      return
+    }
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const commitDurationMs = Number(batchForm.commitSeconds) * 1000
+      const revealDurationMs = Number(batchForm.revealSeconds) * 1000
+      const created = await createBatchAuction({
+        client_order_id: nextClientOrderId(),
+        market_id: Number(batchForm.marketId || selectedBatchMarket?.id),
+        qty: Number(batchForm.qty),
+        floor_price_ticks: Number(batchForm.floorTicks),
+        commit_duration_ms: commitDurationMs,
+        reveal_duration_ms: revealDurationMs,
+      })
+      setNotice(`Batch auction #${created.id} is created in Commit phase.`)
+      await load()
+    } catch (nextError) {
+      setError(nextError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleCommitBid = async (auction) => {
+    if (userId == null) {
+      setError('Log in to commit a bid.')
+      return
+    }
+    const currentBid = batchBidsState[auction.id]
+    const priceTicks = Number(currentBid?.priceTicks || auction.floor_price_ticks)
+    const qty = Number(currentBid?.qty || 1)
+
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const salt = generateSalt()
+      const { commitmentHex, saltHex } = await computeCommitment(priceTicks, qty, salt)
+      const clientOrderId = nextClientOrderId()
+
+      await commitBatchBid(auction.id, {
+        client_order_id: clientOrderId,
+        commitment: commitmentHex,
+      })
+
+      saveBatchBidState(auction.id, {
+        clientOrderId,
+        priceTicks,
+        qty,
+        commitmentHex,
+        saltHex,
+        committed: true,
+      })
+      setNotice(`Sealed bid committed for Batch Auction #${auction.id}! Keep secret until reveal phase.`)
+      await load()
+    } catch (nextError) {
+      setError(nextError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleRevealBid = async (auction) => {
+    if (userId == null) {
+      setError('Log in to reveal a bid.')
+      return
+    }
+    const currentBid = batchBidsState[auction.id]
+    if (!currentBid?.committed || !currentBid?.saltHex) {
+      setError('No committed bid found for this auction.')
+      return
+    }
+
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      await revealBatchBid(auction.id, {
+        client_order_id: currentBid.clientOrderId,
+        price_ticks: currentBid.priceTicks,
+        qty: currentBid.qty,
+        salt: currentBid.saltHex,
+      })
+
+      saveBatchBidState(auction.id, { revealed: true })
+      setNotice(`Bid revealed for Batch Auction #${auction.id}! Cash collateral reserved.`)
+      await load()
+    } catch (nextError) {
+      setError(nextError.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const handleSettleBatch = async (auction) => {
+    setBusy(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const res = await settleBatchAuction(auction.id, {
+        client_order_id: nextClientOrderId(),
+      })
+      setNotice(
+        `Auction #${auction.id} settled! Fills: ${res.fills.length}. Uniform price applied.`,
+      )
       await load()
     } catch (nextError) {
       setError(nextError.message)
@@ -179,7 +369,7 @@ export function AuctionsPage() {
 
   const handleExpire = async (auction) => {
     if (userId == null) {
-      setError('Log in to close an auction.')
+      setError('Log in to expire an auction.')
       return
     }
     setBusy(true)
@@ -200,226 +390,412 @@ export function AuctionsPage() {
     <div className="auction-page">
       <div className="auction-heading">
         <div>
-          <span className="eyebrow">Liquidation</span>
-          <h2>Dutch auctions</h2>
+          <span className="eyebrow">Fair Liquidation</span>
+          <h2>Auctions</h2>
         </div>
         <p className="auction-intro">
-          A seller reserves passes and publishes a linear price decay. Anyone can
-          take the current slice; the first accept that fits wins. Unsold passes
-          return to the seller after the deadline.
+          Continuous Dutch auctions decay linearly in real-time. Frequent Batch Auctions use sealed
+          cryptographic commit-reveal to eliminate front-running and clear at one uniform price.
         </p>
+      </div>
+
+      <div className="auction-tabs-bar">
+        <div className="auction-tabs" role="tablist" aria-label="Auction Types">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'dutch'}
+            className={`auction-tab-btn ${tab === 'dutch' ? 'active' : ''}`}
+            onClick={() => setTab('dutch')}
+          >
+            <span>Dutch Auctions</span>
+            <span className="auction-tab-count">{auctions.length}</span>
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={tab === 'batch'}
+            className={`auction-tab-btn ${tab === 'batch' ? 'active' : ''}`}
+            onClick={() => setTab('batch')}
+          >
+            <span>Batch Auctions</span>
+            <span className="auction-tab-count">{batchAuctions.length}</span>
+          </button>
+        </div>
       </div>
 
       {error && <p className="auction-error">{error}</p>}
       {notice && <p className="auction-notice">{notice}</p>}
       {!user && (
         <p className="auction-guest-note">
-          Browsing as a guest. <Link to="/login" state={{ from: '/auctions' }}>Log in</Link>{' '}
-          to start or accept an auction.
+          Browsing as a guest.{' '}
+          <Link to="/login" state={{ from: '/auctions' }}>
+            Log in
+          </Link>{' '}
+          to participate or publish an auction.
         </p>
       )}
 
-      <section className="auction-panel">
-        <h3>Open auctions</h3>
-        {status === 'loading' && <p className="auction-empty">Loading…</p>}
-        {status === 'ready' && auctions.length === 0 && (
-          <p className="auction-empty">No auctions yet. Create one below.</p>
-        )}
-        <div className="auction-grid">
-          {auctions.map((auction) => {
-            const market = marketsById.get(auction.market_id)
-            const phase = auctionPhase(auction, nowMs)
-            const price = auctionPriceTicks(auction, nowMs)
-            const isSeller = auction.seller_id === userId
-            const remainingMs = auction.end_ms - nowMs
-            return (
-              <article key={auction.id} className="auction-card">
-                <header>
-                  <span className="auction-id">#{auction.id}</span>
-                  <h4>{auction.market_name}</h4>
-                  <span className={`auction-phase phase-${phase}`}>
-                    {phaseLabel[phase]}
-                  </span>
-                </header>
-                <dl>
-                  <div>
-                    <dt>Current price</dt>
-                    <dd>{formatPrice(market, price)}</dd>
-                  </div>
-                  <div>
-                    <dt>Floor</dt>
-                    <dd>{formatPrice(market, auction.floor_price_ticks)}</dd>
-                  </div>
-                  <div>
-                    <dt>Remaining</dt>
-                    <dd>
-                      {formatQty(auction.qty_remaining)} /{' '}
-                      {formatQty(auction.qty_total)}
-                    </dd>
-                  </div>
-                  <div>
-                    <dt>Seller</dt>
-                    <dd>User {auction.seller_id}</dd>
-                  </div>
-                  <div>
-                    <dt>{phase === 'active' ? 'Ends in' : 'Window'}</dt>
-                    <dd>
-                      {phase === 'active'
-                        ? formatCountdown(remainingMs)
-                        : formatCountdown(
-                            auction.end_ms - auction.start_ms,
-                          )}
-                    </dd>
-                  </div>
-                </dl>
-                {phase === 'active' && (
-                  user ? (
-                    <div className="auction-actions">
-                      <label>
-                        Qty
+      {/* ── DUTCH AUCTION VIEW ────────────────────────────────────────────── */}
+      {tab === 'dutch' && (
+        <>
+          <section className="auction-panel">
+            <h3>Open Dutch Auctions</h3>
+            {status === 'loading' && <p className="auction-empty">Loading…</p>}
+            {status === 'ready' && auctions.length === 0 && (
+              <p className="auction-empty">No Dutch auctions yet. Create one below.</p>
+            )}
+            <div className="auction-grid">
+              {auctions.map((auction) => {
+                const market = marketsById.get(auction.market_id)
+                const phase = auctionPhase(auction, nowMs)
+                const price = auctionPriceTicks(auction, nowMs)
+                const isSeller = auction.seller_id === userId
+                const remainingMs = auction.end_ms - nowMs
+                return (
+                  <article key={auction.id} className="auction-card">
+                    <header>
+                      <span className="auction-id">#{auction.id}</span>
+                      <h4>{auction.market_name}</h4>
+                      <span className={`auction-phase phase-${phase}`}>
+                        {phaseLabel[phase]}
+                      </span>
+                    </header>
+                    <dl>
+                      <div>
+                        <dt>Current price</dt>
+                        <dd>{formatPrice(market, price)}</dd>
+                      </div>
+                      <div>
+                        <dt>Floor</dt>
+                        <dd>{formatPrice(market, auction.floor_price_ticks)}</dd>
+                      </div>
+                      <div>
+                        <dt>Remaining</dt>
+                        <dd>{formatQty(auction.qty_remaining)}</dd>
+                      </div>
+                      <div>
+                        <dt>Time</dt>
+                        <dd>{formatCountdown(remainingMs)}</dd>
+                      </div>
+                    </dl>
+                    {phase === 'active' && !isSeller && (
+                      <div className="auction-actions">
                         <input
                           type="number"
                           min="1"
                           max={auction.qty_remaining}
                           value={qtyById[auction.id] ?? 1}
-                          onChange={(event) =>
-                            setQtyById((current) => ({
-                              ...current,
-                              [auction.id]: event.target.value,
+                          onChange={(e) =>
+                            setQtyById((prev) => ({
+                              ...prev,
+                              [auction.id]: e.target.value,
                             }))
                           }
                         />
-                      </label>
+                        <button
+                          type="button"
+                          disabled={busy || !userId}
+                          onClick={() => handleAccept(auction)}
+                        >
+                          Buy at current price
+                        </button>
+                      </div>
+                    )}
+                    {phase === 'ended' && isSeller && (
                       <button
                         type="button"
-                        disabled={busy || auction.seller_id === userId}
-                        onClick={() => handleAccept(auction)}
+                        disabled={busy}
+                        onClick={() => handleExpire(auction)}
                       >
-                        Accept at {formatPrice(market, price)}
+                        Reclaim unsold passes
                       </button>
-                    </div>
-                  ) : (
-                    <div className="auction-actions">
-                      <Link
-                        className="auction-login"
-                        to="/login"
-                        state={{ from: '/auctions' }}
-                      >
-                        Log in to accept
-                      </Link>
-                    </div>
-                  )
-                )}
-                {phase === 'ended' && isSeller && (
-                  <div className="auction-actions">
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => handleExpire(auction)}
-                    >
-                      Close and return unsold
-                    </button>
-                  </div>
-                )}
-                {auction.seller_id === userId && phase !== 'sold' && (
-                  <p className="auction-hint">You are the seller.</p>
-                )}
-              </article>
-            )
-          })}
-        </div>
-      </section>
+                    )}
+                  </article>
+                )
+              })}
+            </div>
+          </section>
 
-      <section className="auction-panel">
-        <h3>Start an auction</h3>
-        {user ? (
-          <form className="auction-form" onSubmit={handleCreate}>
-          <label>
-            Market
-            <select
-              value={form.marketId || selectedMarket?.id || ''}
-              onChange={(event) => pickMarket(event.target.value)}
-            >
-              {markets.map((market) => (
-                <option key={market.config.id} value={market.config.id}>
-                  {market.config.name}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Quantity
-            <input
-              type="number"
-              min="1"
-              value={form.qty}
-              onChange={(event) =>
-                setForm((current) => ({ ...current, qty: event.target.value }))
-              }
-            />
-          </label>
-          <label>
-            Start price (ticks)
-            <input
-              type="number"
-              min="1"
-              value={form.startTicks}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  startTicks: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <label>
-            Floor price (ticks)
-            <input
-              type="number"
-              min="1"
-              value={form.floorTicks}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  floorTicks: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <label>
-            Window (seconds)
-            <input
-              type="number"
-              min="1"
-              value={form.durationSeconds}
-              onChange={(event) =>
-                setForm((current) => ({
-                  ...current,
-                  durationSeconds: event.target.value,
-                }))
-              }
-            />
-          </label>
-          <button type="submit" disabled={busy || !selectedMarket}>
-            {busy ? 'Working…' : 'Reserve passes and publish'}
-          </button>
-        </form>
-        ) : (
-          <div className="auction-guest">
-            <p>Log in to reserve passes and publish an auction.</p>
-            <Link to="/login" state={{ from: '/auctions' }}>
-              Log in
-            </Link>
-          </div>
-        )}
-        {selectedMarket && (
-          <p className="auction-hint">
-            {selectedMarket.name}: collar {formatPrice(selectedMarket, collarFor(selectedMarket).floor)}{' '}
-            – {formatPrice(selectedMarket, collarFor(selectedMarket).cap)}. The
-            seller must already hold the passes.
-          </p>
-        )}
-      </section>
+          <section className="auction-panel">
+            <h3>Create a Dutch Auction</h3>
+            {user ? (
+              <form className="auction-form" onSubmit={handleCreate}>
+                <label>
+                  Market
+                  <select
+                    value={form.marketId || selectedMarket?.id || ''}
+                    onChange={(e) => pickMarket(e.target.value)}
+                  >
+                    {markets.map((m) => (
+                      <option key={m.config.id} value={m.config.id}>
+                        {m.config.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Quantity
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.qty}
+                    onChange={(e) => setForm((c) => ({ ...c, qty: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Start price (ticks)
+                  <input
+                    type="number"
+                    value={form.startTicks}
+                    onChange={(e) => setForm((c) => ({ ...c, startTicks: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Floor price (ticks)
+                  <input
+                    type="number"
+                    value={form.floorTicks}
+                    onChange={(e) => setForm((c) => ({ ...c, floorTicks: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Window (seconds)
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.durationSeconds}
+                    onChange={(e) => setForm((c) => ({ ...c, durationSeconds: e.target.value }))}
+                  />
+                </label>
+                <button type="submit" disabled={busy || !selectedMarket}>
+                  {busy ? 'Working…' : 'Reserve passes and publish'}
+                </button>
+              </form>
+            ) : (
+              <div className="auction-guest">
+                <p>Log in to reserve passes and publish an auction.</p>
+                <Link to="/login" state={{ from: '/auctions' }}>
+                  Log in
+                </Link>
+              </div>
+            )}
+          </section>
+        </>
+      )}
+
+      {/* ── BATCH AUCTION VIEW (COMMIT-REVEAL) ─────────────────────────────── */}
+      {tab === 'batch' && (
+        <>
+          <section className="auction-panel">
+            <h3>Batch Auctions (Commit-Reveal Uniform Clearing)</h3>
+            {status === 'loading' && <p className="auction-empty">Loading…</p>}
+            {status === 'ready' && batchAuctions.length === 0 && (
+              <p className="auction-empty">No batch auctions active. Create one below.</p>
+            )}
+            <div className="auction-grid">
+              {batchAuctions.map((auction) => {
+                const market = marketsById.get(auction.market_id)
+                const isSeller = auction.seller_id === userId
+                const savedBid = batchBidsState[auction.id] || {}
+
+                // Phase time calculation
+                const commitRemainingMs = Math.max(0, auction.commit_end_ms - nowMs)
+                const revealRemainingMs = Math.max(0, auction.reveal_end_ms - nowMs)
+
+                return (
+                  <article key={auction.id} className="auction-card">
+                    <header>
+                      <span className="auction-id">Batch #{auction.id}</span>
+                      <h4>{auction.market_name}</h4>
+                      <span className={`auction-phase phase-${auction.phase}`}>
+                        {auction.phase.toUpperCase()}
+                      </span>
+                    </header>
+                    <dl>
+                      <div>
+                        <dt>Total supply</dt>
+                        <dd>{formatQty(auction.qty_total)} passes</dd>
+                      </div>
+                      <div>
+                        <dt>Floor price</dt>
+                        <dd>{formatPrice(market, auction.floor_price_ticks)}</dd>
+                      </div>
+                      <div>
+                        <dt>Commit window</dt>
+                        <dd>{commitRemainingMs > 0 ? formatCountdown(commitRemainingMs) : 'Closed'}</dd>
+                      </div>
+                      <div>
+                        <dt>Reveal window</dt>
+                        <dd>{revealRemainingMs > 0 ? formatCountdown(revealRemainingMs) : 'Closed'}</dd>
+                      </div>
+                      {auction.clearing_price_ticks && (
+                        <div>
+                          <dt>Uniform Price</dt>
+                          <dd className="auction-card-clearing">
+                            {formatPrice(market, auction.clearing_price_ticks)}
+                          </dd>
+                        </div>
+                      )}
+                    </dl>
+
+                    {/* Commit Phase Action */}
+                    {auction.phase === 'commit' && !isSeller && (
+                      <div className="batch-bid-actions">
+                        <div className="batch-bid-inputs">
+                          <label>
+                            Price (ticks)
+                            <input
+                              type="number"
+                              min="1"
+                              placeholder="Ticks"
+                              value={savedBid.priceTicks ?? auction.floor_price_ticks}
+                              onChange={(e) =>
+                                saveBatchBidState(auction.id, { priceTicks: Number(e.target.value) })
+                              }
+                            />
+                          </label>
+                          <label>
+                            Quantity
+                            <input
+                              type="number"
+                              placeholder="Qty"
+                              min="1"
+                              value={savedBid.qty ?? 1}
+                              onChange={(e) =>
+                                saveBatchBidState(auction.id, { qty: Number(e.target.value) })
+                              }
+                            />
+                          </label>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={busy || !userId || savedBid.committed}
+                          onClick={() => handleCommitBid(auction)}
+                        >
+                          {savedBid.committed ? 'Sealed Bid Committed' : 'Commit Sealed Bid (SHA-256)'}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Reveal Phase Action */}
+                    {auction.phase === 'reveal' && !isSeller && (
+                      <div className="auction-actions">
+                        <button
+                          type="button"
+                          disabled={busy || !userId || savedBid.revealed || !savedBid.committed}
+                          onClick={() => handleRevealBid(auction)}
+                        >
+                          {savedBid.revealed
+                            ? 'Bid Revealed'
+                            : savedBid.committed
+                              ? 'Reveal Pre-Image'
+                              : 'No Commit Made'}
+                        </button>
+                      </div>
+                    )}
+
+                    {/* Settle Action (Available when reveal closes) */}
+                    {(auction.phase === 'reveal' || auction.phase === 'commit') && revealRemainingMs === 0 && (
+                      <div className="auction-actions">
+                        <button
+                          type="button"
+                          disabled={busy}
+                          onClick={() => handleSettleBatch(auction)}
+                        >
+                          Clear Auction (Uniform Price)
+                        </button>
+                      </div>
+                    )}
+
+                    {auction.phase === 'settled' && (
+                      <div className="auction-settled-badge">
+                        <span>✓</span> Settled • Remaining: {formatQty(auction.qty_remaining)}
+                      </div>
+                    )}
+
+                    {isSeller && (
+                      <p className="auction-hint">You are the seller.</p>
+                    )}
+                  </article>
+                )
+              })}
+            </div>
+          </section>
+
+          <section className="auction-panel">
+            <h3>Create a Batch Auction</h3>
+            {user ? (
+              <form className="auction-form" onSubmit={handleCreateBatch}>
+                <label>
+                  Market
+                  <select
+                    value={batchForm.marketId || selectedBatchMarket?.id || ''}
+                    onChange={(e) => pickBatchMarket(e.target.value)}
+                  >
+                    {markets.map((m) => (
+                      <option key={m.config.id} value={m.config.id}>
+                        {m.config.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Total supply (passes)
+                  <input
+                    type="number"
+                    min="1"
+                    value={batchForm.qty}
+                    onChange={(e) => setBatchForm((c) => ({ ...c, qty: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Floor price (ticks)
+                  <input
+                    type="number"
+                    value={batchForm.floorTicks}
+                    onChange={(e) => setBatchForm((c) => ({ ...c, floorTicks: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Commit duration (seconds)
+                  <input
+                    type="number"
+                    min="5"
+                    value={batchForm.commitSeconds}
+                    onChange={(e) => setBatchForm((c) => ({ ...c, commitSeconds: e.target.value }))}
+                  />
+                </label>
+                <label>
+                  Reveal duration (seconds)
+                  <input
+                    type="number"
+                    min="5"
+                    value={batchForm.revealSeconds}
+                    onChange={(e) => setBatchForm((c) => ({ ...c, revealSeconds: e.target.value }))}
+                  />
+                </label>
+                <button type="submit" disabled={busy || !selectedBatchMarket}>
+                  {busy ? 'Working…' : 'Publish Batch Auction'}
+                </button>
+              </form>
+            ) : (
+              <div className="auction-guest">
+                <p>Log in to reserve passes and publish a batch auction.</p>
+                <Link to="/login" state={{ from: '/auctions' }}>
+                  Log in
+                </Link>
+              </div>
+            )}
+            {selectedBatchMarket && (
+              <p className="auction-hint">
+                {selectedBatchMarket.name}: collar {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).floor)}{' '}
+                – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. The seller must hold the passes in balance.
+              </p>
+            )}
+          </section>
+        </>
+      )}
     </div>
   )
 }

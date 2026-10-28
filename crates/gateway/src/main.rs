@@ -25,11 +25,12 @@ use axum::{Json, Router};
 use dx_core::Core;
 use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
-    AcceptDutchAuction, AuctionStatus, Balance, BookSnapshot, Cancel, ClientOrderId, Command,
-    CommandResponse, CreateDutchAuction, DutchAuction, ErrorBody, EscrowRecord, EscrowState, Fill,
-    JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
-    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, Side, Ticks, TradeId, UserId,
-    WsClientMessage, WsServerMessage, seed_markets,
+    AcceptDutchAuction, AuctionStatus, Balance, BatchAuction, BatchAuctionFill, BatchAuctionPhase,
+    BidRecord, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, CommitBid,
+    CreateBatchAuction, CreateDutchAuction, DutchAuction, ErrorBody, EscrowRecord, EscrowState,
+    Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, SettleBatchAuction, Side,
+    Ticks, TradeId, UserId, WsClientMessage, WsServerMessage, seed_markets,
 };
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -126,9 +127,16 @@ async fn attach_database(auth: &dx_auth::AuthState, admin: &dx_admin::AdminState
     match std::env::var("DATABASE_URL") {
         Ok(url) => {
             if let Err(error) = dx_store::attach(&url, auth, admin).await {
-                panic!("database: {error}");
+                if auth.dev_auth_enabled() {
+                    eprintln!(
+                        "database: could not connect to PostgreSQL ({error}). Falling back to in-memory mode."
+                    );
+                } else {
+                    panic!("database: {error}");
+                }
+            } else {
+                println!("database: accounts, events and tiers are saved in PostgreSQL");
             }
-            println!("database: accounts, events and tiers are saved in PostgreSQL");
         }
         Err(_) if !auth.dev_auth_enabled() => {
             panic!("DATABASE_URL must be set when DX_DEV_AUTH=0 (see docs/AUTH.md)")
@@ -175,11 +183,12 @@ fn status_for_reason(reason: ReasonCode) -> StatusCode {
         | AuctionNotActive
         | AuctionClosed
         | StaleAuctionPrice
+        | AuctionPhaseMismatch
         | EscrowNotReady => StatusCode::CONFLICT,
         RateLimited | QueueFull => StatusCode::TOO_MANY_REQUESTS,
         InternalError => StatusCode::INTERNAL_SERVER_ERROR,
         InvalidQuantity | InvalidPrice | PriceNotTickAligned | InvalidRequest | InvalidReceipt
-        | ReceiptExpired => StatusCode::BAD_REQUEST,
+        | ReceiptExpired | InvalidCommitment => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -321,6 +330,28 @@ async fn main() {
         .route("/api/auctions", get(auctions_current).post(auction_create))
         .route("/api/auctions/{auction_id}/accept", post(auction_accept))
         .route("/api/auctions/{auction_id}/expire", post(auction_expire))
+        // Batch auction endpoints
+        .route(
+            "/api/batch-auctions",
+            get(batch_auctions_current).post(batch_auction_create),
+        )
+        .route("/api/batch-auctions/{auction_id}", get(batch_auction_get))
+        .route(
+            "/api/batch-auctions/{auction_id}/commit",
+            post(batch_auction_commit),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/reveal",
+            post(batch_auction_reveal),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/settle",
+            post(batch_auction_settle),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/bids",
+            get(batch_auction_bids),
+        )
         .route("/api/history", get(history_current))
         .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
@@ -1396,6 +1427,269 @@ async fn auction_expire(
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
     let markets = state.writer.markets().await.map_err(writer_error)?;
     Ok(Json(auction_view(&auction, &markets, at_ms)))
+}
+
+// ---------------------------------------------------------------------------
+// Batch Auction Handlers
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct BatchAuctionView {
+    id: u64,
+    market_id: MarketId,
+    market_name: String,
+    seller_id: UserId,
+    qty_total: Qty,
+    qty_remaining: Qty,
+    floor_price_ticks: Ticks,
+    floor_price_minor: Minor,
+    commit_end_ms: u64,
+    reveal_end_ms: u64,
+    clearing_price_ticks: Option<Ticks>,
+    clearing_price_minor: Option<Minor>,
+    phase: BatchAuctionPhase,
+}
+
+fn batch_auction_view(auction: &BatchAuction, markets: &[MarketView]) -> BatchAuctionView {
+    let market = markets
+        .iter()
+        .find(|market| market.config.id == auction.market_id);
+    let market_name = market
+        .map(|market| market.config.name.clone())
+        .unwrap_or_else(|| format!("Market #{}", auction.market_id));
+    let tick_size_minor = market
+        .map(|market| market.config.tick_size_minor)
+        .unwrap_or(1)
+        .max(1);
+
+    let floor_price_minor =
+        i64::try_from((auction.floor_price_ticks as u128) * (tick_size_minor as u128))
+            .unwrap_or(i64::MAX);
+
+    let clearing_price_minor = auction.clearing_price_ticks.map(|ticks| {
+        i64::try_from((ticks as u128) * (tick_size_minor as u128)).unwrap_or(i64::MAX)
+    });
+
+    BatchAuctionView {
+        id: auction.id,
+        market_id: auction.market_id,
+        market_name,
+        seller_id: auction.seller_id,
+        qty_total: auction.qty_total,
+        qty_remaining: auction.qty_remaining,
+        floor_price_ticks: auction.floor_price_ticks,
+        floor_price_minor,
+        commit_end_ms: auction.commit_end_ms,
+        reveal_end_ms: auction.reveal_end_ms,
+        clearing_price_ticks: auction.clearing_price_ticks,
+        clearing_price_minor,
+        phase: auction.phase.clone(),
+    }
+}
+
+#[derive(Serialize)]
+struct BatchAuctionsResponse {
+    items: Vec<BatchAuctionView>,
+    now_ms: u64,
+}
+
+async fn batch_auctions_current(
+    State(state): State<AppState>,
+    Query(query): Query<AuctionQuery>,
+) -> Result<Json<BatchAuctionsResponse>, ApiError> {
+    let auctions = state
+        .writer
+        .batch_auctions(query.market_id)
+        .await
+        .map_err(writer_error)?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    let at_ms = now_ms();
+    let items = auctions
+        .iter()
+        .map(|auction| batch_auction_view(auction, &markets))
+        .collect();
+    Ok(Json(BatchAuctionsResponse {
+        items,
+        now_ms: at_ms,
+    }))
+}
+
+async fn batch_auction_get(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<BatchAuctionView>, ApiError> {
+    let auction = state
+        .writer
+        .batch_auction(auction_id)
+        .await
+        .map_err(writer_error)?
+        .ok_or_else(|| api_error(StatusCode::NOT_FOUND, ReasonCode::OrderNotFound))?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(batch_auction_view(&auction, &markets)))
+}
+
+#[derive(Deserialize)]
+struct CreateBatchAuctionPayload {
+    client_order_id: ClientOrderId,
+    market_id: MarketId,
+    qty: Qty,
+    floor_price_ticks: Ticks,
+    commit_duration_ms: u64,
+    reveal_duration_ms: u64,
+}
+
+async fn batch_auction_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateBatchAuctionPayload>, JsonRejection>,
+) -> Result<Json<BatchAuctionView>, ApiError> {
+    let seller_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let request = CreateBatchAuction {
+        client_order_id: body.client_order_id,
+        market_id: body.market_id,
+        qty: body.qty,
+        floor_price_ticks: body.floor_price_ticks,
+        commit_duration_ms: body.commit_duration_ms,
+        reveal_duration_ms: body.reveal_duration_ms,
+    };
+    let at_ms = now_ms();
+    let auction = state
+        .writer
+        .create_batch_auction(seller_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    let markets = state.writer.markets().await.map_err(writer_error)?;
+    Ok(Json(batch_auction_view(&auction, &markets)))
+}
+
+#[derive(Deserialize)]
+struct CommitBatchPayload {
+    client_order_id: ClientOrderId,
+    commitment: String, // hex encoded 32 bytes
+}
+
+async fn batch_auction_commit(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<CommitBatchPayload>, JsonRejection>,
+) -> Result<Json<BidRecord>, ApiError> {
+    let bidder_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let bytes = hex::decode(body.commitment.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
+    if bytes.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
+    }
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(&bytes);
+
+    let request = CommitBid {
+        client_order_id: body.client_order_id,
+        auction_id,
+        commitment,
+    };
+    let at_ms = now_ms();
+    let record = state
+        .writer
+        .commit_batch_bid(bidder_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(record))
+}
+
+#[derive(Deserialize)]
+struct RevealBatchPayload {
+    client_order_id: ClientOrderId,
+    price_ticks: Ticks,
+    qty: Qty,
+    salt: String, // hex encoded 32 bytes
+}
+
+async fn batch_auction_reveal(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<RevealBatchPayload>, JsonRejection>,
+) -> Result<Json<BidRecord>, ApiError> {
+    let bidder_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let bytes = hex::decode(body.salt.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
+    if bytes.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
+    }
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&bytes);
+
+    let request = RevealBid {
+        client_order_id: body.client_order_id,
+        auction_id,
+        price_ticks: body.price_ticks,
+        qty: body.qty,
+        salt,
+    };
+    let at_ms = now_ms();
+    let record = state
+        .writer
+        .reveal_batch_bid(bidder_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(record))
+}
+
+#[derive(Deserialize)]
+struct SettleBatchPayload {
+    client_order_id: ClientOrderId,
+}
+
+#[derive(Serialize)]
+struct BatchSettleResponse {
+    fills: Vec<BatchAuctionFill>,
+}
+
+async fn batch_auction_settle(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<SettleBatchPayload>, JsonRejection>,
+) -> Result<Json<BatchSettleResponse>, ApiError> {
+    let caller_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let request = SettleBatchAuction {
+        client_order_id: body.client_order_id,
+        auction_id,
+    };
+    let at_ms = now_ms();
+    let fills = state
+        .writer
+        .settle_batch_auction(caller_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(BatchSettleResponse { fills }))
+}
+
+async fn batch_auction_bids(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<BidRecord>>, ApiError> {
+    let bids = state
+        .writer
+        .batch_bids(auction_id)
+        .await
+        .map_err(writer_error)?;
+    Ok(Json(bids))
 }
 
 #[derive(Deserialize)]

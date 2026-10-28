@@ -28,6 +28,8 @@ pub enum ReasonCode {
     AuctionNotActive,
     AuctionClosed,
     StaleAuctionPrice,
+    InvalidCommitment,
+    AuctionPhaseMismatch,
     EscrowNotReady,
     InvalidReceipt,
     ReceiptExpired,
