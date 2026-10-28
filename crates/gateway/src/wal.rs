@@ -305,7 +305,9 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
             now_ms,
         } => {
             core.create_batch_auction(*seller_id, request.clone(), *now_ms)
-                .map_err(|reason| format!("WAL batch auction create replay rejected: {reason:?}"))?;
+                .map_err(|reason| {
+                    format!("WAL batch auction create replay rejected: {reason:?}")
+                })?;
         }
         WalOp::CommitBatchBid {
             bidder_id,
@@ -313,7 +315,9 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
             now_ms,
         } => {
             core.commit_batch_bid(*bidder_id, request.clone(), *now_ms)
-                .map_err(|reason| format!("WAL batch auction commit replay rejected: {reason:?}"))?;
+                .map_err(|reason| {
+                    format!("WAL batch auction commit replay rejected: {reason:?}")
+                })?;
         }
         WalOp::RevealBatchBid {
             bidder_id,
@@ -321,7 +325,9 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
             now_ms,
         } => {
             core.reveal_batch_bid(*bidder_id, request.clone(), *now_ms)
-                .map_err(|reason| format!("WAL batch auction reveal replay rejected: {reason:?}"))?;
+                .map_err(|reason| {
+                    format!("WAL batch auction reveal replay rejected: {reason:?}")
+                })?;
         }
         WalOp::SettleBatchAuction {
             caller_id,
@@ -329,7 +335,9 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
             now_ms,
         } => {
             core.settle_batch_auction(*caller_id, request.clone(), *now_ms)
-                .map_err(|reason| format!("WAL batch auction settle replay rejected: {reason:?}"))?;
+                .map_err(|reason| {
+                    format!("WAL batch auction settle replay rejected: {reason:?}")
+                })?;
         }
     }
     Ok(())

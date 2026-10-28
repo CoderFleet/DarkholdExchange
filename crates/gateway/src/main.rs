@@ -27,11 +27,10 @@ use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
     AcceptDutchAuction, AuctionStatus, Balance, BatchAuction, BatchAuctionFill, BatchAuctionPhase,
     BidRecord, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, CommitBid,
-    CreateBatchAuction, CreateDutchAuction, DeliveryReceipt, DutchAuction, ErrorBody,
-    EscrowRecord, EscrowState, Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot,
-    Minor, OpenOrderView, OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode,
-    RevealBid, SettleBatchAuction, Side, Ticks, TradeId, UserId, WsClientMessage, WsServerMessage,
-    seed_markets,
+    CreateBatchAuction, CreateDutchAuction, DutchAuction, ErrorBody, EscrowRecord, EscrowState,
+    Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, SettleBatchAuction, Side,
+    Ticks, TradeId, UserId, WsClientMessage, WsServerMessage, seed_markets,
 };
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -332,12 +331,27 @@ async fn main() {
         .route("/api/auctions/{auction_id}/accept", post(auction_accept))
         .route("/api/auctions/{auction_id}/expire", post(auction_expire))
         // Batch auction endpoints
-        .route("/api/batch-auctions", get(batch_auctions_current).post(batch_auction_create))
+        .route(
+            "/api/batch-auctions",
+            get(batch_auctions_current).post(batch_auction_create),
+        )
         .route("/api/batch-auctions/{auction_id}", get(batch_auction_get))
-        .route("/api/batch-auctions/{auction_id}/commit", post(batch_auction_commit))
-        .route("/api/batch-auctions/{auction_id}/reveal", post(batch_auction_reveal))
-        .route("/api/batch-auctions/{auction_id}/settle", post(batch_auction_settle))
-        .route("/api/batch-auctions/{auction_id}/bids", get(batch_auction_bids))
+        .route(
+            "/api/batch-auctions/{auction_id}/commit",
+            post(batch_auction_commit),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/reveal",
+            post(batch_auction_reveal),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/settle",
+            post(batch_auction_settle),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/bids",
+            get(batch_auction_bids),
+        )
         .route("/api/history", get(history_current))
         .route("/api/statements", get(statements_current))
         .route("/api/dev/deposit", post(dev_deposit))
@@ -1436,10 +1450,7 @@ struct BatchAuctionView {
     phase: BatchAuctionPhase,
 }
 
-fn batch_auction_view(
-    auction: &BatchAuction,
-    markets: &[MarketView],
-) -> BatchAuctionView {
+fn batch_auction_view(auction: &BatchAuction, markets: &[MarketView]) -> BatchAuctionView {
     let market = markets
         .iter()
         .find(|market| market.config.id == auction.market_id);
@@ -1570,7 +1581,10 @@ async fn batch_auction_commit(
     let bytes = hex::decode(body.commitment.trim())
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
     if bytes.len() != 32 {
-        return Err(api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
     }
     let mut commitment = [0u8; 32];
     commitment.copy_from_slice(&bytes);
@@ -1609,7 +1623,10 @@ async fn batch_auction_reveal(
     let bytes = hex::decode(body.salt.trim())
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
     if bytes.len() != 32 {
-        return Err(api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest));
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
     }
     let mut salt = [0u8; 32];
     salt.copy_from_slice(&bytes);

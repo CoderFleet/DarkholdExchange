@@ -17,8 +17,8 @@ use dkx_escrow::{AdminRuling, DisputeRecord};
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
-    AcceptDutchAuction, Asset, AuctionAccept, Balance, BatchAuction, BatchAuctionFill,
-    BidRecord, BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, CommitBid,
+    AcceptDutchAuction, Asset, AuctionAccept, Balance, BatchAuction, BatchAuctionFill, BidRecord,
+    BookDelta, BookSnapshot, ClientOrderId, Command, CommandResponse, CommitBid,
     CreateBatchAuction, CreateDutchAuction, DutchAuction, EscrowRecord, Fill, MarketConfig,
     MarketId, MarketView, Minor, OpenOrderView, OrderStatus, Qty, ReasonCode, RevealBid, Seq,
     SettleBatchAuction, TradeId, UserId, WsServerMessage,
@@ -682,10 +682,7 @@ impl WriterHandle {
             .await
     }
 
-    pub(crate) async fn batch_bids(
-        &self,
-        auction_id: u64,
-    ) -> Result<Vec<BidRecord>, WriterError> {
+    pub(crate) async fn batch_bids(&self, auction_id: u64) -> Result<Vec<BidRecord>, WriterError> {
         self.request(|reply| WriterRequest::BatchBids { auction_id, reply })
             .await
     }

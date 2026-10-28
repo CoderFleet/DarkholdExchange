@@ -16,11 +16,11 @@ use dx_engine::{Engine, PlaceOutcome};
 use dx_ledger::{Ledger, LedgerError, Owner, TradeSettlement};
 use dx_types::{
     AcceptDutchAuction, Asset, AuctionAccept, AuctionStatus, Balance, BatchAuction,
-    BatchAuctionFill, BatchAuctionPhase, BidRecord, BookDelta, BookSnapshot, Cancel,
-    ClientOrderId, Command, CommandResponse, CommitBid, CreateBatchAuction, CreateDutchAuction,
-    DeliveryReceipt, DutchAuction, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId,
-    MarketStatus, Minor, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, Seq,
-    SettleBatchAuction, Side, Ticks, TradeId, UserId,
+    BatchAuctionFill, BatchAuctionPhase, BidRecord, BookDelta, BookSnapshot, Cancel, ClientOrderId,
+    Command, CommandResponse, CommitBid, CreateBatchAuction, CreateDutchAuction, DeliveryReceipt,
+    DutchAuction, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId, MarketStatus, Minor,
+    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, Seq, SettleBatchAuction,
+    Side, Ticks, TradeId, UserId,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -1336,9 +1336,9 @@ impl Core {
         auctions
     }
 
-    /// -----------------------------------------------------------------------
-    /// Batch Auction (Commit-Reveal)
-    /// -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Batch Auction (Commit-Reveal)
+    // -----------------------------------------------------------------------
 
     /// Create a seller-backed batch auction. The seller's passes are reserved immediately.
     pub fn create_batch_auction(
@@ -1417,10 +1417,12 @@ impl Core {
         now_ms: u64,
     ) -> Result<BidRecord, ReasonCode> {
         let commit_key = (bidder_id, request.client_order_id);
-        if let Some(existing_auction_id) = self.batch_commits.get(&commit_key).copied() {
-            if let Some(bid) = self.batch_bids.get(&(existing_auction_id, bidder_id, request.client_order_id)) {
-                return Ok(bid.clone());
-            }
+        if let Some(existing_auction_id) = self.batch_commits.get(&commit_key).copied()
+            && let Some(bid) =
+                self.batch_bids
+                    .get(&(existing_auction_id, bidder_id, request.client_order_id))
+        {
+            return Ok(bid.clone());
         }
 
         let Some(auction) = self.batch_auctions.get(&request.auction_id) else {
@@ -1443,7 +1445,10 @@ impl Core {
             valid: true,
         };
 
-        self.batch_bids.insert((auction.id, bidder_id, request.client_order_id), record.clone());
+        self.batch_bids.insert(
+            (auction.id, bidder_id, request.client_order_id),
+            record.clone(),
+        );
         self.batch_commits.insert(commit_key, auction.id);
         self.bump_state_version();
         Ok(record)
@@ -1457,10 +1462,12 @@ impl Core {
         now_ms: u64,
     ) -> Result<BidRecord, ReasonCode> {
         let reveal_key = (bidder_id, request.client_order_id);
-        if let Some(existing_auction_id) = self.batch_reveals.get(&reveal_key).copied() {
-            if let Some(bid) = self.batch_bids.get(&(existing_auction_id, bidder_id, request.client_order_id)) {
-                return Ok(bid.clone());
-            }
+        if let Some(existing_auction_id) = self.batch_reveals.get(&reveal_key).copied()
+            && let Some(bid) =
+                self.batch_bids
+                    .get(&(existing_auction_id, bidder_id, request.client_order_id))
+        {
+            return Ok(bid.clone());
         }
 
         let Some(auction) = self.batch_auctions.get_mut(&request.auction_id) else {
@@ -1474,7 +1481,10 @@ impl Core {
             return Err(ReasonCode::AuctionPhaseMismatch);
         }
 
-        let Some(bid) = self.batch_bids.get_mut(&(auction.id, bidder_id, request.client_order_id)) else {
+        let Some(bid) = self
+            .batch_bids
+            .get_mut(&(auction.id, bidder_id, request.client_order_id))
+        else {
             return Err(ReasonCode::OrderNotFound);
         };
         if bid.client_order_id != request.client_order_id {
@@ -1482,9 +1492,10 @@ impl Core {
         }
 
         // Verify commitment: sha256(price_ticks_le8 || qty_le8 || salt32)
-        let preimage = CommitBid::commitment_preimage(request.price_ticks, request.qty, &request.salt);
+        let preimage =
+            CommitBid::commitment_preimage(request.price_ticks, request.qty, &request.salt);
         let mut hasher = Sha256::new();
-        hasher.update(&preimage);
+        hasher.update(preimage);
         let expected_hash: [u8; 32] = hasher.finalize().into();
 
         if expected_hash != bid.commitment {
@@ -1496,11 +1507,8 @@ impl Core {
         let Some(market) = self.markets.get(&auction.market_id) else {
             return Err(ReasonCode::InternalError);
         };
-        if !market.price_in_collar(request.price_ticks) || request.price_ticks < auction.floor_price_ticks {
-            bid.valid = false;
-        } else {
-            bid.valid = true;
-        }
+        bid.valid = market.price_in_collar(request.price_ticks)
+            && request.price_ticks >= auction.floor_price_ticks;
 
         bid.price_ticks = Some(request.price_ticks);
         bid.qty = Some(request.qty);
@@ -1510,7 +1518,7 @@ impl Core {
             if let Some(notional) = market.notional_minor(request.price_ticks, request.qty) {
                 let fee = market.taker_fee_minor(notional);
                 if let Some(cash) = notional.checked_add(fee) {
-                    if let Err(_) = self.ledger.reserve(bidder_id, Asset::Cash, cash) {
+                    if self.ledger.reserve(bidder_id, Asset::Cash, cash).is_err() {
                         bid.valid = false;
                     }
                 } else {
@@ -1544,8 +1552,14 @@ impl Core {
         if now_ms < auction.reveal_end_ms {
             return Err(ReasonCode::AuctionPhaseMismatch);
         }
-        if auction.phase == BatchAuctionPhase::Settled || auction.phase == BatchAuctionPhase::Expired {
-            return Ok(self.batch_settlements.get(&request.auction_id).cloned().unwrap_or_default());
+        if auction.phase == BatchAuctionPhase::Settled
+            || auction.phase == BatchAuctionPhase::Expired
+        {
+            return Ok(self
+                .batch_settlements
+                .get(&request.auction_id)
+                .cloned()
+                .unwrap_or_default());
         }
 
         auction.phase = BatchAuctionPhase::Clearing;
@@ -1603,12 +1617,12 @@ impl Core {
             }
             // Release reserved cash for all bidders
             for bid in valid_bids {
-                if let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty) {
-                    if let Some(notional) = market.notional_minor(price, qty) {
-                        let fee = market.taker_fee_minor(notional);
-                        if let Some(cash) = notional.checked_add(fee) {
-                            let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
-                        }
+                if let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty)
+                    && let Some(notional) = market.notional_minor(price, qty)
+                {
+                    let fee = market.taker_fee_minor(notional);
+                    if let Some(cash) = notional.checked_add(fee) {
+                        let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
                     }
                 }
             }
@@ -1670,23 +1684,26 @@ impl Core {
                     notional,
                     fee,
                 });
-                if let Some(stored_bid) = self.batch_bids.get_mut(&(auction_id, bid.bidder_id, bid.client_order_id)) {
+                if let Some(stored_bid) =
+                    self.batch_bids
+                        .get_mut(&(auction_id, bid.bidder_id, bid.client_order_id))
+                {
                     stored_bid.filled_qty = alloc_qty;
                 }
             }
         }
 
         // Release cash for losing bids
-        let winning_user_ids: std::collections::HashSet<_> = fills.iter().map(|f| f.buyer_id).collect();
+        let winning_user_ids: std::collections::HashSet<_> =
+            fills.iter().map(|f| f.buyer_id).collect();
         for bid in &valid_bids {
-            if !winning_user_ids.contains(&bid.bidder_id) {
-                if let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty) {
-                    if let Some(notional) = market.notional_minor(price, qty) {
-                        let fee = market.taker_fee_minor(notional);
-                        if let Some(cash) = notional.checked_add(fee) {
-                            let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
-                        }
-                    }
+            if !winning_user_ids.contains(&bid.bidder_id)
+                && let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty)
+                && let Some(notional) = market.notional_minor(price, qty)
+            {
+                let fee = market.taker_fee_minor(notional);
+                if let Some(cash) = notional.checked_add(fee) {
+                    let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
                 }
             }
         }

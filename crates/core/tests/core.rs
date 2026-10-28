@@ -1,9 +1,9 @@
 use dx_core::{CommandOutcome, Core};
 use dx_types::{
     AcceptDutchAuction, Asset, AuctionStatus, Balance, BatchAuctionPhase, BookDelta, BookLevel,
-    BookSnapshot, Cancel, ClientOrderId, Command, CommitBid, CreateBatchAuction,
-    CreateDutchAuction, DeliveryReceipt, EscrowState, LevelChange, OrderStatus, PlaceLimit,
-    PlaceMarket, Qty, ReasonCode, RevealBid, SettleBatchAuction, Side, Ticks, seed_markets,
+    BookSnapshot, Cancel, Command, CommitBid, CreateBatchAuction, CreateDutchAuction,
+    DeliveryReceipt, EscrowState, LevelChange, OrderStatus, PlaceLimit, PlaceMarket, Qty,
+    ReasonCode, RevealBid, SettleBatchAuction, Side, Ticks, seed_markets,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -1282,36 +1282,40 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
     let salt1 = [1u8; 32];
     let preimage1 = CommitBid::commitment_preimage(4_500, 6, &salt1);
     let mut h1 = Sha256::new();
-    h1.update(&preimage1);
+    h1.update(preimage1);
     let commitment1: [u8; 32] = h1.finalize().into();
 
-    let commit1 = core.commit_batch_bid(
-        1,
-        CommitBid {
-            client_order_id: 201,
-            auction_id: auction.id,
-            commitment: commitment1,
-        },
-        2_000,
-    ).unwrap();
+    let commit1 = core
+        .commit_batch_bid(
+            1,
+            CommitBid {
+                client_order_id: 201,
+                auction_id: auction.id,
+                commitment: commitment1,
+            },
+            2_000,
+        )
+        .unwrap();
     assert!(commit1.valid);
 
     // Bidder 2 wants 6 passes at 4_000
     let salt2 = [2u8; 32];
     let preimage2 = CommitBid::commitment_preimage(4_000, 6, &salt2);
     let mut h2 = Sha256::new();
-    h2.update(&preimage2);
+    h2.update(preimage2);
     let commitment2: [u8; 32] = h2.finalize().into();
 
-    let commit2 = core.commit_batch_bid(
-        2,
-        CommitBid {
-            client_order_id: 202,
-            auction_id: auction.id,
-            commitment: commitment2,
-        },
-        3_000,
-    ).unwrap();
+    let commit2 = core
+        .commit_batch_bid(
+            2,
+            CommitBid {
+                client_order_id: 202,
+                auction_id: auction.id,
+                commitment: commitment2,
+            },
+            3_000,
+        )
+        .unwrap();
     assert!(commit2.valid);
 
     // At commit phase, cash is NOT yet reserved
@@ -1319,44 +1323,50 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
     assert_eq!(core.balance(2, Asset::Cash).held, 0);
 
     // 3. Reveal Phase (t = 7_000, after commit_end_ms = 6_000)
-    let rev1 = core.reveal_batch_bid(
-        1,
-        RevealBid {
-            client_order_id: 201,
-            auction_id: auction.id,
-            price_ticks: 4_500,
-            qty: 6,
-            salt: salt1,
-        },
-        7_000,
-    ).unwrap();
+    let rev1 = core
+        .reveal_batch_bid(
+            1,
+            RevealBid {
+                client_order_id: 201,
+                auction_id: auction.id,
+                price_ticks: 4_500,
+                qty: 6,
+                salt: salt1,
+            },
+            7_000,
+        )
+        .unwrap();
     assert!(rev1.valid);
     // Bidder 1 now has cash reserved
     assert!(core.balance(1, Asset::Cash).held > 0);
 
-    let rev2 = core.reveal_batch_bid(
-        2,
-        RevealBid {
-            client_order_id: 202,
-            auction_id: auction.id,
-            price_ticks: 4_000,
-            qty: 6,
-            salt: salt2,
-        },
-        8_000,
-    ).unwrap();
+    let rev2 = core
+        .reveal_batch_bid(
+            2,
+            RevealBid {
+                client_order_id: 202,
+                auction_id: auction.id,
+                price_ticks: 4_000,
+                qty: 6,
+                salt: salt2,
+            },
+            8_000,
+        )
+        .unwrap();
     assert!(rev2.valid);
     assert!(core.balance(2, Asset::Cash).held > 0);
 
     // 4. Settle Phase (t = 12_000, after reveal_end_ms = 11_000)
-    let fills = core.settle_batch_auction(
-        999, // anyone can settle
-        SettleBatchAuction {
-            client_order_id: 300,
-            auction_id: auction.id,
-        },
-        12_000,
-    ).unwrap();
+    let fills = core
+        .settle_batch_auction(
+            999, // anyone can settle
+            SettleBatchAuction {
+                client_order_id: 300,
+                auction_id: auction.id,
+            },
+            12_000,
+        )
+        .unwrap();
 
     // Total demand = 12, supply = 10.
     // Bidder 1 bid 4_500 for 6 -> gets 6 at uniform clearing price 4_000!
@@ -1376,8 +1386,14 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
     assert_eq!(auc_after.qty_remaining, 0);
 
     // Check balances
-    assert_eq!(core.balance(1, Asset::Pass { market_id: MARKET }).available, 6);
-    assert_eq!(core.balance(2, Asset::Pass { market_id: MARKET }).available, 4);
+    assert_eq!(
+        core.balance(1, Asset::Pass { market_id: MARKET }).available,
+        6
+    );
+    assert_eq!(
+        core.balance(2, Asset::Pass { market_id: MARKET }).available,
+        4
+    );
     assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
 
     core.check_invariants().unwrap();
