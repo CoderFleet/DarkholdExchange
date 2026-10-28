@@ -1,5 +1,6 @@
 // @ts-check
 import { getAuthToken, notifyUnauthorized } from './authToken.js'
+import { fetchWithPuzzle } from './pow/fetchWithPuzzle.js'
 /** @typedef {import('./protocol/generated/Balance').Balance} Balance */
 /** @typedef {import('./protocol/generated/BookSnapshot').BookSnapshot} BookSnapshot */
 /** @typedef {import('./protocol/generated/Command').Command} Command */
@@ -37,7 +38,7 @@ const withAuth = (options) => {
  * @returns {Promise<T>}
  */
 export const request = async (path, options = {}) => {
-  const response = await fetch(path, withAuth(options))
+  const response = await fetchWithPuzzle(path, withAuth(options))
   /** @type {ErrorBody | null} */
   const body = await response.json().catch(() => null)
   if (!response.ok) {

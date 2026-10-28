@@ -45,6 +45,7 @@ export const reasonText = (reason) =>
     not_order_owner: 'You do not own that order',
     cancel_not_allowed: 'This order cannot be cancelled',
     rate_limited: 'Rate limited',
+    pow_required: 'Too many requests from your network. Please wait a minute and try again',
     queue_full: 'Core queue is full',
     internal_error: 'Internal engine error',
   })[reason] ?? String(reason ?? 'Request failed').replaceAll('_', ' ')

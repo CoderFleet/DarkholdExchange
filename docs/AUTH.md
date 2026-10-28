@@ -302,5 +302,66 @@ Notes:
 | `DX_RATE_IP` / `DX_RATE_AUTH` / `DX_RATE_USER` | see table | `BURST/PER_SECOND`, for example `30/15` |
 | `DX_TRUST_PROXY` | off | `1` behind a reverse proxy that sets `X-Forwarded-For` |
 
-Not covered here: the WebSocket feeds are limited only by the IP bucket at connection time, and
-adaptive proof-of-work (a harder puzzle for clients that keep hitting the limits) is the next step.
+Not covered here: the WebSocket feeds are limited only by the IP bucket at connection time. A
+client that keeps hitting these limits is asked to solve puzzles (section 9).
+
+## 9. Proof-of-work
+
+Rate limits stop a client from going too fast, but a bot can still keep trying forever. Proof-of-work
+makes every attempt cost it computing time, and it makes the cost grow with bad behaviour. The
+checking side is `crates/pow`; it is used by `crates/gateway/src/rate.rs`.
+
+**Strikes.** Every time the rate limiter refuses a request (any 429), the client's address gets a
+*strike*. Strikes are forgiven after 120 seconds without a new one (each new strike restarts the
+wait).
+
+**The rule.** While an address has strikes, its `POST /api/auth/login`, `/signup` and its commands
+(the same list as the user bucket in section 8) must carry a solved puzzle in the `x-pow` header.
+Without one the answer is **428**, `{"reason":"pow_required","bits":N}`. Reads, health checks and
+addresses without strikes are never asked.
+
+**The puzzle.** Find a number `nonce` so that the SHA-256 hash of the text `"<challenge>~<nonce>"`
+starts with at least `bits` zero bits. Each extra bit doubles the work: 16 bits is about 65 000
+hashes (a fraction of a second in a browser), 22 bits about 4 million (a few seconds).
+
+| Strikes | Puzzle (defaults) |
+|---|---|
+| 0 | none |
+| 1 | 16 bits |
+| 2 | 18 bits |
+| 3 | 20 bits |
+| 4 or more | 22 bits (the cap) |
+
+**The flow.**
+1. The client sends a request and gets `428`.
+2. It calls `GET /api/pow/challenge` and receives `{"challenge": "...", "bits": N, "ttl_secs": 120}`.
+3. It solves the puzzle and repeats the request with `x-pow: <challenge>~<nonce>`.
+
+**What a challenge is.** `v1.<expiry>.<bits>.<random>.<signature>`, signed with HMAC-SHA-256 under a
+key that exists only in the server's memory. So the server stores nothing per challenge, and:
+- it cannot be forged or made easier (changing the bits breaks the signature);
+- it is tied to one client address, so it cannot be passed on;
+- it expires after 120 seconds;
+- it works once: used signatures are remembered until they expire (at most 100 000; if that table is
+  full the server answers 428 until some expire).
+
+**Solving a puzzle does not skip the rate limit.** The puzzle check comes first, then the usual
+bucket. A client that is still too fast gets 429 again, which is another strike and a harder puzzle.
+The puzzle is checked before the user bucket, so unsolved requests never touch anybody's allowance.
+
+**In the browser.** `web/src/pow/` has the solver (its own SHA-256, because `crypto.subtle` is
+asynchronous and needs HTTPS) and a Web Worker, so the page does not freeze. `fetchWithPuzzle`
+wraps `fetch`: on a 428 it fetches a puzzle, solves it, and repeats the request once. It never
+loops. `scripts/seed.mjs` does the same with Node's crypto.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DX_POW` | on | `off` (or `0`) turns puzzles off (rate limits stay). `DX_RATE_LIMIT=off` turns both off |
+| `DX_POW_BITS` | `16/22` | `BASE/MAX`: difficulty after the first strike, and the cap (at most 30) |
+| `DX_POW_WINDOW_SECS` | `120` | Seconds without a refusal before an address is forgiven |
+
+Limits to know about: strikes and used challenges live in memory (a restart forgives everyone and
+cancels open puzzles, and several gateway copies would each keep their own). Behind a proxy the
+address is the one from `X-Forwarded-For` (see `DX_TRUST_PROXY`), so everyone behind one shared
+address (a school, an office) shares the strikes. Proof-of-work slows a bot down; it does not make
+it impossible, and a client with a lot of computing power pays less per attempt than a phone does.

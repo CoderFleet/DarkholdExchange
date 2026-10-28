@@ -339,6 +339,7 @@ async fn main() {
         .with_state(state)
         .merge(dx_auth::router(auth.clone()))
         .merge(dx_admin::router(admin, auth))
+        .merge(rate::router(rate_state.clone()))
         // Last, so it wraps every route above: rate limits (src/rate.rs, docs/AUTH.md section 8).
         .layer(axum::middleware::from_fn_with_state(
             rate_state,
