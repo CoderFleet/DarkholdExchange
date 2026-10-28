@@ -344,34 +344,29 @@ export const getEscrows = (state) => {
 
 /**
  * @param {number} id
- * @param {number} [userId]
  * @returns {Promise<any>}
  */
-export const getEscrowById = (id, userId) =>
-  request(`/api/escrow/${id}`, userId != null ? { headers: authHeaders(userId) } : {})
+export const getEscrowById = (id) => request(`/api/escrow/${id}`)
 
 /**
  * @param {number} id
- * @param {number} [userId]
  * @returns {Promise<any>}
  */
-export const acceptEscrow = (id, userId) =>
+export const acceptEscrow = (id) =>
   request(`/api/escrow/${id}/accept`, {
     method: 'POST',
-    headers: userId != null ? authHeaders(userId) : {},
   })
 
 /**
  * @param {number} id
  * @param {string} reason
  * @param {string} note
- * @param {number} [userId]
  * @returns {Promise<any>}
  */
-export const rejectEscrow = (id, reason, note, userId) =>
+export const rejectEscrow = (id, reason, note) =>
   request(`/api/escrow/${id}/reject`, {
     method: 'POST',
-    headers: userId != null ? jsonHeaders(userId) : { 'content-type': 'application/json' },
+    headers: jsonHeaders,
     body: JSON.stringify({ reason, note }),
   })
 

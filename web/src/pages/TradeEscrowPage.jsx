@@ -37,14 +37,14 @@ export function TradeEscrowPage({ tradeId }) {
     setLoading(true)
     setError(null)
     try {
-      const data = await getEscrowById(tradeId, currentUserId)
+      const data = await getEscrowById(tradeId)
       setEscrow(data)
     } catch (err) {
       setError(err.message || 'Escrow details not found')
     } finally {
       setLoading(false)
     }
-  }, [tradeId, currentUserId])
+  }, [tradeId])
   
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -82,7 +82,7 @@ useEffect(() => {
     if (!escrow) return
     setActionBusy(true)
     try {
-      await acceptEscrow(escrow.id, currentUserId)
+      await acceptEscrow(escrow.id)
       await fetchEscrow()
     } catch (err) {
       alert(err.message || 'Failed to accept escrow')
@@ -96,7 +96,7 @@ useEffect(() => {
     if (!escrow) return
     setActionBusy(true)
     try {
-      await rejectEscrow(escrow.id, rejectReason, rejectNote, currentUserId)
+      await rejectEscrow(escrow.id, rejectReason, rejectNote)
       setShowRejectModal(false)
       await fetchEscrow()
     } catch (err) {

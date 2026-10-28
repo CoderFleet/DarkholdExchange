@@ -79,7 +79,14 @@ export function AppShell() {
           <Route path="/verify" element={<VerifyPage />} />
           <Route path="/login" element={<LoginPage />} />
           <Route path="/signup" element={<SignupPage />} />
-          <Route path="/trade/:tradeId" element={<TradeEscrowRouteWrapper />} />
+          <Route
+            path="/trade/:tradeId"
+            element={
+              <RequireRole>
+                <TradeEscrowRouteWrapper />
+              </RequireRole>
+            }
+          />
           <Route
             path="/admin/disputes"
             element={
