@@ -46,6 +46,7 @@ const collarFor = (market) => {
 export function AuctionsPage() {
   const user = useAuthStore((state) => state.user)
   const userId = user?.user_id ?? null
+  const isAdmin = user?.role === 'admin' || user?.role === 'issuer'
 
   const [tab, setTab] = useState('dutch') // 'dutch' | 'batch'
   const [auctions, setAuctions] = useState([])
@@ -394,8 +395,9 @@ export function AuctionsPage() {
           <h2>Auctions</h2>
         </div>
         <p className="auction-intro">
-          Continuous Dutch auctions decay linearly in real-time. Frequent Batch Auctions use sealed
-          cryptographic commit-reveal to eliminate front-running and clear at one uniform price.
+          Continuous Dutch auctions decay linearly in real-time for seller-initiated liquidations.
+          Frequent Batch Auctions are exchange-scheduled windows using sealed cryptographic
+          commit-reveal to eliminate front-running and clear all participants at one uniform price.
         </p>
       </div>
 
@@ -723,9 +725,9 @@ export function AuctionsPage() {
             </div>
           </section>
 
-          <section className="auction-panel">
-            <h3>Create a Batch Auction</h3>
-            {user ? (
+          {isAdmin ? (
+            <section className="auction-panel">
+              <h3>Schedule Batch Auction Window (Admin / Exchange)</h3>
               <form className="auction-form" onSubmit={handleCreateBatch}>
                 <label>
                   Market
@@ -776,24 +778,24 @@ export function AuctionsPage() {
                   />
                 </label>
                 <button type="submit" disabled={busy || !selectedBatchMarket}>
-                  {busy ? 'Working…' : 'Publish Batch Auction'}
+                  {busy ? 'Working…' : 'Schedule Batch Window'}
                 </button>
               </form>
-            ) : (
-              <div className="auction-guest">
-                <p>Log in to reserve passes and publish a batch auction.</p>
-                <Link to="/login" state={{ from: '/auctions' }}>
-                  Log in
-                </Link>
-              </div>
-            )}
-            {selectedBatchMarket && (
+              {selectedBatchMarket && (
+                <p className="auction-hint">
+                  {selectedBatchMarket.name}: collar {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).floor)}{' '}
+                  – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. Sponsoring passes are reserved from the exchange inventory.
+                </p>
+              )}
+            </section>
+          ) : (
+            <section className="auction-panel">
+              <h3>Exchange-Scheduled Clearing Windows</h3>
               <p className="auction-hint">
-                {selectedBatchMarket.name}: collar {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).floor)}{' '}
-                – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. The seller must hold the passes in balance.
+                Batch auctions are scheduled exclusively by the exchange to pool all market liquidity and eliminate front-running. Traders submit sealed cryptographic bids during the commit window and reveal them simultaneously to clear at one fair, uniform price.
               </p>
-            )}
-          </section>
+            </section>
+          )}
         </>
       )}
     </div>
