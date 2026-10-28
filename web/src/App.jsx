@@ -29,7 +29,6 @@ import { WalletView } from './components/WalletView'
 import { HistoryView } from './components/HistoryView'
 import { DepthChart, PriceChart } from './components/MarketCharts'
 import { SpeedPanel } from './components/SpeedPanel'
-import { TierTabs } from './components/TierTabs'
 import { createLatencySample } from './lib/latency'
 import './App.css'
 
@@ -288,7 +287,7 @@ function App({ initialView = 'trade' }) {
         />
       ) : (
         <>
-          <TierTabs
+          <MarketTabs
             markets={markets}
             snapshots={snapshots}
             selectedMarketId={selectedMarketId}
@@ -339,14 +338,14 @@ function App({ initialView = 'trade' }) {
               {bootError ? (
                 <>
                   <p>Gateway unavailable.</p>
-                  <Link to="/markets">Back to events</Link>
+                  <Link to="/markets">Back to markets</Link>
                 </>
               ) : !marketsLoaded ? (
                 'Connecting to the exchange…'
               ) : (
                 <>
                   <p>Market not found.</p>
-                  <Link to="/markets">Browse the events</Link>
+                  <Link to="/markets">Browse the markets</Link>
                 </>
               )}
             </div>
@@ -379,7 +378,7 @@ function MarketToolbar({ connection, resyncing, account, marketName }) {
   return (
     <div className="market-toolbar">
       <nav className="market-breadcrumb" aria-label="Breadcrumb">
-        <Link to="/markets">Events</Link>
+        <Link to="/markets">Markets</Link>
         <span aria-hidden="true">/</span>
         <span>{marketName ?? 'Terminal'}</span>
       </nav>
@@ -396,6 +395,44 @@ function MarketToolbar({ connection, resyncing, account, marketName }) {
         ) : null}
       </div>
     </div>
+  )
+}
+
+function MarketTabs({ markets, snapshots, selectedMarketId }) {
+  return (
+    <nav className="market-tabs" aria-label="Markets">
+      {markets.map((market) => {
+        const snapshot = snapshots[market.id]
+        return (
+          <Link
+            key={market.id}
+            to={`/markets/${market.id}`}
+            className={`market-tab ${
+              selectedMarketId === market.id ? 'active' : ''
+            }`}
+            aria-current={selectedMarketId === market.id ? 'page' : undefined}
+          >
+            <span className="market-tab-top">
+              <span>{market.name}</span>
+              <span className="market-tab-id">M{market.id}</span>
+            </span>
+            <span className="market-tab-meta">
+              {formatMoney(market.face_value_minor)} face ·{' '}
+              {formatPercent(market.taker_fee_bps)} fee
+            </span>
+            <span
+              className={`market-tab-last ${
+                snapshot?.last_trade_price ? 'has-trade' : ''
+              }`}
+            >
+              {snapshot?.last_trade_price
+                ? formatPrice(market, snapshot.last_trade_price)
+                : 'No prints yet'}
+            </span>
+          </Link>
+        )
+      })}
+    </nav>
   )
 }
 

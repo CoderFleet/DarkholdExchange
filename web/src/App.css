@@ -1320,42 +1320,62 @@
 .topup-panel {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+}
+
+.topup-body {
+  padding: 16px 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .preset-buttons {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
-  gap: 8px;
+  gap: 10px;
 }
 
 .preset-button {
-  padding: 10px;
+  padding: 12px 10px;
   border-radius: 8px;
   border: 1px solid var(--line);
   background: var(--panel-raised);
-  color: var(--text);
+  color: var(--text-strong);
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 600;
+  cursor: pointer;
   transition: all 0.15s ease;
 }
 
 .preset-button:hover:not(:disabled) {
   border-color: var(--purple);
   color: var(--text-strong);
-  background: rgba(179, 136, 255, 0.1);
+  background: rgba(179, 136, 255, 0.12);
+  transform: translateY(-1px);
 }
 
 .custom-topup-form {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 12px;
+}
+
+.custom-topup-form .field {
+  margin-top: 0;
+}
+
+.custom-topup-form .submit-button {
+  margin-top: 4px;
 }
 
 .passes-panel {
   display: flex;
   flex-direction: column;
+}
+
+.passes-panel .passes-list {
+  padding: 16px 18px 20px;
 }
 
 .passes-list {
