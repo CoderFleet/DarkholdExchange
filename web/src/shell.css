@@ -985,6 +985,131 @@
   color: var(--purple);
 }
 
+.phase-commit {
+  background: rgba(246, 198, 107, 0.16);
+  color: var(--amber);
+  border: 1px solid rgba(246, 198, 107, 0.35);
+}
+
+.phase-reveal {
+  background: rgba(139, 92, 246, 0.16);
+  color: var(--purple);
+  border: 1px solid rgba(139, 92, 246, 0.35);
+}
+
+.phase-settled {
+  background: rgba(67, 217, 139, 0.16);
+  color: var(--green);
+  border: 1px solid rgba(67, 217, 139, 0.35);
+}
+
+.auction-tabs-bar {
+  display: flex;
+  align-items: center;
+  margin-top: -4px;
+}
+
+.auction-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line-soft);
+  border-radius: 10px;
+  background: rgba(14, 15, 22, 0.8);
+}
+
+.auction-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.auction-tab-btn:hover {
+  color: var(--text-strong);
+  background: var(--panel-raised);
+}
+
+.auction-tab-btn.active {
+  color: var(--text-strong);
+  background: var(--panel-raised);
+  border-color: rgba(179, 136, 255, 0.35);
+  box-shadow: 0 0 12px rgba(179, 136, 255, 0.12);
+}
+
+.auction-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 99px;
+  background: rgba(179, 136, 255, 0.15);
+  color: var(--purple);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.batch-bid-inputs {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.batch-bid-inputs label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.batch-bid-inputs input {
+  width: 100%;
+}
+
+.batch-bid-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.batch-bid-actions button {
+  width: 100%;
+}
+
+.auction-card-clearing {
+  color: var(--green);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.auction-settled-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 500;
+  margin: 4px 0 0;
+}
+
 .auction-card dl {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
