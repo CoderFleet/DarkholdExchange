@@ -2,7 +2,7 @@
 
 > **Source of truth:** [`docs/spec/darkhold-spec.pdf`](spec/darkhold-spec.pdf)
 >
-> **Baseline audited:** `main` @ `aab8997` on 2026-10-27
+> **Baseline audited:** `main` @ `9a764ee` on 2026-10-28
 >
 > **Purpose:** this is the short working checklist for the Webster 2026 spec. Update the relevant
 > row when work lands instead of re-reading the PDF or re-auditing the whole repository.
@@ -19,7 +19,7 @@
 | Live L2 ladder, depth chart, trade tape, WS diffs + resync | ✅ | Live market terminal is working, including charts and WebSocket rebuild/resync. |
 | Dutch-auction liquidation engine | ✅ | Seller-backed auctions reserve passes and decay linearly from start to floor. Accept is a compare-and-set at the server-computed price; unsold passes return on expiry. `/auctions` UI and WAL replay are covered. |
 | Frequent batch auctions with commit-reveal | ❌ | Not implemented. |
-| Escrow with signed delivery receipts and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. Live flow released a market-3 trade and survived WAL restart. |
+| Escrow with signed delivery receipts, disputes, and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. A buyer can open a dispute after delivery and an admin ruling resolves it to a buyer refund or seller release. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
 | Hash-chained public audit log + browser verification | 🟡 | Hash primitives and browser verifier exist and are tested, but no audit records are produced or exposed, and there is no audit UI. |
 | Per-identity/per-IP rate limits + adaptive proof-of-work | 🟡 | Token-bucket rate limits per IP, per user and for login/sign-up are done (429 + `Retry-After`, `docs/AUTH.md` section 8). Adaptive proof-of-work is not built yet. |
@@ -53,7 +53,7 @@
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
 | 10 | Dutch auction | ✅ | `crates/types/src/auction.rs` (integer decay curve), core create/accept/expire with CAS quantity, reserved seller passes, atomic settlement, WAL replay, and the `/auctions` UI. | Optional: background expiry timer and seller cancellation before the deadline. |
 | 11 | Batch auction + commit-reveal | ❌ | Nothing implemented. | Defer until P1 items are complete, unless the submission needs it. |
-| 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered` on a valid receipt, or `Refunded` after the deadline. Ledger hold/release/refund journals and core escrow invariants are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. Refund is triggered manually by either party after the deadline; there is no background timer yet. | Optional T3 timer service to auto-submit refunds. |
+| 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered → Released` on a valid receipt, or `Refunded` after the deadline. After delivery the buyer can open `Disputed`; an admin ruling resolves it to `Released` (seller) or `Refunded` (buyer). Ledger hold/release/refund journals, writer state, admin routes, and the admin disputes page are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. Refund is triggered manually by either party after the deadline; there is no background timer yet. | Optional T3 timer service to auto-submit refunds. |
 | 13 | ed25519 signed delivery receipts | ✅ | `dx-types` canonical bytes, core seller-key registry, `ed25519-dalek` verification, WAL-logged key registration/release, and browser Web Crypto seller signing. | — |
 | 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
 | 15 | Hash-chained audit log | 🟡 | `crates/hash/src/audit.rs` + `web/src/lib/hash.ts` + golden vectors. No records/endpoint/UI. | Record sequenced commands, expose `GET /api/audit`, verify the chain on `/verify`. |
@@ -91,8 +91,8 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | WS endpoint auth (with T3); optional Playwright place/match/cancel smoke test. |
-| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; escrow disputes/arbitration; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Issuer console; per-identity/per-IP rate limits + adaptive PoW; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
+| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
+| **T3 — Stuti** | Adaptive PoW; batch auction + commit-reveal; escrow timer service; bot simulator UI; Docker/Caddy/nginx; k6/Locust thresholds; Playwright setup; WS auth (with T1). |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -114,7 +114,8 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
   engine, but there is no WebSocket “market opened” frame yet. The market appears through
   `/api/markets` on the next load. Issuance is still required before trading.
 - **Escrow timeout is 5 minutes and manual:** either party can trigger the refund after the deadline;
-  there is no background timer service yet. Disputes/arbitration are out of scope for v1.
+  there is no background timer service yet. Buyer disputes and admin rulings are implemented after
+  delivery, but they are still opened and resolved manually.
 - **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
   core/WAL, but the private key is browser-local and is not a production key-management story.
 - **Dutch auctions expire manually:** after the deadline the seller must call expire to recover
@@ -134,12 +135,13 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-2. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds; disputes/arbitration remain out of scope for v1.
-3. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-4. **Fairness (T3 — Stuti):** per-identity/per-IP rate limits + adaptive PoW.
-5. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
+1. **WS auth (T1/T3):** authenticate the WebSocket upgrade and reject spoofed user IDs.
+2. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
+3. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds. Buyer disputes and admin rulings are already implemented.
+4. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
+5. **Fairness (T3 — Stuti):** adaptive proof-of-work and the bot-defence UI. Per-identity/per-IP rate limits are done.
+6. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
+7. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection, Docker/Caddy deployment.
 
 ## Submission honesty
 
