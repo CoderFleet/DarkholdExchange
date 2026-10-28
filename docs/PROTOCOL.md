@@ -17,12 +17,13 @@ encodings live in `contracts/msgpack/`. `dx-types` is the source of truth.
 | Area | Owner | Notes |
 |---|---|---|
 | Order entry, book, trades, market feed, engine metrics | T1 | This document |
-| JWT/session login, admin, issuer UI/API | T3 | T1 keeps `x-dev-user` behind `dev_user()` until replaced |
+| JWT/session login, admin, issuer UI/API | T3 | `x-dev-user` is a dev-only fallback and must be sent explicitly |
 | Ledger, escrow, proofs, private balance feed | T2 | `Balances` WS message is reserved for T2 |
 
 **Auth rule:** commands never contain a `user_id`. The gateway derives identity from the request.
-Until T3 lands JWT, `x-dev-user: <id>` is the temporary session header and defaults to user `1`.
-Any future auth implementation must preserve the command bodies below.
+The browser uses `Authorization: Bearer <jwt>` from login; `x-dev-user: <id>` is accepted only when
+`DX_DEV_AUTH=1` and is never the default. Any future auth implementation must preserve the command
+bodies below.
 
 **Units:** money is `i64` minor units; prices and quantities are `u64`; no floats. `seq` is the
 global command sequence. `book_seq` is the per-market book version.

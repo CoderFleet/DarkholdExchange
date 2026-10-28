@@ -88,6 +88,25 @@ reads needs the `Authorization` header. Role-restricted endpoints (`/api/admin/*
 
 ---
 
+### 2.5 WebSocket feeds
+
+`/ws` and `/ws/market/{id}` take `?token=<jwt>` (decision A7). The check runs before the
+connection is upgraded, so a refused connection never opens.
+
+| Query | Result |
+|---|---|
+| valid `token` | connected as the token's user |
+| valid `token` and a `user_id` that is not that user | 403 `forbidden` |
+| bad, expired or foreign-secret `token` | 401 `unauthorized` (never replaced by `user_id`) |
+| `user_id` only, `DX_DEV_AUTH` on | connected as that id (old dev behaviour) |
+| `user_id` only, `DX_DEV_AUTH` off | 401 `unauthorized` |
+| nothing | anonymous viewer of public market data |
+
+The website passes the token from the login store to the feed worker, which has no access to it.
+Known limits: the token sits in the address, so it can show in server or proxy logs; a browser
+does not show a failed handshake's status, so the feed worker keeps retrying (with growing
+waits) after a 401 until the page logs out.
+
 ## 3. Errors
 
 Same shape as `PROTOCOL.md` §3: `{ "reason": "<ReasonCode>" }`.
@@ -120,18 +139,21 @@ it. Each change is small, backward compatible, in its own PR, and passes CI befo
 1. **Auth endpoints:** a new crate, added to the gateway router with one `.merge(...)` line.
 2. **`dev_user()` in the gateway (done):** it is now `identify()` in `crates/gateway/src/main.rs`.
    If an `Authorization: Bearer` header is present it must hold a valid token, otherwise the answer
-   is 401 and the dev header is never used instead. With no token, `x-dev-user` still works while
-   `DX_DEV_AUTH=1` (the default), so the load simulator, the k6 scripts and every existing request
-   keep working unchanged. Endpoints that name a user in the address (`/api/users/{id}/balances`
-   and `/api/users/{id}/orders`) let a logged-in user read only their own data (admins may read
-   anyone's). `/api/dev/deposit` and `/api/dev/issue` answer 403 when `DX_DEV_AUTH=0`.
-3. **`web/src/api.js` `request()`:** if a saved token exists, add `Authorization: Bearer <token>`;
-   otherwise behave exactly as today. The existing `x-dev-user` headers stay until the switch-over.
+   is 401 and the dev header is never used instead. With no token, an **explicit** `x-dev-user`
+   header works while `DX_DEV_AUTH=1` (the default); there is no default dev user. The load
+   simulator sends the header explicitly. Endpoints that name a user in the address
+   (`/api/users/{id}/balances` and `/api/users/{id}/orders`) let a logged-in user read only their
+   own data (admins may read anyone's). `/api/dev/deposit` and `/api/dev/issue` answer 403 when
+   `DX_DEV_AUTH=0`.
+3. **`web/src/api.js` `request()`:** every call carries `Authorization: Bearer <token>` when a
+   session exists. The browser app never sends `x-dev-user`, so it cannot impersonate a trader.
 4. **Login, signup, role-protected routes, auth store:** new files.
-5. **Switch-over (done):** `/market`, the wallet and the history pages use the logged-in user. The
-   Identity dropdown shows only while nobody is logged in (dev). Real runs set `DX_DEV_AUTH=0`.
-   Still open: the WebSocket does not check the token yet, and in a real run `/market` shows
-   errors, instead of redirecting to the login page, when nobody is logged in.
+5. **Switch-over (done):** `/markets/:id`, `/wallet` and `/history` are behind `RequireRole`; an
+   anonymous visitor is redirected to `/login` and returned to the page after signing in. The
+   terminal has no Identity dropdown and trades only as the logged-in user. The navbar hides
+   private links while anonymous; `/auctions` stays readable but its create/accept controls
+   require a login. Real runs set `DX_DEV_AUTH=0`.
+   The WebSocket feeds check the token too (section 2.5).
 
 
 ## 5. Saving accounts, events and tiers
@@ -298,5 +320,66 @@ Notes:
 | `DX_RATE_IP` / `DX_RATE_AUTH` / `DX_RATE_USER` | see table | `BURST/PER_SECOND`, for example `30/15` |
 | `DX_TRUST_PROXY` | off | `1` behind a reverse proxy that sets `X-Forwarded-For` |
 
-Not covered here: the WebSocket feeds are limited only by the IP bucket at connection time, and
-adaptive proof-of-work (a harder puzzle for clients that keep hitting the limits) is the next step.
+Not covered here: the WebSocket feeds are limited only by the IP bucket at connection time. A
+client that keeps hitting these limits is asked to solve puzzles (section 9).
+
+## 9. Proof-of-work
+
+Rate limits stop a client from going too fast, but a bot can still keep trying forever. Proof-of-work
+makes every attempt cost it computing time, and it makes the cost grow with bad behaviour. The
+checking side is `crates/pow`; it is used by `crates/gateway/src/rate.rs`.
+
+**Strikes.** Every time the rate limiter refuses a request (any 429), the client's address gets a
+*strike*. Strikes are forgiven after 120 seconds without a new one (each new strike restarts the
+wait).
+
+**The rule.** While an address has strikes, its `POST /api/auth/login`, `/signup` and its commands
+(the same list as the user bucket in section 8) must carry a solved puzzle in the `x-pow` header.
+Without one the answer is **428**, `{"reason":"pow_required","bits":N}`. Reads, health checks and
+addresses without strikes are never asked.
+
+**The puzzle.** Find a number `nonce` so that the SHA-256 hash of the text `"<challenge>~<nonce>"`
+starts with at least `bits` zero bits. Each extra bit doubles the work: 16 bits is about 65 000
+hashes (a fraction of a second in a browser), 22 bits about 4 million (a few seconds).
+
+| Strikes | Puzzle (defaults) |
+|---|---|
+| 0 | none |
+| 1 | 16 bits |
+| 2 | 18 bits |
+| 3 | 20 bits |
+| 4 or more | 22 bits (the cap) |
+
+**The flow.**
+1. The client sends a request and gets `428`.
+2. It calls `GET /api/pow/challenge` and receives `{"challenge": "...", "bits": N, "ttl_secs": 120}`.
+3. It solves the puzzle and repeats the request with `x-pow: <challenge>~<nonce>`.
+
+**What a challenge is.** `v1.<expiry>.<bits>.<random>.<signature>`, signed with HMAC-SHA-256 under a
+key that exists only in the server's memory. So the server stores nothing per challenge, and:
+- it cannot be forged or made easier (changing the bits breaks the signature);
+- it is tied to one client address, so it cannot be passed on;
+- it expires after 120 seconds;
+- it works once: used signatures are remembered until they expire (at most 100 000; if that table is
+  full the server answers 428 until some expire).
+
+**Solving a puzzle does not skip the rate limit.** The puzzle check comes first, then the usual
+bucket. A client that is still too fast gets 429 again, which is another strike and a harder puzzle.
+The puzzle is checked before the user bucket, so unsolved requests never touch anybody's allowance.
+
+**In the browser.** `web/src/pow/` has the solver (its own SHA-256, because `crypto.subtle` is
+asynchronous and needs HTTPS) and a Web Worker, so the page does not freeze. `fetchWithPuzzle`
+wraps `fetch`: on a 428 it fetches a puzzle, solves it, and repeats the request once. It never
+loops. `scripts/seed.mjs` does the same with Node's crypto.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DX_POW` | on | `off` (or `0`) turns puzzles off (rate limits stay). `DX_RATE_LIMIT=off` turns both off |
+| `DX_POW_BITS` | `16/22` | `BASE/MAX`: difficulty after the first strike, and the cap (at most 30) |
+| `DX_POW_WINDOW_SECS` | `120` | Seconds without a refusal before an address is forgiven |
+
+Limits to know about: strikes and used challenges live in memory (a restart forgives everyone and
+cancels open puzzles, and several gateway copies would each keep their own). Behind a proxy the
+address is the one from `X-Forwarded-For` (see `DX_TRUST_PROXY`), so everyone behind one shared
+address (a school, an office) shares the strikes. Proof-of-work slows a bot down; it does not make
+it impossible, and a client with a lot of computing power pays less per attempt than a phone does.

@@ -22,6 +22,7 @@
  *   userId: number,
  *   marketId: number,
  *   depth: number,
+ *   token?: string | null,
  * }} FeedConnection
  */
 
@@ -54,8 +55,8 @@ export const createMarketFeedClient = ({ onStatus, onMessage, onError }) => {
 
   return {
     /** @param {FeedConnection} connection */
-    connect: ({ userId, marketId, depth }) => {
-      worker.postMessage({ type: 'connect', userId, marketId, depth })
+    connect: ({ userId, marketId, depth, token }) => {
+      worker.postMessage({ type: 'connect', userId, marketId, depth, token })
     },
     resync: () => {
       worker.postMessage({ type: 'resync' })

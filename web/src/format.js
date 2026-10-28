@@ -51,6 +51,7 @@ export const reasonText = (reason) =>
     invalid_receipt: 'Invalid delivery receipt',
     receipt_expired: 'Delivery receipt expired',
     rate_limited: 'Rate limited',
+    pow_required: 'Too many requests from your network. Please wait a minute and try again',
     queue_full: 'Core queue is full',
     internal_error: 'Internal engine error',
   })[reason] ?? String(reason ?? 'Request failed').replaceAll('_', ' ')

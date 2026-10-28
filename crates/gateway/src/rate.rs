@@ -11,17 +11,23 @@
 //! A refused request gets `429` with a `Retry-After` header and the reason `rate_limited`. The
 //! numbers come from environment variables (below). `DX_RATE_LIMIT=off` turns all of it off, which
 //! the load tests use.
-
+//!
+//! Every refusal also counts as a strike against the address. While an address has strikes, its
+//! logins, sign-ups and commands must carry a solved proof-of-work puzzle (`x-pow` header, see
+//! `dx-pow`); more strikes mean a harder puzzle. Without one the answer is `428` (docs/AUTH.md
+//! section 9). `GET /api/pow/challenge` hands out puzzles.
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::Json;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
 use dx_limits::{Limit, Limiter, Verdict};
+use dx_pow::{Pow, Strikes};
 use dx_types::{ErrorBody, ReasonCode, UserId};
 
 use crate::{Caller, identify};
@@ -34,6 +40,13 @@ const DEFAULT_USER: &str = "30/15";
 const DEFAULT_IP: &str = "120/60";
 /// Login and sign-up, per IP address: a burst of 10, then one every 5 seconds.
 const DEFAULT_AUTH: &str = "10/0.2";
+/// Puzzle difficulty in bits, `BASE/MAX`: 16 bits (about 65 000 hashes, well under a second in a
+/// browser) after the first refusal, 2 more per further refusal, never above 22.
+const DEFAULT_POW_BITS: &str = "16/22";
+/// Seconds a puzzle stays valid once handed out.
+const POW_TTL_SECS: u64 = 120;
+/// Seconds without a refusal before an address is forgiven.
+const DEFAULT_POW_WINDOW_SECS: u64 = 120;
 
 /// What the limiter works with: the three limiters and how to find out who is asking.
 pub(crate) struct RateLimits {
@@ -42,6 +55,10 @@ pub(crate) struct RateLimits {
     ip: Limiter<IpAddr>,
     auth: Limiter<IpAddr>,
     user: Limiter<UserId>,
+    /// Recent refusals per address; the puzzles' difficulty follows from them.
+    strikes: Strikes<IpAddr>,
+    /// `None` when proof-of-work is switched off.
+    pow: Option<Pow>,
 }
 
 impl RateLimits {
@@ -58,7 +75,17 @@ impl RateLimits {
             ip: Limiter::new(ip),
             auth: Limiter::new(auth),
             user: Limiter::new(user),
+            strikes: Strikes::new(Duration::from_secs(DEFAULT_POW_WINDOW_SECS)),
+            pow: None,
         }
+    }
+
+    /// Turns on proof-of-work for addresses with recent strikes. They are forgiven after `window`
+    /// without a refusal.
+    pub(crate) fn with_pow(mut self, pow: Pow, window: Duration) -> Self {
+        self.pow = Some(pow);
+        self.strikes = Strikes::new(window);
+        self
     }
 
     /// Reads the settings:
@@ -67,6 +94,9 @@ impl RateLimits {
     /// * `DX_RATE_USER`, `DX_RATE_IP`, `DX_RATE_AUTH`: `BURST/PER_SECOND`, for example `30/15`.
     /// * `DX_TRUST_PROXY`: `1` when the gateway sits behind a reverse proxy that adds
     ///   `X-Forwarded-For`. Otherwise that header is ignored, because anybody can fake it.
+    /// * `DX_POW`: `off` (or `0`) turns the proof-of-work puzzles off. Default on.
+    /// * `DX_POW_BITS`: `BASE/MAX` difficulty, for example `16/22`.
+    /// * `DX_POW_WINDOW_SECS`: seconds without a refusal before an address is forgiven.
     ///
     /// A setting that cannot be read stops the start with a clear message, like the others.
     pub(crate) fn from_env() -> Self {
@@ -76,13 +106,34 @@ impl RateLimits {
         };
         let flag = |name: &str| std::env::var(name).is_ok_and(|value| value == "1");
         let off = std::env::var("DX_RATE_LIMIT").is_ok_and(|value| value == "off" || value == "0");
-        RateLimits::new(
+        let limits = RateLimits::new(
             !off,
             flag("DX_TRUST_PROXY"),
             read("DX_RATE_IP", DEFAULT_IP),
             read("DX_RATE_AUTH", DEFAULT_AUTH),
             read("DX_RATE_USER", DEFAULT_USER),
-        )
+        );
+        let pow_off = std::env::var("DX_POW").is_ok_and(|value| value == "off" || value == "0");
+        if pow_off {
+            return limits;
+        }
+        let bits = std::env::var("DX_POW_BITS").unwrap_or_else(|_| DEFAULT_POW_BITS.to_string());
+        let (base, max) = bits
+            .split_once('/')
+            .and_then(|(base, max)| Some((base.trim().parse().ok()?, max.trim().parse().ok()?)))
+            .unwrap_or_else(|| {
+                panic!("DX_POW_BITS: expected BASE/MAX such as 16/22, got {bits:?}")
+            });
+        let window = std::env::var("DX_POW_WINDOW_SECS")
+            .map(|text| {
+                text.trim()
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("DX_POW_WINDOW_SECS: not a whole number: {text:?}"))
+            })
+            .unwrap_or(DEFAULT_POW_WINDOW_SECS);
+        let pow = Pow::new(base, max, POW_TTL_SECS)
+            .unwrap_or_else(|error| panic!("DX_POW_BITS: {error}"));
+        limits.with_pow(pow, Duration::from_secs(window))
     }
 }
 
@@ -155,6 +206,21 @@ fn client_ip(trust_proxy: bool, headers: &HeaderMap, peer: Option<IpAddr>) -> Ip
     peer.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
+/// `428`: this address has to solve a puzzle of `bits` first. `GET /api/pow/challenge` gives one.
+fn puzzle_required(bits: u32) -> Response {
+    (
+        StatusCode::PRECONDITION_REQUIRED,
+        Json(serde_json::json!({ "reason": "pow_required", "bits": bits })),
+    )
+        .into_response()
+}
+
 fn denied(retry_after_secs: u64) -> Response {
     let mut response = (
         StatusCode::TOO_MANY_REQUESTS,
@@ -192,7 +258,29 @@ pub(crate) async fn limit(
     let ip = client_ip(limits.trust_proxy, request.headers(), peer);
 
     if let Verdict::Denied { retry_after_secs } = limits.ip.check(&ip, now) {
+        limits.strikes.record(&ip, now);
         return denied(retry_after_secs);
+    }
+    // An address with recent strikes has to show a solved puzzle before logging in, signing up or
+    // sending a command. This comes before the user's own bucket, so a flood of unsolved requests
+    // never touches anybody's allowance.
+    if matches!(class, Class::Auth | Class::Command)
+        && let Some(pow) = &limits.pow
+    {
+        let required = pow.bits_for(limits.strikes.count(&ip, now));
+        if required > 0 {
+            let solution = request
+                .headers()
+                .get("x-pow")
+                .and_then(|value| value.to_str().ok());
+            let solved = solution.is_some_and(|solution| {
+                pow.verify(&ip.to_string(), solution, required, unix_now())
+                    .is_ok()
+            });
+            if !solved {
+                return puzzle_required(required);
+            }
+        }
     }
     let verdict = match class {
         Class::Auth => limits.auth.check(&ip, now),
@@ -206,9 +294,43 @@ pub(crate) async fn limit(
         Class::Exempt | Class::Other => Verdict::Allowed,
     };
     if let Verdict::Denied { retry_after_secs } = verdict {
+        limits.strikes.record(&ip, now);
         return denied(retry_after_secs);
     }
     next.run(request).await
+}
+
+/// `GET /api/pow/challenge`: a fresh puzzle for the caller's address. Merged into the app before
+/// the layer, so it also meets the address limit.
+pub(crate) fn router(state: RateState) -> Router {
+    Router::new()
+        .route("/api/pow/challenge", get(challenge))
+        .with_state(state)
+}
+
+async fn challenge(State(state): State<RateState>, request: Request) -> Response {
+    let limits = &state.limits;
+    let Some(pow) = limits.pow.as_ref().filter(|_| limits.enabled) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "reason": "pow_disabled" })),
+        )
+            .into_response();
+    };
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0.ip());
+    let ip = client_ip(limits.trust_proxy, request.headers(), peer);
+    let strikes = limits.strikes.count(&ip, Instant::now());
+    // Someone asking without strikes still gets the easiest real puzzle.
+    let bits = pow.bits_for(strikes).max(pow.base_bits());
+    Json(serde_json::json!({
+        "challenge": pow.issue(&ip.to_string(), bits, unix_now()),
+        "bits": bits,
+        "ttl_secs": pow.ttl_secs(),
+    }))
+    .into_response()
 }
 
 #[cfg(test)]
@@ -231,6 +353,7 @@ mod tests {
 
     /// A small app with the real layer and empty handlers, so only the limiting is tested.
     fn app(limits: RateLimits, auth: dx_auth::AuthState) -> Router {
+        let state = RateState::new(limits, auth);
         Router::new()
             .route("/health", get(|| async { "ok" }))
             .route("/api/markets", get(|| async { "ok" }))
@@ -239,10 +362,8 @@ mod tests {
             .route("/api/auth/login", post(|| async { "ok" }))
             .route("/api/auth/signup", post(|| async { "ok" }))
             .route("/api/issuer/issue", post(|| async { "ok" }))
-            .layer(axum::middleware::from_fn_with_state(
-                RateState::new(limits, auth),
-                limit,
-            ))
+            .merge(router(state.clone()))
+            .layer(axum::middleware::from_fn_with_state(state, limit))
     }
 
     fn limits(ip: Limit, auth: Limit, user: Limit) -> RateLimits {
@@ -257,9 +378,24 @@ mod tests {
         from: &str,
         dev_user: Option<&str>,
     ) -> Response {
+        send_with(app, method, path, from, dev_user, None).await
+    }
+
+    /// Like `send`, with a solved puzzle in the `x-pow` header if given.
+    async fn send_with(
+        app: &Router,
+        method: &str,
+        path: &str,
+        from: &str,
+        dev_user: Option<&str>,
+        puzzle: Option<&str>,
+    ) -> Response {
         let mut builder = axum::http::Request::builder().method(method).uri(path);
         if let Some(user) = dev_user {
             builder = builder.header("x-dev-user", user);
+        }
+        if let Some(solution) = puzzle {
+            builder = builder.header("x-pow", solution);
         }
         let mut request = builder.body(Body::empty()).unwrap();
         let address: SocketAddr = format!("{from}:5000").parse().unwrap();
@@ -272,6 +408,32 @@ mod tests {
             .headers()
             .get(header::RETRY_AFTER)
             .map(|value| value.to_str().unwrap().to_string())
+    }
+
+    fn with_pow(limits: RateLimits) -> RateLimits {
+        limits.with_pow(Pow::new(8, 12, 60).unwrap(), Duration::from_secs(60))
+    }
+
+    fn strike(limits: &RateLimits, address: &str) {
+        limits
+            .strikes
+            .record(&address.parse::<IpAddr>().unwrap(), Instant::now());
+    }
+
+    /// Fetches a puzzle for `from` and solves it, like the browser does.
+    async fn solved_puzzle(app: &Router, from: &str) -> String {
+        let reply = send(app, "GET", "/api/pow/challenge", from, None).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let challenge = json["challenge"].as_str().unwrap();
+        let bits = u32::try_from(json["bits"].as_u64().unwrap()).unwrap();
+        format!("{challenge}~{}", dx_pow::solve(challenge, bits))
+    }
+
+    async fn reason_of(reply: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(reply.into_body(), 4096).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
     }
 
     #[tokio::test]
@@ -477,5 +639,105 @@ mod tests {
         assert_eq!(classify(&post, "/api/admin/events"), Class::Other);
         assert_eq!(classify(&post, "/api/dev/deposit"), Class::Other);
         assert_eq!(classify(&get, "/ws"), Class::Other);
+    }
+
+    #[tokio::test]
+    async fn an_address_with_strikes_must_solve_a_puzzle_and_each_solution_works_once() {
+        let roomy = limit_of(1000, 1000.0);
+        let limits = with_pow(limits(roomy, roomy, roomy));
+        strike(&limits, "10.0.0.1");
+        let app = app(limits, auth());
+
+        // No puzzle: refused with the difficulty, for logins, sign-ups and commands alike.
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+        let json = reason_of(reply).await;
+        assert_eq!(json["reason"], "pow_required");
+        assert_eq!(json["bits"], 8);
+        let reply = send(&app, "POST", "/api/auth/signup", "10.0.0.1", None).await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        // Reads, and addresses without strikes, are not asked for anything.
+        let reply = send(&app, "GET", "/api/markets", "10.0.0.1", None).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.2", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+
+        // A solved puzzle lets one request through; the same solution again does not.
+        let solution = solved_puzzle(&app, "10.0.0.1").await;
+        let reply = send_with(
+            &app,
+            "POST",
+            "/api/orders",
+            "10.0.0.1",
+            Some("7"),
+            Some(&solution),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let reply = send_with(
+            &app,
+            "POST",
+            "/api/orders",
+            "10.0.0.1",
+            Some("7"),
+            Some(&solution),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+
+        // A puzzle cannot be passed on to another address.
+        let solution = solved_puzzle(&app, "10.0.0.4").await;
+        let reply = send_with(
+            &app,
+            "POST",
+            "/api/orders",
+            "10.0.0.1",
+            Some("7"),
+            Some(&solution),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn being_refused_earns_a_strike_and_a_solved_puzzle_does_not_skip_the_limit() {
+        let roomy = limit_of(1000, 1000.0);
+        let app = app(with_pow(limits(roomy, roomy, limit_of(1, 0.1))), auth());
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        // Out of tokens: refused, and that is the first strike.
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::TOO_MANY_REQUESTS);
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+        // Solving the puzzle gets past the puzzle check, not past the empty bucket. That is a
+        // second strike, so the next puzzle is harder.
+        let solution = solved_puzzle(&app, "10.0.0.1").await;
+        let reply = send_with(
+            &app,
+            "POST",
+            "/api/orders",
+            "10.0.0.1",
+            Some("7"),
+            Some(&solution),
+        )
+        .await;
+        assert_eq!(reply.status(), StatusCode::TOO_MANY_REQUESTS);
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(reason_of(reply).await["bits"], 10);
+    }
+
+    #[tokio::test]
+    async fn without_puzzles_switched_on_there_is_no_challenge_and_no_428() {
+        let roomy = limit_of(1000, 1000.0);
+        let limits = limits(roomy, roomy, roomy);
+        strike(&limits, "10.0.0.1");
+        let app = app(limits, auth());
+        let reply = send(&app, "GET", "/api/pow/challenge", "10.0.0.1", None).await;
+        assert_eq!(reply.status(), StatusCode::NOT_FOUND);
+        let reply = send(&app, "POST", "/api/orders", "10.0.0.1", Some("7")).await;
+        assert_eq!(reply.status(), StatusCode::OK);
     }
 }

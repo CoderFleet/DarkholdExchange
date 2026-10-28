@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Link } from 'react-router-dom'
 import {
   acceptAuction,
   createAuction,
@@ -38,7 +39,7 @@ const collarFor = (market) => {
 
 export function AuctionsPage() {
   const user = useAuthStore((state) => state.user)
-  const userId = user?.user_id ?? 1
+  const userId = user?.user_id ?? null
   const [auctions, setAuctions] = useState([])
   const [markets, setMarkets] = useState([])
   const [offset, setOffset] = useState(0)
@@ -120,12 +121,16 @@ export function AuctionsPage() {
 
   const handleCreate = async (event) => {
     event.preventDefault()
+    if (userId == null) {
+      setError('Log in to start an auction.')
+      return
+    }
     setBusy(true)
     setError(null)
     setNotice(null)
     try {
       const durationMs = Number(form.durationSeconds) * 1000
-      const created = await createAuction(userId, {
+      const created = await createAuction({
         client_order_id: nextClientOrderId(),
         market_id: Number(form.marketId || selectedMarket?.id),
         qty: Number(form.qty),
@@ -143,13 +148,17 @@ export function AuctionsPage() {
   }
 
   const handleAccept = async (auction) => {
+    if (userId == null) {
+      setError('Log in to accept an auction.')
+      return
+    }
     setBusy(true)
     setError(null)
     setNotice(null)
     try {
       const qty = Number(qtyById[auction.id] ?? 1)
       const price = auctionPriceTicks(auction, nowMs)
-      const accepted = await acceptAuction(userId, auction.id, {
+      const accepted = await acceptAuction(auction.id, {
         client_order_id: nextClientOrderId(),
         qty,
         max_price_ticks: price,
@@ -169,11 +178,15 @@ export function AuctionsPage() {
   }
 
   const handleExpire = async (auction) => {
+    if (userId == null) {
+      setError('Log in to close an auction.')
+      return
+    }
     setBusy(true)
     setError(null)
     setNotice(null)
     try {
-      await expireAuction(userId, auction.id)
+      await expireAuction(auction.id)
       setNotice(`Auction #${auction.id} closed and unsold passes were returned.`)
       await load()
     } catch (nextError) {
@@ -199,6 +212,12 @@ export function AuctionsPage() {
 
       {error && <p className="auction-error">{error}</p>}
       {notice && <p className="auction-notice">{notice}</p>}
+      {!user && (
+        <p className="auction-guest-note">
+          Browsing as a guest. <Link to="/login" state={{ from: '/auctions' }}>Log in</Link>{' '}
+          to start or accept an auction.
+        </p>
+      )}
 
       <section className="auction-panel">
         <h3>Open auctions</h3>
@@ -254,30 +273,42 @@ export function AuctionsPage() {
                   </div>
                 </dl>
                 {phase === 'active' && (
-                  <div className="auction-actions">
-                    <label>
-                      Qty
-                      <input
-                        type="number"
-                        min="1"
-                        max={auction.qty_remaining}
-                        value={qtyById[auction.id] ?? 1}
-                        onChange={(event) =>
-                          setQtyById((current) => ({
-                            ...current,
-                            [auction.id]: event.target.value,
-                          }))
-                        }
-                      />
-                    </label>
-                    <button
-                      type="button"
-                      disabled={busy || auction.seller_id === userId}
-                      onClick={() => handleAccept(auction)}
-                    >
-                      Accept at {formatPrice(market, price)}
-                    </button>
-                  </div>
+                  user ? (
+                    <div className="auction-actions">
+                      <label>
+                        Qty
+                        <input
+                          type="number"
+                          min="1"
+                          max={auction.qty_remaining}
+                          value={qtyById[auction.id] ?? 1}
+                          onChange={(event) =>
+                            setQtyById((current) => ({
+                              ...current,
+                              [auction.id]: event.target.value,
+                            }))
+                          }
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        disabled={busy || auction.seller_id === userId}
+                        onClick={() => handleAccept(auction)}
+                      >
+                        Accept at {formatPrice(market, price)}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="auction-actions">
+                      <Link
+                        className="auction-login"
+                        to="/login"
+                        state={{ from: '/auctions' }}
+                      >
+                        Log in to accept
+                      </Link>
+                    </div>
+                  )
                 )}
                 {phase === 'ended' && isSeller && (
                   <div className="auction-actions">
@@ -301,7 +332,8 @@ export function AuctionsPage() {
 
       <section className="auction-panel">
         <h3>Start an auction</h3>
-        <form className="auction-form" onSubmit={handleCreate}>
+        {user ? (
+          <form className="auction-form" onSubmit={handleCreate}>
           <label>
             Market
             <select
@@ -372,6 +404,14 @@ export function AuctionsPage() {
             {busy ? 'Working…' : 'Reserve passes and publish'}
           </button>
         </form>
+        ) : (
+          <div className="auction-guest">
+            <p>Log in to reserve passes and publish an auction.</p>
+            <Link to="/login" state={{ from: '/auctions' }}>
+              Log in
+            </Link>
+          </div>
+        )}
         {selectedMarket && (
           <p className="auction-hint">
             {selectedMarket.name}: collar {formatPrice(selectedMarket, collarFor(selectedMarket).floor)}{' '}

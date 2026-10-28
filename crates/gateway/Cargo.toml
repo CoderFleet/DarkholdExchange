@@ -9,6 +9,7 @@ dx-admin = { version = "0.1.0", path = "../admin" }
 dx-auth = { version = "0.1.0", path = "../auth" }
 dx-core = { version = "0.1.0", path = "../core" }
 dx-limits = { version = "0.1.0", path = "../limits" }
+dx-pow = { version = "0.1.0", path = "../pow" }
 dx-ledger = { version = "0.1.0", path = "../ledger" }
 dkx-escrow = { version = "0.1.0", path = "../dkx-escrow" }
 dx-solvency = { version = "0.1.0", path = "../solvency" }

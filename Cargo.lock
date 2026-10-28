@@ -663,6 +663,7 @@ dependencies = [
  "dx-core",
  "dx-ledger",
  "dx-limits",
+ "dx-pow",
  "dx-solvency",
  "dx-store",
  "dx-types",
@@ -693,6 +694,16 @@ dependencies = [
 [[package]]
 name = "dx-limits"
 version = "0.1.0"
+
+[[package]]
+name = "dx-pow"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "rand_core 0.6.4",
+ "sha2",
+]
 
 [[package]]
 name = "dx-simulator"

@@ -1,5 +1,6 @@
 // @ts-check
 import { getAuthToken, notifyUnauthorized } from './authToken.js'
+import { fetchWithPuzzle } from './pow/fetchWithPuzzle.js'
 /** @typedef {import('./protocol/generated/Balance').Balance} Balance */
 /** @typedef {import('./protocol/generated/BookSnapshot').BookSnapshot} BookSnapshot */
 /** @typedef {import('./protocol/generated/Command').Command} Command */
@@ -13,26 +14,13 @@ import { getAuthToken, notifyUnauthorized } from './authToken.js'
 /** @typedef {Error & { reason?: ReasonCode, status?: number, retryAfter?: number }} ApiError */
 /** @typedef {Exclude<Command, { type: 'Cancel' }>} PlaceCommand */
 
-/**
- * @param {number} userId
- * @returns {Record<string, string>}
- */
-const authHeaders = (userId) => ({
-  'x-dev-user': String(userId),
-})
-
-/**
- * @param {number} userId
- * @returns {Record<string, string>}
- */
-const jsonHeaders = (userId) => ({
-  ...authHeaders(userId),
+const jsonHeaders = {
   'content-type': 'application/json',
-})
+}
 
 /**
- * Adds the login token when there is one. Without a token the request is sent exactly as
- * before, so the dev-user header flow keeps working.
+ * Adds the login token when there is one. Protected calls are only made from pages that
+ * RequireRole already put behind a login, so there is no anonymous identity fallback.
  *
  * @param {RequestInit} options
  * @returns {RequestInit}
@@ -50,7 +38,7 @@ const withAuth = (options) => {
  * @returns {Promise<T>}
  */
 export const request = async (path, options = {}) => {
-  const response = await fetch(path, withAuth(options))
+  const response = await fetchWithPuzzle(path, withAuth(options))
   /** @type {ErrorBody | null} */
   const body = await response.json().catch(() => null)
   if (!response.ok) {
@@ -77,17 +65,22 @@ export const request = async (path, options = {}) => {
 export const getMarkets = () => request('/api/markets')
 
 /**
+ * Current core state hash, for the trust strip and proof pages.
+ *
+ * @returns {Promise<{ state_hash: string }>}
+ */
+export const getStateHash = () => request('/api/state/hash')
+
+/**
  * @param {number} userId
  * @returns {Promise<Balance[]>}
  */
 export const getBalances = (userId) => request(`/api/users/${userId}/balances`)
 
 /**
- * @param {number} userId
  * @returns {Promise<OpenOrderView[]>}
  */
-export const getOpenOrders = (userId) =>
-  request('/api/orders/open', { headers: authHeaders(userId) })
+export const getOpenOrders = () => request('/api/orders/open')
 
 /**
  * @param {number} marketId
@@ -119,14 +112,13 @@ export const getTrades = (marketId, limit = 40) =>
 
 /**
  * @param {Command} command
- * @param {number} userId
  * @returns {Promise<CommandResponse>}
  */
-export const postCommand = async (command, userId) => {
+export const postCommand = async (command) => {
   try {
     return await request('/api/orders', {
       method: 'POST',
-      headers: jsonHeaders(userId),
+      headers: jsonHeaders,
       body: JSON.stringify(command),
     })
   } catch (err) {
@@ -136,7 +128,7 @@ export const postCommand = async (command, userId) => {
     if (status === 404 || status === 405) {
       return await request('/api/commands', {
         method: 'POST',
-        headers: jsonHeaders(userId),
+        headers: jsonHeaders,
         body: JSON.stringify(command),
       })
     }
@@ -148,60 +140,48 @@ export const postCommand = async (command, userId) => {
  * Canonical T1 placement endpoint.
  *
  * @param {PlaceCommand} command
- * @param {number} userId
  * @returns {Promise<CommandResponse>}
  */
-export const postOrder = (command, userId) =>
+export const postOrder = (command) =>
   request('/api/orders', {
     method: 'POST',
-    headers: jsonHeaders(userId),
+    headers: jsonHeaders,
     body: JSON.stringify(command),
   })
 
 /**
  * @param {number} orderId
  * @param {number} clientOrderId
- * @param {number} userId
  * @returns {Promise<CommandResponse>}
  */
-export const cancelOrderRequest = (orderId, clientOrderId, userId) =>
+export const cancelOrderRequest = (orderId, clientOrderId) =>
   request(`/api/orders/${orderId}?client_order_id=${clientOrderId}`, {
     method: 'DELETE',
-    headers: authHeaders(userId),
   })
 
 /**
- * @param {number} userId
  * @returns {Promise<{ user_id: number, cash_avail: number, cash_locked: number, escrow_cash: number, passes: any[] }>}
  */
-export const getWallet = (userId) =>
-  request('/api/wallet', {
-    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-  })
+export const getWallet = () => request('/api/wallet')
 
 /**
  * Top up user wallet in paise (100 paise = ₹1). Maximum 10,000,000 paise (₹100,000).
  *
- * @param {number} userId
  * @param {number} amountPaise
  * @returns {Promise<any>}
  */
-export const topupWallet = (userId, amountPaise) =>
+export const topupWallet = (amountPaise) =>
   request('/api/wallet/topup', {
     method: 'POST',
-    headers: {
-      ...jsonHeaders(userId),
-      'x-user-id': String(userId),
-    },
+    headers: jsonHeaders,
     body: JSON.stringify({ amount: amountPaise }),
   })
 
 /**
- * @param {number} userId
  * @param {{ market_id?: number, side?: 'buy' | 'sell', limit?: number, cursor?: number }} [query]
  * @returns {Promise<{ items: any[], next_cursor: number | null }>}
  */
-export const getHistory = (userId, query = {}) => {
+export const getHistory = (query = {}) => {
   const params = new URLSearchParams()
   if (query.market_id != null) params.set('market_id', String(query.market_id))
   if (query.side != null) params.set('side', query.side)
@@ -209,72 +189,61 @@ export const getHistory = (userId, query = {}) => {
   if (query.cursor != null) params.set('cursor', String(query.cursor))
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  return request(`/api/history${qs}`, {
-    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-  })
+  return request(`/api/history${qs}`)
 }
 
 /**
- * @param {number} userId
  * @param {{ limit?: number, cursor?: number }} [query]
  * @returns {Promise<{ items: any[], next_cursor: number | null }>}
  */
-export const getStatements = (userId, query = {}) => {
+export const getStatements = (query = {}) => {
   const params = new URLSearchParams()
   if (query.limit != null) params.set('limit', String(query.limit))
   if (query.cursor != null) params.set('cursor', String(query.cursor))
   const qs = params.toString() ? `?${params.toString()}` : ''
 
-  return request(`/api/statements${qs}`, {
-    headers: { ...authHeaders(userId), 'x-user-id': String(userId) },
-  })
+  return request(`/api/statements${qs}`)
 }
 
 /**
  * The caller's registered ed25519 seller key, if any.
  *
- * @param {number} userId
  * @returns {Promise<{ public_key: string | null }>}
  */
-export const getEscrowPublicKey = (userId) =>
-  request('/api/me/public-key', { headers: authHeaders(userId) })
+export const getEscrowPublicKey = () => request('/api/me/public-key')
 
 /**
  * Register the public half of the seller's delivery-signing key.
  *
- * @param {number} userId
  * @param {string} publicKeyHex
  * @returns {Promise<{ public_key: string | null }>}
  */
-export const registerEscrowPublicKey = (userId, publicKeyHex) =>
+export const registerEscrowPublicKey = (publicKeyHex) =>
   request('/api/me/public-key', {
     method: 'POST',
-    headers: jsonHeaders(userId),
+    headers: jsonHeaders,
     body: JSON.stringify({ public_key: publicKeyHex }),
   })
 
 /**
  * Escrows where the caller is buyer or seller.
  *
- * @param {number} userId
  * @returns {Promise<{ items: any[], now_ms: number }>}
  */
-export const getMyEscrow = (userId) =>
-  request('/api/me/escrow', { headers: authHeaders(userId) })
+export const getMyEscrow = () => request('/api/me/escrow')
 
 /**
  * Submit the seller's signed delivery receipt.
  *
- * @param {number} userId
  * @param {number} tradeId
  * @param {number} deliveredAtMs
  * @param {string} signatureHex
  * @returns {Promise<any>}
  */
-export const releaseEscrow = (userId, tradeId, deliveredAtMs, signatureHex) =>
+export const releaseEscrow = (tradeId, deliveredAtMs, signatureHex) =>
   request(`/api/escrow/${tradeId}/receipt`, {
     method: 'POST',
-    headers: jsonHeaders(userId),
+    headers: jsonHeaders,
     body: JSON.stringify({
       delivered_at_ms: deliveredAtMs,
       signature: signatureHex,
@@ -284,14 +253,12 @@ export const releaseEscrow = (userId, tradeId, deliveredAtMs, signatureHex) =>
 /**
  * Refund an escrow after its deadline.
  *
- * @param {number} userId
  * @param {number} tradeId
  * @returns {Promise<any>}
  */
-export const refundEscrow = (userId, tradeId) =>
+export const refundEscrow = (tradeId) =>
   request(`/api/escrow/${tradeId}/refund`, {
     method: 'POST',
-    headers: authHeaders(userId),
   })
 
 /**
@@ -310,43 +277,39 @@ export const getAuctions = (query = {}) => {
 /**
  * Create a seller-backed Dutch auction. The seller's passes are reserved.
  *
- * @param {number} userId
  * @param {{ client_order_id: number, market_id: number, qty: number, start_price_ticks: number, floor_price_ticks: number, duration_ms: number }} body
  * @returns {Promise<any>}
  */
-export const createAuction = (userId, body) =>
+export const createAuction = (body) =>
   request('/api/auctions', {
     method: 'POST',
-    headers: jsonHeaders(userId),
+    headers: jsonHeaders,
     body: JSON.stringify(body),
   })
 
 /**
  * Accept a slice of an auction at or below `max_price_ticks`.
  *
- * @param {number} userId
  * @param {number} auctionId
  * @param {{ client_order_id: number, qty: number, max_price_ticks: number }} body
  * @returns {Promise<any>}
  */
-export const acceptAuction = (userId, auctionId, body) =>
+export const acceptAuction = (auctionId, body) =>
   request(`/api/auctions/${auctionId}/accept`, {
     method: 'POST',
-    headers: jsonHeaders(userId),
+    headers: jsonHeaders,
     body: JSON.stringify(body),
   })
 
 /**
  * Return an auction's unsold passes to the seller after its deadline.
  *
- * @param {number} userId
  * @param {number} auctionId
  * @returns {Promise<any>}
  */
-export const expireAuction = (userId, auctionId) =>
+export const expireAuction = (auctionId) =>
   request(`/api/auctions/${auctionId}/expire`, {
     method: 'POST',
-    headers: authHeaders(userId),
   })
 
 /**

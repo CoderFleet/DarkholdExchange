@@ -2,6 +2,7 @@
 // The real login (crates/auth) is the default. The browser-only stand-in in mockAuth.js is used
 // only in dev and only when you ask for it with VITE_MOCK_AUTH=true (for example in web/.env.local).
 import { mockLogin, mockMe, mockSignup } from './mockAuth'
+import { fetchWithPuzzle } from './pow/fetchWithPuzzle.js'
 
 export const isMockAuth = import.meta.env.DEV && import.meta.env.VITE_MOCK_AUTH === 'true'
 
@@ -10,7 +11,7 @@ export const isMockAuth = import.meta.env.DEV && import.meta.env.VITE_MOCK_AUTH 
  * @param {RequestInit} [options]
  */
 const request = async (path, options = {}) => {
-  const response = await fetch(path, options)
+  const response = await fetchWithPuzzle(path, options)
   const body = await response.json().catch(() => null)
   if (!response.ok) {
     const error = new Error(body?.reason ?? `HTTP ${response.status}`)
@@ -50,6 +51,7 @@ const MESSAGES = {
   unauthorized: 'Your session has expired. Please log in again.',
   forbidden: 'You do not have access to that.',
   rate_limited: 'Too many attempts. Please wait a moment and try again.',
+    pow_required: 'Too many attempts from your network. Please wait a minute and try again.',
 }
 
 /** Turns an API error into text a user can read. */

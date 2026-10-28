@@ -13,7 +13,7 @@ import {
 import { generateSellerKey, signDeliveryReceipt } from '../lib/escrowReceipt'
 
 export const useWalletStore = create((set, get) => ({
-  userId: 1,
+  userId: null,
   cashAvail: 0,
   cashLocked: 0,
   escrowCash: 0,
@@ -41,11 +41,33 @@ export const useWalletStore = create((set, get) => ({
     get().fetchWallet()
   },
 
+  resetAccount: () => {
+    set({
+      userId: null,
+      cashAvail: 0,
+      cashLocked: 0,
+      escrowCash: 0,
+      escrowItems: [],
+      escrowNow: 0,
+      escrowPublicKey: null,
+      escrowLoading: false,
+      passes: [],
+      historyItems: [],
+      statementItems: [],
+      loading: false,
+      topupLoading: false,
+      error: null,
+      historyCursor: null,
+      statementCursor: null,
+    })
+  },
+
   fetchWallet: async () => {
     const { userId } = get()
+    if (userId == null) return
     set({ loading: true, error: null })
     try {
-      const data = await getWallet(userId)
+      const data = await getWallet()
       set({
         cashAvail: Number(data.cash_avail ?? 0),
         cashLocked: Number(data.cash_locked ?? 0),
@@ -60,13 +82,14 @@ export const useWalletStore = create((set, get) => ({
 
   topup: async (amountRupees) => {
     const { userId } = get()
+    if (userId == null) throw new Error('Log in to top up your wallet')
     const amountPaise = Math.round(Number(amountRupees) * 100)
     if (amountPaise <= 0) throw new Error('Top-up amount must be positive')
     if (amountPaise > 10_000_000) throw new Error('Maximum top-up is ₹1,00,000')
 
     set({ topupLoading: true, error: null })
     try {
-      await topupWallet(userId, amountPaise)
+      await topupWallet(amountPaise)
       await get().fetchWallet()
       set({ topupLoading: false })
     } catch (err) {
@@ -77,11 +100,12 @@ export const useWalletStore = create((set, get) => ({
 
   fetchEscrow: async () => {
     const { userId } = get()
+    if (userId == null) return
     set({ escrowLoading: true, error: null })
     try {
       const [escrow, key] = await Promise.all([
-        getMyEscrow(userId),
-        getEscrowPublicKey(userId),
+        getMyEscrow(),
+        getEscrowPublicKey(),
       ])
       set({
         escrowItems: escrow.items ?? [],
@@ -96,10 +120,11 @@ export const useWalletStore = create((set, get) => ({
 
   registerSigningKey: async () => {
     const { userId } = get()
+    if (userId == null) throw new Error('Log in to register a signing key')
     set({ escrowLoading: true, error: null })
     try {
       const publicKey = await generateSellerKey(userId)
-      const result = await registerEscrowPublicKey(userId, publicKey)
+      const result = await registerEscrowPublicKey(publicKey)
       set({
         escrowPublicKey: result.public_key ?? publicKey,
         escrowLoading: false,
@@ -129,7 +154,7 @@ export const useWalletStore = create((set, get) => ({
     }, userId)
     set({ escrowLoading: true, error: null })
     try {
-      await releaseEscrow(userId, tradeId, deliveredAtMs, signature)
+      await releaseEscrow(tradeId, deliveredAtMs, signature)
       await Promise.all([get().fetchEscrow(), get().fetchWallet()])
     } catch (err) {
       set({ error: err.message, escrowLoading: false })
@@ -138,10 +163,9 @@ export const useWalletStore = create((set, get) => ({
   },
 
   refundEscrowAction: async (tradeId) => {
-    const { userId } = get()
     set({ escrowLoading: true, error: null })
     try {
-      await refundEscrow(userId, tradeId)
+      await refundEscrow(tradeId)
       await Promise.all([get().fetchEscrow(), get().fetchWallet()])
     } catch (err) {
       set({ error: err.message, escrowLoading: false })
@@ -151,8 +175,9 @@ export const useWalletStore = create((set, get) => ({
 
   fetchHistory: async (filter = {}) => {
     const { userId } = get()
+    if (userId == null) return
     try {
-      const res = await getHistory(userId, filter)
+      const res = await getHistory(filter)
       set({
         historyItems: res.items ?? [],
         historyCursor: res.next_cursor ?? null,
@@ -164,8 +189,9 @@ export const useWalletStore = create((set, get) => ({
 
   fetchStatements: async (filter = {}) => {
     const { userId } = get()
+    if (userId == null) return
     try {
-      const res = await getStatements(userId, filter)
+      const res = await getStatements(filter)
       set({
         statementItems: res.items ?? [],
         statementCursor: res.next_cursor ?? null,

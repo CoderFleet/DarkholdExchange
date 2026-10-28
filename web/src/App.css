@@ -1,7 +1,52 @@
 .app-shell {
   width: min(1480px, 100%);
   margin: 0 auto;
-  padding: 28px 28px 42px;
+  padding: 24px 28px 42px;
+}
+
+.market-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.market-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+}
+
+.market-breadcrumb a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.market-breadcrumb a:hover {
+  color: var(--purple);
+}
+
+.market-breadcrumb span:last-child {
+  overflow: hidden;
+  color: var(--text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.market-toolbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 0 0 auto;
 }
 
 .topbar {
@@ -52,16 +97,6 @@
 .brand p {
   color: var(--muted);
   font-size: 12px;
-}
-
-.eyebrow {
-  display: block;
-  color: var(--purple);
-  font-family: var(--mono);
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.17em;
-  text-transform: uppercase;
 }
 
 .topbar-controls {
@@ -123,22 +158,13 @@
   text-transform: uppercase;
 }
 
-.identity select {
-  min-height: 36px;
-  padding: 0 30px 0 11px;
+.identity-role {
+  padding: 2px 6px;
   border: 1px solid var(--line);
-  border-radius: 9px;
-  outline: none;
-  background: #0e0f16;
-  color: var(--text-strong);
-  font-family: var(--sans);
-  font-size: 12px;
-  letter-spacing: 0;
-  text-transform: none;
-}
-
-.identity select:focus {
-  border-color: var(--purple-strong);
+  border-radius: 999px;
+  color: var(--purple);
+  font-size: 8px;
+  letter-spacing: 0.06em;
 }
 
 .banner {
@@ -153,7 +179,7 @@
 
 .market-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 10px;
   margin-bottom: 14px;
 }
@@ -170,10 +196,16 @@
   background: rgba(14, 15, 22, 0.72);
   color: var(--text);
   text-align: left;
+  text-decoration: none;
   transition:
     border-color 160ms ease,
     background 160ms ease,
     transform 160ms ease;
+}
+
+.market-tab:focus-visible {
+  outline: 2px solid var(--purple);
+  outline-offset: 2px;
 }
 
 .market-tab:hover {
@@ -262,12 +294,17 @@
 
 .stat-grid {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
   gap: 1px;
   overflow: hidden;
   border: 1px solid var(--line-soft);
   border-radius: 10px;
   background: var(--line-soft);
+}
+
+/* The collar is a range and needs twice the room of a single price. */
+.stat.collar {
+  grid-column: span 2;
 }
 
 .stat {
@@ -964,6 +1001,27 @@
   font-size: 11px;
 }
 
+.loading-panel.market-missing {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  font-family: var(--sans);
+  font-size: 13px;
+}
+
+.loading-panel.market-missing p {
+  color: var(--muted);
+}
+
+.loading-panel.market-missing a {
+  color: var(--purple);
+  text-decoration: none;
+}
+
+.loading-panel.market-missing a:hover {
+  color: var(--text-strong);
+}
+
 .toast {
   position: fixed;
   right: 24px;
@@ -1027,6 +1085,10 @@
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
+  .stat.collar {
+    grid-column: span 1;
+  }
+
   .market-header {
     grid-template-columns: 1fr;
     gap: 14px;
@@ -1067,8 +1129,24 @@
     justify-content: space-between;
   }
 
+  .market-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .market-toolbar-controls {
+    width: 100%;
+    justify-content: space-between;
+  }
+
   .market-tabs {
     grid-template-columns: 1fr;
+  }
+
+  /* Keep the mobile book compact instead of reserving desktop depth rows. */
+  .book-row.placeholder {
+    display: none;
   }
 
   .market-main-grid {
@@ -1101,6 +1179,10 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .stat.collar {
+    grid-column: span 2;
+  }
+
   .footer {
     flex-direction: column;
     gap: 4px;
@@ -1124,11 +1206,7 @@
   }
 
   .identity {
-    font-size: 0;
-  }
-
-  .identity select {
-    font-size: 11px;
+    font-size: 9px;
   }
 }
 

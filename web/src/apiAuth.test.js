@@ -37,15 +37,15 @@ describe('request helper', () => {
     })
   })
 
-  it('keeps the existing headers when it adds the token', async () => {
+  it('adds the bearer token to authenticated calls', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse([]))
     vi.stubGlobal('fetch', fetchMock)
     setAuthToken('abc.def')
 
-    await getOpenOrders(3)
+    await getOpenOrders()
 
     expect(fetchMock).toHaveBeenCalledWith('/api/orders/open', {
-      headers: { 'x-dev-user': '3', authorization: 'Bearer abc.def' },
+      headers: { authorization: 'Bearer abc.def' },
     })
   })
 

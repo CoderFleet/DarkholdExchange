@@ -9,6 +9,7 @@
 
 import { create } from 'zustand'
 import { createMarketFeedClient } from '../feed/marketFeedClient'
+import { getAuthToken } from '../authToken'
 import { applyServerMessage, mergeTrades } from '../feed/marketFeed'
 
 /** @typedef {import('../protocol/generated/BookSnapshot').BookSnapshot} BookSnapshot */
@@ -125,7 +126,10 @@ export const useMarketFeedStore = create((set, get) => {
      * @param {number} [depth]
      */
     connect: (userId, marketId, depth = FEED_DEPTH) => {
-      const key = `${userId}:${marketId}:${depth}`
+      // The worker has no access to the login token, so it is handed over here. It is part of
+      // the key so logging in or out reconnects the feed as the new identity.
+      const token = getAuthToken()
+      const key = `${userId}:${marketId}:${depth}:${token ?? ''}`
       if (client && activeKey === key) return
 
       const previous = get()
@@ -139,7 +143,7 @@ export const useMarketFeedStore = create((set, get) => {
         lastTrade: null,
         metrics: sameMarket ? previous.metrics : null,
       })
-      ensureClient().connect({ userId, marketId, depth })
+      ensureClient().connect({ userId, marketId, depth, token })
     },
 
     disconnect: () => {
