@@ -391,13 +391,13 @@ export function AuctionsPage() {
     <div className="auction-page">
       <div className="auction-heading">
         <div>
-          <span className="eyebrow">Fair Liquidation</span>
+          <span className="eyebrow">Price Discovery & Fair Clearing</span>
           <h2>Auctions</h2>
         </div>
         <p className="auction-intro">
-          Continuous Dutch auctions decay linearly in real-time for seller-initiated liquidations.
-          Frequent Batch Auctions are exchange-scheduled windows using sealed cryptographic
-          commit-reveal to eliminate front-running and clear all participants at one uniform price.
+          {tab === 'dutch'
+            ? 'Continuous Dutch auctions start high and decay over time until a buyer accepts or the floor is reached.'
+            : 'Frequent Batch Auctions collect sealed bids and clear all winning orders simultaneously at one uniform price.'}
         </p>
       </div>
 

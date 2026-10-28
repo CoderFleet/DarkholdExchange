@@ -31,6 +31,16 @@ export function WalletView({ wallet, onTopup, onRefresh }) {
 
   return (
     <div className="wallet-view">
+      <div className="wallet-heading" style={{ marginBottom: '1.25rem' }}>
+        <div>
+          <span className="eyebrow">Treasury & Balances</span>
+          <h2>Account Wallet</h2>
+        </div>
+        <p className="wallet-intro" style={{ margin: '4px 0 0', color: 'var(--muted)', fontSize: '13px', lineHeight: 1.5 }}>
+          Real-time double-entry balances across settled cash, resting order collateral, and delivery escrow protections.
+        </p>
+      </div>
+
       <div className="wallet-summary-grid">
         <div className="stat-card primary">
           <span className="eyebrow">Portfolio Value</span>

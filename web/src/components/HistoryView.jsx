@@ -60,15 +60,71 @@ export function HistoryView({ wallet, onRefresh }) {
   const formatTime = (ts) => {
     if (!ts) return '—'
     const ms = ts > 1_000_000_000_000_000 ? Math.floor(ts / 1000) : ts
-    return new Date(ms).toLocaleTimeString('en-IN', {
+    const d = new Date(ms)
+    return d.toLocaleString('en-IN', {
+      day: '2-digit',
+      month: 'short',
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
     })
   }
 
+  const formatKind = (kind) => {
+    switch (kind) {
+      case 'Deposit':
+        return 'Deposit Cash'
+      case 'IssuePass':
+        return 'Pass Issued'
+      case 'ReserveCash':
+        return 'Reserved Cash'
+      case 'ReleaseCash':
+        return 'Released Cash'
+      default:
+        return kind.replace(/([A-Z])/g, ' $1').trim()
+    }
+  }
+
+  const formatAccount = (account) => {
+    // Pass accounts: PassAvail(201, 1) or PassHeld(201, 1)
+    const passMatch = account.match(/PassAvail\((\d+),\s*(\d+)\)/)
+    if (passMatch) return `Available Passes (Market #${passMatch[2]})`
+
+    const passHeld = account.match(/PassHeld\((\d+),\s*(\d+)\)/)
+    if (passHeld) return `Locked Passes for Order (Market #${passHeld[2]})`
+
+    // Cash accounts: CashAvail(201) or CashLocked(201)
+    const cashAvail = account.match(/CashAvail\((\d+)\)/)
+    if (cashAvail) return 'Available Cash'
+
+    const cashHeld = account.match(/CashLocked\((\d+)\)|CashHeld\((\d+)\)/)
+    if (cashHeld) return 'Locked Cash in Orders'
+
+    const escrowCash = account.match(/EscrowCash\((\d+)\)/)
+    if (escrowCash) return 'Escrow Protected Cash'
+
+    return account
+  }
+
+  const formatAsset = (asset) => {
+    if (asset === 'Cash') return 'Rupees (₹)'
+    const match = asset.match(/Pass\((\d+)\)/)
+    if (match) return `Market #${match[1]} Pass`
+    return asset
+  }
+
   return (
     <div className="history-view">
+      <div className="history-heading" style={{ marginBottom: '1.25rem' }}>
+        <div>
+          <span className="eyebrow">Trading Journal & Ledger</span>
+          <h2>Activity & Statements</h2>
+        </div>
+        <p className="history-intro" style={{ margin: '4px 0 0', color: 'var(--muted)', fontSize: '13px', lineHeight: 1.5 }}>
+          Comprehensive record of matched trades, delivery escrow handoffs, and double-entry balance statements.
+        </p>
+      </div>
+
       <div className="history-header">
         <div className="segmented">
           <button
@@ -323,12 +379,13 @@ export function HistoryView({ wallet, onRefresh }) {
                       <td className="mono text-purple">#{st.id}</td>
                       <td className="mono muted">{formatTime(st.ts)}</td>
                       <td>
-                        <span className="kind-badge">{st.kind}</span>
+                        <span className="kind-badge">{formatKind(st.kind)}</span>
                       </td>
-                      <td className="mono text-strong">{st.account}</td>
-                      <td>{st.asset}</td>
+                      <td className="mono text-strong">{formatAccount(st.account)}</td>
+                      <td>{formatAsset(st.asset)}</td>
                       <td className={`mono font-bold ${st.amount >= 0 ? 'text-green' : 'text-red'}`}>
-                        {st.amount >= 0 ? '+' : ''}{formatMoney(st.amount)}
+                        {st.amount >= 0 ? '+' : ''}
+                        {st.asset === 'Cash' ? formatMoney(st.amount) : `${formatQty(st.amount)} passes`}
                       </td>
                     </tr>
                   ))}

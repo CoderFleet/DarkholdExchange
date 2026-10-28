@@ -275,18 +275,21 @@ export function VerifyPage() {
       </p>
 
       {/* Tabs */}
-      <div className="verify-tabs" style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem', borderBottom: '1px solid var(--border-color, #27272a)' }}>
+      <div className="verify-tabs" style={{ display: 'flex', gap: '0.75rem', marginBottom: '1.5rem', borderBottom: '1px solid rgba(255, 255, 255, 0.08)' }}>
         <button
           type="button"
           onClick={() => setActiveTab('balance')}
           style={{
             padding: '0.75rem 1.25rem',
-            background: 'none',
+            background: activeTab === 'balance' ? 'rgba(179, 136, 255, 0.12)' : 'none',
             border: 'none',
-            borderBottom: activeTab === 'balance' ? '2px solid #38bdf8' : '2px solid transparent',
-            color: activeTab === 'balance' ? '#f8fafc' : '#94a3b8',
+            borderBottom: activeTab === 'balance' ? '2px solid #b388ff' : '2px solid transparent',
+            color: activeTab === 'balance' ? '#ffffff' : '#94a3b8',
+            borderRadius: '6px 6px 0 0',
             cursor: 'pointer',
             fontWeight: 600,
+            fontSize: '14px',
+            transition: 'all 0.15s ease',
           }}
         >
           My Balance Proof
@@ -296,12 +299,15 @@ export function VerifyPage() {
           onClick={() => setActiveTab('audit')}
           style={{
             padding: '0.75rem 1.25rem',
-            background: 'none',
+            background: activeTab === 'audit' ? 'rgba(179, 136, 255, 0.12)' : 'none',
             border: 'none',
-            borderBottom: activeTab === 'audit' ? '2px solid #38bdf8' : '2px solid transparent',
-            color: activeTab === 'audit' ? '#f8fafc' : '#94a3b8',
+            borderBottom: activeTab === 'audit' ? '2px solid #b388ff' : '2px solid transparent',
+            color: activeTab === 'audit' ? '#ffffff' : '#94a3b8',
+            borderRadius: '6px 6px 0 0',
             cursor: 'pointer',
             fontWeight: 600,
+            fontSize: '14px',
+            transition: 'all 0.15s ease',
           }}
         >
           Public Audit Log
@@ -310,9 +316,9 @@ export function VerifyPage() {
 
       {/* Tab 1: Balance Proof */}
       {activeTab === 'balance' && (
-        <div>
-          <div className="banner" style={{ background: '#1e293b', border: '1px solid #334155', padding: '1rem', borderRadius: '8px', marginBottom: '1.5rem', color: '#94a3b8' }}>
-            ℹ <strong>Note:</strong> Exchange reserves are simulated for this demonstration. The Merkle-sum tree is rebuilt periodically from user balances at a known snapshot sequence.
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.75rem' }}>
+          <div className="banner" style={{ background: 'rgba(179, 136, 255, 0.06)', border: '1px solid rgba(179, 136, 255, 0.25)', padding: '1rem 1.25rem', borderRadius: '10px', color: '#cbd5e1', fontSize: '13px', lineHeight: 1.6 }}>
+            🛡️ <strong>Cryptographic Guarantee:</strong> Merkle-sum tree roots commit to total user liabilities. Exchange reserves are simulated for this demonstration. The tree is rebuilt every 30s at known snapshot sequences.
           </div>
 
           <div className="verify-grid">
@@ -325,7 +331,7 @@ export function VerifyPage() {
             </div>
             <div className="verify-stat">
               <span className="eyebrow">Total Liabilities</span>
-              <strong>{formatMoney(solvencyRoot?.total_paise ?? 0)}</strong>
+              <strong style={{ color: '#4ade80' }}>{formatMoney(solvencyRoot?.total_paise ?? 0)}</strong>
               <span>Across {solvencyRoot?.leaf_count ?? 0} accounts</span>
             </div>
             <div className="verify-stat">
@@ -344,7 +350,7 @@ export function VerifyPage() {
                   ? '✕ Failed'
                   : 'Ready'}
               </strong>
-              <span>Browser Web Crypto Check</span>
+              <span>Browser Web Crypto</span>
             </div>
           </div>
 
@@ -355,31 +361,43 @@ export function VerifyPage() {
           )}
 
           {!user ? (
-            <div className="panel verify-card" style={{ padding: '2rem', textAlign: 'center' }}>
-              <p>Please log in to inspect and verify your personal balance inclusion proof.</p>
+            <div className="panel verify-card" style={{ padding: '3rem 2rem', textAlign: 'center', background: 'rgba(255, 255, 255, 0.02)' }}>
+              <p style={{ color: '#94a3b8', fontSize: '14px' }}>Please log in to inspect and verify your personal balance inclusion proof.</p>
             </div>
           ) : !balanceProof ? (
-            <div className="panel verify-card" style={{ padding: '2rem', textAlign: 'center' }}>
-              <p>No balance proof record found for your account yet. Try depositing funds or waiting for the next tree update.</p>
+            <div className="panel verify-card" style={{ padding: '3rem 2rem', textAlign: 'center', background: 'rgba(255, 255, 255, 0.02)' }}>
+              <p style={{ color: '#94a3b8', fontSize: '14px' }}>No balance proof record found for your account yet. Try depositing funds or waiting for the next tree update.</p>
               <button type="button" className="ghost-button" onClick={loadBalanceProof} style={{ marginTop: '1rem' }}>
                 ↻ Refresh Proof
               </button>
             </div>
           ) : (
             <>
-              <section className="panel verify-card" style={{ marginBottom: '1.5rem' }}>
-                <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                  <div>
-                    <h3>Your Balance Leaf & Salt</h3>
-                    <span className="panel-meta">Only you receive your personal 16-byte random salt</span>
+              <section className="panel verify-card" style={{ border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '12px' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', gap: '12px', flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', gap: '3px' }}>
+                    <h3 style={{ fontSize: '17px', fontWeight: 600, margin: 0, color: 'var(--text-strong)' }}>Your Balance Leaf & Salt</h3>
+                    <span style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
+                      Only you receive your personal 16-byte random salt
+                    </span>
                   </div>
                   <button
                     type="button"
-                    className="button primary"
+                    className="verify-action-btn"
                     onClick={handleVerifyBalance}
                     disabled={balanceStatus === 'loading'}
                   >
-                    {balanceStatus === 'loading' ? 'Verifying Path…' : 'Verify my balance'}
+                    {balanceStatus === 'loading' ? (
+                      <>
+                        <span className="verify-spinner" />
+                        Verifying Path…
+                      </>
+                    ) : (
+                      <>
+                        <span style={{ opacity: 0.8 }}>⚡</span>
+                        Verify my balance
+                      </>
+                    )}
                   </button>
                 </div>
 
@@ -396,10 +414,10 @@ export function VerifyPage() {
                     <tbody>
                       <tr>
                         <td className="mono">{balanceProof.leaf.user_id}</td>
-                        <td className="mono" style={{ color: '#38bdf8', fontWeight: 600 }}>
+                        <td className="mono" style={{ color: '#38bdf8', fontWeight: 700, fontSize: '15px' }}>
                           {formatMoney(balanceProof.leaf.balance_paise)}
                         </td>
-                        <td className="mono" title={balanceProof.leaf.salt_hex}>
+                        <td className="mono" title={balanceProof.leaf.salt_hex} style={{ color: '#e2e8f0' }}>
                           {balanceProof.leaf.salt_hex}
                         </td>
                         <td className="mono">{balanceProof.path.length} levels</td>
@@ -411,10 +429,12 @@ export function VerifyPage() {
 
               {/* Step-by-step level verification */}
               {verificationSteps.length > 0 && (
-                <section className="panel verify-card">
-                  <div className="panel-header">
-                    <h3>Step-by-Step Level Walk</h3>
-                    <span className="panel-meta">Browser calculation from leaf to root hash</span>
+                <section className="panel verify-card" style={{ border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '12px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', gap: '3px', marginBottom: '14px' }}>
+                    <h3 style={{ fontSize: '15px', fontWeight: 600, margin: 0, color: 'var(--text-strong)' }}>Step-by-Step Level Walk</h3>
+                    <span style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
+                      Browser recalculation from leaf hash up to published root
+                    </span>
                   </div>
                   <div className="verify-table-wrap">
                     <table className="verify-table">
@@ -432,19 +452,27 @@ export function VerifyPage() {
                       <tbody>
                         {verificationSteps.map((st, idx) => (
                           <tr key={idx}>
-                            <td className="mono">{st.level}</td>
-                            <td>{st.type}</td>
+                            <td className="mono">
+                              <span style={{ padding: '2px 8px', borderRadius: '4px', background: 'rgba(255, 255, 255, 0.05)' }}>
+                                L{st.level}
+                              </span>
+                            </td>
+                            <td style={{ fontWeight: 500 }}>{st.type}</td>
                             <td className="mono" title={st.siblingHash || ''}>
                               {shortHash(st.siblingHash)}
                             </td>
-                            <td className="mono">
+                            <td className="mono" style={{ color: '#cbd5e1' }}>
                               {st.siblingSum != null ? formatMoney(st.siblingSum) : '—'}
                             </td>
-                            <td>{st.direction || 'Self'}</td>
-                            <td className="mono" title={st.resultingHash || st.hash}>
+                            <td>
+                              <span style={{ color: st.direction === 'Left' ? '#38bdf8' : '#a78bfa' }}>
+                                {st.direction || 'Self'}
+                              </span>
+                            </td>
+                            <td className="mono" title={st.resultingHash || st.hash} style={{ color: '#38bdf8' }}>
                               {shortHash(st.resultingHash || st.hash)}
                             </td>
-                            <td className="mono">
+                            <td className="mono" style={{ fontWeight: 600 }}>
                               {formatMoney(st.resultingSum || st.sum)}
                             </td>
                           </tr>
@@ -501,34 +529,47 @@ export function VerifyPage() {
             </div>
           )}
 
-          <section className="panel verify-card">
-            <div className="panel-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <div>
-                <h3>Public Audit Records</h3>
-                <span className="panel-meta">DKX-AUD-v1 continuous SHA-256 hash chain</span>
+          <section className="panel verify-card" style={{ border: '1px solid rgba(255, 255, 255, 0.08)', borderRadius: '12px' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '14px', gap: '12px', flexWrap: 'wrap' }}>
+              <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', gap: '3px' }}>
+                <h3 style={{ fontSize: '17px', fontWeight: 600, margin: 0, color: 'var(--text-strong)' }}>Public Audit Records</h3>
+                <span style={{ fontSize: '11px', color: '#94a3b8', lineHeight: 1.4 }}>
+                  DKX-AUD-v1 continuous SHA-256 hash chain without user identifiers
+                </span>
               </div>
-              <div style={{ display: 'flex', gap: '0.75rem' }}>
+              <div style={{ display: 'flex', gap: '0.6rem', alignItems: 'center' }}>
                 <button
                   type="button"
                   className="ghost-button"
                   onClick={loadAuditData}
                   disabled={auditStatus === 'loading'}
+                  style={{ fontSize: '12px', padding: '6px 12px' }}
                 >
                   ↻ Refresh Log
                 </button>
                 <button
                   type="button"
-                  className="button primary"
+                  className="verify-action-btn"
                   onClick={handleVerifyChain}
                   disabled={auditStatus === 'loading' || auditRecords.length === 0}
                 >
-                  {auditStatus === 'loading' ? 'Recomputing Hashes…' : 'Verify chain'}
+                  {auditStatus === 'loading' ? (
+                    <>
+                      <span className="verify-spinner" />
+                      Recomputing Hashes…
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ opacity: 0.8 }}>⛓️</span>
+                      Verify chain
+                    </>
+                  )}
                 </button>
               </div>
             </div>
 
             {auditRecords.length === 0 ? (
-              <p className="verify-empty" style={{ padding: '2rem', textAlign: 'center' }}>
+              <p className="verify-empty" style={{ padding: '3rem 2rem', textAlign: 'center', color: '#94a3b8' }}>
                 No audit records generated yet. Trade or issue operations will create audit entries.
               </p>
             ) : (
@@ -560,9 +601,9 @@ export function VerifyPage() {
                           }
                         >
                           <td className="mono">#{rec.seq}</td>
-                          <td className="mono">{rec.ts_micros}</td>
+                          <td className="mono text-muted">{rec.ts_micros}</td>
                           <td>
-                            <span className="mono" style={{ color: '#38bdf8' }}>
+                            <span className="mono" style={{ color: '#a78bfa', fontWeight: 600 }}>
                               {AUDIT_KINDS[rec.kind] || `Kind ${rec.kind}`}
                             </span>
                           </td>
@@ -572,14 +613,14 @@ export function VerifyPage() {
                           <td className="mono verify-hash" title={rec.prev_hash_hex}>
                             {shortHash(rec.prev_hash_hex)}
                           </td>
-                          <td className="mono verify-hash" title={rec.hash_hex}>
+                          <td className="mono verify-hash" title={rec.hash_hex} style={{ color: '#38bdf8' }}>
                             {shortHash(rec.hash_hex)}
                           </td>
                           <td>
                             {isBrokenRow ? (
-                              <span style={{ color: '#ef4444', fontWeight: 600 }}>✕ BROKEN</span>
+                              <span style={{ color: '#ef4444', fontWeight: 700 }}>✕ BROKEN</span>
                             ) : auditStatus === 'verified' ? (
-                              <span style={{ color: '#22c55e' }}>✓ OK</span>
+                              <span style={{ color: '#22c55e', fontWeight: 600 }}>✓ OK</span>
                             ) : (
                               <span style={{ color: '#94a3b8' }}>—</span>
                             )}

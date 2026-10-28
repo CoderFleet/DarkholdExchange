@@ -80,15 +80,28 @@ export function Navbar() {
 
       <div className="shell-user">
         {user ? (
-          <>
-            <span className="shell-identity">
-              {user.username}
-              <span className="shell-role">{user.role}</span>
-            </span>
-            <button type="button" className="shell-logout" onClick={handleLogout}>
-              Log out
+          <div className="shell-user-cluster">
+            <div className="shell-identity">
+              <span className="shell-user-avatar">
+                {user.username.slice(0, 1).toUpperCase()}
+              </span>
+              <span className="shell-user-name">{user.username}</span>
+              <span className={`shell-role role-${user.role}`}>{user.role}</span>
+            </div>
+            <button
+              type="button"
+              className="shell-logout"
+              onClick={handleLogout}
+              title="Sign out of exchange session"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" />
+                <polyline points="16 17 21 12 16 7" />
+                <line x1="21" y1="12" x2="9" y2="12" />
+              </svg>
+              <span>Log out</span>
             </button>
-          </>
+          </div>
         ) : (
           <>
             <Link to="/login" state={loginState} className="shell-login">
