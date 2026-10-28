@@ -43,7 +43,7 @@ export function Navbar() {
       </div>
 
       <nav className="shell-nav-center" aria-label="Primary">
-        <NavLink to="/markets">Markets</NavLink>
+        <NavLink to="/markets">Events</NavLink>
         <NavLink to="/auctions">Auctions</NavLink>
         {user && (
           <>

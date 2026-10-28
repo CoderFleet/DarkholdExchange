@@ -34,7 +34,7 @@ export function ShellFooter() {
 
         <nav className="shell-footer-column" aria-label="Product">
           <h3>Product</h3>
-          <Link to="/markets">Markets</Link>
+          <Link to="/markets">Events</Link>
           <Link to="/auctions">Auctions</Link>
           {user && (
             <>

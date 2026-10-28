@@ -76,6 +76,8 @@
 | 32 | Admin publishing reaches the engine | ✅ | Admin publish → writer `CreateMarket` → `Core::add_market` → engine book; tested at engine, core, writer, and gateway. Live check published market 100 and `/api/markets` returned it `Open` with book seq 0. | New markets appear via `/api/markets` on reload; no WS market-opened frame yet. |
 | 33 | Issuer console | ✅ | `IssuerPage` credits passes by username (a retry cannot double-credit) and shows how many passes users hold per market. It uses `POST /api/issuer/issue` and `GET /api/issuer/supply`, issuer role only (`docs/AUTH.md` section 6). `node scripts/seed.mjs` creates demo traders through these endpoints (`docs/AUTH.md` section 7). | — |
 
+| 34 | Events page and tier tabs | ✅ | The Events page (`/markets`) shows one card per event: name, venue, every tier with face value and live last/bid/ask, and the fee and holding-limit range. Opening a card opens the trading screen, where the tabs are only that event's tiers (hidden when an event has one tier). Events published in the admin console use their real names (`GET /api/events`); the demo markets the engine starts with carry no event name, so they are grouped by event number and named from their market names. Pure helpers are in `web/src/lib/eventList.js` with tests. | Route paths stay `/markets` and `/markets/:marketId`. Landing-page copy still says "markets". |
+
 ## Work ownership
 
 Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
