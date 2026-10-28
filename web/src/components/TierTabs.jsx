@@ -35,16 +35,18 @@ export function TierTabs({ markets, snapshots, selectedMarketId }) {
             aria-current={active ? 'page' : undefined}
           >
             <span className="market-tab-top">
-              <span>{tier.name}</span>
+              <span className="market-tab-name">{tier.name}</span>
+              <span className={`market-tab-last ${snapshot?.last_trade_price ? 'has-trade' : ''}`}>
+                {snapshot?.last_trade_price
+                  ? formatPrice(tier.config, snapshot.last_trade_price)
+                  : 'No prints'}
+              </span>
+            </span>
+            <span className="market-tab-bottom">
               <span className="market-tab-id">M{tier.marketId}</span>
-            </span>
-            <span className="market-tab-meta">
-              {formatMoney(tier.config.face_value_minor)} face · {formatPercent(tier.config.taker_fee_bps)} fee
-            </span>
-            <span className={`market-tab-last ${snapshot?.last_trade_price ? 'has-trade' : ''}`}>
-              {snapshot?.last_trade_price
-                ? formatPrice(tier.config, snapshot.last_trade_price)
-                : 'No prints yet'}
+              <span className="market-tab-meta">
+                {formatMoney(tier.config.face_value_minor)} face · {formatPercent(tier.config.taker_fee_bps)} fee
+              </span>
             </span>
           </Link>
         )

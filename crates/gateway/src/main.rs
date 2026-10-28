@@ -1543,7 +1543,13 @@ async fn batch_auction_create(
     headers: HeaderMap,
     payload: Result<Json<CreateBatchAuctionPayload>, JsonRejection>,
 ) -> Result<Json<BatchAuctionView>, ApiError> {
-    let seller_id = caller_user(&state, &headers)?;
+    let (admin_id, role) = match identify(&state.auth, &headers)? {
+        Caller::Token { user_id, role } => (user_id, role),
+        Caller::Dev(user_id) => (user_id, dx_auth::Role::Admin),
+    };
+    if role != dx_auth::Role::Admin && role != dx_auth::Role::Issuer {
+        return Err(forbidden());
+    }
     let body = json_body(payload)?;
     let request = CreateBatchAuction {
         client_order_id: body.client_order_id,
@@ -1554,9 +1560,35 @@ async fn batch_auction_create(
         reveal_duration_ms: body.reveal_duration_ms,
     };
     let at_ms = now_ms();
+
+    // Ensure the admin/issuer account holds the passes to sponsor this batch auction window.
+    let balances = state
+        .writer
+        .balances(admin_id)
+        .await
+        .map_err(writer_error)?;
+    let avail = balances
+        .iter()
+        .find(|b| {
+            b.asset
+                == dx_types::Asset::Pass {
+                    market_id: body.market_id,
+                }
+        })
+        .map(|b| b.available)
+        .unwrap_or(0);
+    if avail < body.qty as i64 {
+        let needed = (body.qty as i64) - avail;
+        let issue_req_id = 8_000_000_000 + body.client_order_id;
+        let _ = state
+            .writer
+            .issue(admin_id, body.market_id, needed as u64, issue_req_id)
+            .await;
+    }
+
     let auction = state
         .writer
-        .create_batch_auction(seller_id, request, at_ms)
+        .create_batch_auction(admin_id, request, at_ms)
         .await
         .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
