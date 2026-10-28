@@ -1507,11 +1507,12 @@ impl EscrowStore {
         ruling: dkx_escrow::AdminRuling,
         note: String,
     ) -> Result<(), ReasonCode> {
-        // `id` can be either a dispute_id or an escrow_id
-        let escrow_id = if self.escrows.contains_key(&id) {
-            id
-        } else if let Some(d) = self.disputes.values().find(|d| d.id == id) {
+        // `id` is primarily the dispute_id from /api/admin/disputes/{id}/rule,
+        // or optionally the escrow_id. Check dispute_id first to avoid collision.
+        let escrow_id = if let Some(d) = self.disputes.values().find(|d| d.id == id) {
             d.escrow_id
+        } else if self.escrows.contains_key(&id) {
+            id
         } else {
             return Err(ReasonCode::OrderNotFound);
         };
