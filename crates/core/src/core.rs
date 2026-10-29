@@ -1705,15 +1705,27 @@ impl Core {
         let auction_id = auction.id;
         let mut valid_bids: Vec<_> = self
             .batch_bids
-            .values()
-            .filter(|b| b.valid && b.price_ticks.is_some() && b.qty.is_some() && b.qty.unwrap() > 0)
-            .cloned()
+            .iter()
+            .filter(|((id, _, _), b)| {
+                *id == auction_id
+                    && b.valid
+                    && b.price_ticks.is_some()
+                    && b.qty.is_some()
+                    && b.qty.unwrap() > 0
+            })
+            .map(|(_, b)| b.clone())
             .collect();
         let mut valid_asks: Vec<_> = self
             .batch_asks
-            .values()
-            .filter(|a| a.valid && a.price_ticks.is_some() && a.qty.is_some() && a.qty.unwrap() > 0)
-            .cloned()
+            .iter()
+            .filter(|((id, _, _), a)| {
+                *id == auction_id
+                    && a.valid
+                    && a.price_ticks.is_some()
+                    && a.qty.is_some()
+                    && a.qty.unwrap() > 0
+            })
+            .map(|(_, a)| a.clone())
             .collect();
 
         // Sort bids by price descending; asks by price ascending; ties broken

@@ -1704,3 +1704,145 @@ fn an_ask_with_a_short_inventory_is_silently_invalid() {
     );
     core.check_invariants().unwrap();
 }
+
+#[test]
+fn settlement_only_sees_the_orders_of_its_own_window() {
+    // Window one opens first and pools an ask, but never gets a bid.
+    let (mut core, first) = schedule_window(100, 3_000, 1_000);
+    core.issue_passes(10, MARKET, 6, 1).unwrap();
+    core.deposit_cash(1, 5_000_000, 1).unwrap();
+    let salt_older = [21u8; 32];
+    core.commit_batch_ask(
+        10,
+        CommitAsk {
+            client_order_id: 601,
+            auction_id: first.id,
+            commitment: batch_commitment(4_000, 6, &salt_older),
+        },
+        2_000,
+    )
+    .unwrap();
+
+    // A second window for the same market opens while the first one is still
+    // sub-sequence active.
+    let second = core
+        .create_batch_auction(
+            3,
+            CreateBatchAuction {
+                client_order_id: 102,
+                market_id: MARKET,
+                floor_price_ticks: 3_000,
+                commit_duration_ms: 1_000,
+                reveal_duration_ms: 1_000,
+            },
+            2_000,
+        )
+        .unwrap();
+    core.issue_passes(5, MARKET, 4, 2).unwrap();
+
+    let salt_newer = [22u8; 32];
+    core.commit_batch_ask(
+        5,
+        CommitAsk {
+            client_order_id: 602,
+            auction_id: second.id,
+            commitment: batch_commitment(4_000, 4, &salt_newer),
+        },
+        2_500,
+    )
+    .unwrap();
+    core.commit_batch_bid(
+        1,
+        CommitBid {
+            client_order_id: 603,
+            auction_id: second.id,
+            commitment: batch_commitment(4_500, 3, &[23u8; 32]),
+        },
+        2_700,
+    )
+    .unwrap();
+
+    // Reveal everything.
+    core.reveal_batch_ask(
+        10,
+        RevealAsk {
+            client_order_id: 601,
+            auction_id: first.id,
+            price_ticks: 4_000,
+            qty: 6,
+            salt: salt_older,
+        },
+        7_000,
+    )
+    .unwrap();
+    core.reveal_batch_ask(
+        5,
+        RevealAsk {
+            client_order_id: 602,
+            auction_id: second.id,
+            price_ticks: 4_000,
+            qty: 4,
+            salt: salt_newer,
+        },
+        3_500,
+    )
+    .unwrap();
+    core.reveal_batch_bid(
+        1,
+        RevealBid {
+            client_order_id: 603,
+            auction_id: second.id,
+            price_ticks: 4_500,
+            qty: 3,
+            salt: [23u8; 32],
+        },
+        3_800,
+    )
+    .unwrap();
+
+    // Settling the second window must only see the second window's pool.
+    let fills = core
+        .settle_batch_auction(
+            999,
+            SettleBatchAuction {
+                client_order_id: 610,
+                auction_id: second.id,
+            },
+            5_000,
+        )
+        .unwrap();
+    assert_eq!(fills.len(), 1);
+    assert_eq!(
+        fills[0].seller_id, 5,
+        "the fill must come from this window's ask"
+    );
+    assert_eq!(fills[0].buyer_id, 1);
+    assert_eq!(fills[0].price_ticks, 4_500);
+    // The first window's seller still holds their passes untouched: window
+    // two never touches inventory it was not told about.
+    assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 6);
+
+    // The first window itself expires (no bids) and releases its ask.
+    let expired = core
+        .settle_batch_auction(
+            999,
+            SettleBatchAuction {
+                client_order_id: 611,
+                auction_id: first.id,
+            },
+            12_000,
+        )
+        .unwrap();
+    assert!(expired.is_empty());
+    assert_eq!(
+        core.batch_auction(first.id).unwrap().phase,
+        BatchAuctionPhase::Expired
+    );
+    assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
+    assert_eq!(
+        core.balance(10, Asset::Pass { market_id: MARKET })
+            .available,
+        6
+    );
+    core.check_invariants().unwrap();
+}
