@@ -1,9 +1,9 @@
 use dx_core::{CommandOutcome, Core};
 use dx_types::{
     AcceptDutchAuction, Asset, AuctionStatus, Balance, BatchAuctionPhase, BookDelta, BookLevel,
-    BookSnapshot, Cancel, Command, CommitBid, CreateBatchAuction, CreateDutchAuction,
+    BookSnapshot, Cancel, Command, CommitAsk, CommitBid, CreateBatchAuction, CreateDutchAuction,
     DeliveryReceipt, EscrowState, LevelChange, OrderStatus, PlaceLimit, PlaceMarket, Qty,
-    ReasonCode, RevealBid, SettleBatchAuction, Side, Ticks, seed_markets,
+    ReasonCode, RevealAsk, RevealBid, SettleBatchAuction, Side, Ticks, seed_markets,
 };
 use ed25519_dalek::{Signer, SigningKey};
 
@@ -1248,82 +1248,107 @@ fn dutch_auction_state_hash_covers_auction_progress() {
     assert_ne!(created, core.state_hash());
 }
 
-#[test]
-fn batch_auction_commit_reveal_clears_at_uniform_price() {
+/// SHA-256 commitment over the canonical batch pre-image.
+fn batch_commitment(price: Ticks, qty: Qty, salt: &[u8; 32]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(CommitBid::commitment_preimage(price, qty, salt));
+    hasher.finalize().into()
+}
 
+/// Schedule a pooled window by admin 3, with a floor inside the collar.
+fn schedule_window(client_order_id: u64, floor: Ticks, now: u64) -> (Core, dx_types::BatchAuction) {
     let mut core = core();
-    // Fund seller with passes
-    core.issue_passes(10, MARKET, 10, 1).unwrap();
+    let auction = core
+        .create_batch_auction(
+            3,
+            CreateBatchAuction {
+                client_order_id,
+                market_id: MARKET,
+                floor_price_ticks: floor,
+                commit_duration_ms: 5_000,
+                reveal_duration_ms: 5_000,
+            },
+            now,
+        )
+        .unwrap();
+    (core, auction)
+}
 
-    // Fund 2 bidders with cash
-    core.deposit_cash(1, 5_000_000, 1).unwrap(); // ₹50,000
-    core.deposit_cash(2, 5_000_000, 2).unwrap();
-
-    // 1. Create Batch Auction: 10 passes, floor 3_000, commit 5s, reveal 5s
-    let create_req = CreateBatchAuction {
-        client_order_id: 100,
-        market_id: MARKET,
-        qty: 10,
-        floor_price_ticks: 3_000,
-        commit_duration_ms: 5_000,
-        reveal_duration_ms: 5_000,
-    };
-    let auction = core.create_batch_auction(10, create_req, 1_000).unwrap();
+/// Sealed ask from `seller` into `auction` at 4_000 ticks for 10 passes.
+#[test]
+fn batch_window_pools_asks_and_bids_at_uniform_price() {
+    let (mut core, auction) = schedule_window(100, 3_000, 1_000);
     assert_eq!(auction.phase, BatchAuctionPhase::Commit);
     assert_eq!(auction.commit_end_ms, 6_000);
     assert_eq!(auction.reveal_end_ms, 11_000);
+    // Scheduling reserves nothing: the pool fills from sellers' asks.
+    assert_eq!(
+        core.balance(3, Asset::Pass { market_id: MARKET }).available,
+        0
+    );
 
-    // Passes are reserved for seller
+    // Fund the participants: the seller's passes land in the pool at reveal.
+    core.issue_passes(10, MARKET, 10, 1).unwrap();
+    core.deposit_cash(1, 5_000_000, 1).unwrap();
+    core.deposit_cash(2, 5_000_000, 2).unwrap();
+
+    // Sellers commit sealed asks; buyer cash is untouched in commit phase.
+    let salt_ask = [9u8; 32];
+    core.commit_batch_ask(
+        10,
+        CommitAsk {
+            client_order_id: 101,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_000, 10, &salt_ask),
+        },
+        2_000,
+    )
+    .unwrap();
+    assert_eq!(core.balance(1, Asset::Cash).held, 0);
+
+    // Buyers commit sealed bids.
+    let salt1 = [1u8; 32];
+    core.commit_batch_bid(
+        1,
+        CommitBid {
+            client_order_id: 201,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_500, 6, &salt1),
+        },
+        2_500,
+    )
+    .unwrap();
+    let salt2 = [2u8; 32];
+    core.commit_batch_bid(
+        2,
+        CommitBid {
+            client_order_id: 202,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_000, 6, &salt2),
+        },
+        3_000,
+    )
+    .unwrap();
+
+    // Reveal phase: the ask reserves the seller's passes, bids reserve cash.
+    let ask = core
+        .reveal_batch_ask(
+            10,
+            RevealAsk {
+                client_order_id: 101,
+                auction_id: auction.id,
+                price_ticks: 4_000,
+                qty: 10,
+                salt: salt_ask,
+            },
+            7_000,
+        )
+        .unwrap();
+    assert!(ask.valid);
     assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 10);
 
-    // 2. Commit Phase (t = 2_000)
-    // Bidder 1 wants 6 passes at 4_500
-    let salt1 = [1u8; 32];
-    let preimage1 = CommitBid::commitment_preimage(4_500, 6, &salt1);
-    let mut h1 = Sha256::new();
-    h1.update(preimage1);
-    let commitment1: [u8; 32] = h1.finalize().into();
-
-    let commit1 = core
-        .commit_batch_bid(
-            1,
-            CommitBid {
-                client_order_id: 201,
-                auction_id: auction.id,
-                commitment: commitment1,
-            },
-            2_000,
-        )
-        .unwrap();
-    assert!(commit1.valid);
-
-    // Bidder 2 wants 6 passes at 4_000
-    let salt2 = [2u8; 32];
-    let preimage2 = CommitBid::commitment_preimage(4_000, 6, &salt2);
-    let mut h2 = Sha256::new();
-    h2.update(preimage2);
-    let commitment2: [u8; 32] = h2.finalize().into();
-
-    let commit2 = core
-        .commit_batch_bid(
-            2,
-            CommitBid {
-                client_order_id: 202,
-                auction_id: auction.id,
-                commitment: commitment2,
-            },
-            3_000,
-        )
-        .unwrap();
-    assert!(commit2.valid);
-
-    // At commit phase, cash is NOT yet reserved
-    assert_eq!(core.balance(1, Asset::Cash).held, 0);
-    assert_eq!(core.balance(2, Asset::Cash).held, 0);
-
-    // 3. Reveal Phase (t = 7_000, after commit_end_ms = 6_000)
-    let rev1 = core
+    let bid1 = core
         .reveal_batch_bid(
             1,
             RevealBid {
@@ -1333,14 +1358,13 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
                 qty: 6,
                 salt: salt1,
             },
-            7_000,
+            8_000,
         )
         .unwrap();
-    assert!(rev1.valid);
-    // Bidder 1 now has cash reserved
+    assert!(bid1.valid);
     assert!(core.balance(1, Asset::Cash).held > 0);
 
-    let rev2 = core
+    let bid2 = core
         .reveal_batch_bid(
             2,
             RevealBid {
@@ -1350,13 +1374,14 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
                 qty: 6,
                 salt: salt2,
             },
-            8_000,
+            9_000,
         )
         .unwrap();
-    assert!(rev2.valid);
+    assert!(bid2.valid);
     assert!(core.balance(2, Asset::Cash).held > 0);
 
-    // 4. Settle Phase (t = 12_000, after reveal_end_ms = 11_000)
+    // Settle: demand 12, supply 10 -> volume 10 is first reached at 4_000 and
+    // holds at 4_000 (higher candidate 4_500 only moves 6). Uniform 4_000.
     let fills = core
         .settle_batch_auction(
             999, // anyone can settle
@@ -1368,14 +1393,11 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
         )
         .unwrap();
 
-    // Total demand = 12, supply = 10.
-    // Bidder 1 bid 4_500 for 6 -> gets 6 at uniform clearing price 4_000!
-    // Bidder 2 bid 4_000 for 6 -> gets remaining 4 at uniform clearing price 4_000!
     assert_eq!(fills.len(), 2);
     assert_eq!(fills[0].price_ticks, 4_000);
     assert_eq!(fills[0].qty, 6);
     assert_eq!(fills[0].buyer_id, 1);
-
+    assert_eq!(fills[0].seller_id, 10);
     assert_eq!(fills[1].price_ticks, 4_000);
     assert_eq!(fills[1].qty, 4);
     assert_eq!(fills[1].buyer_id, 2);
@@ -1383,9 +1405,10 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
     let auc_after = core.batch_auction(auction.id).unwrap();
     assert_eq!(auc_after.phase, BatchAuctionPhase::Settled);
     assert_eq!(auc_after.clearing_price_ticks, Some(4_000));
-    assert_eq!(auc_after.qty_remaining, 0);
+    assert_eq!(auc_after.qty_total, Some(10));
+    assert_eq!(auc_after.qty_remaining, Some(0));
 
-    // Check balances
+    // Passes moved to the buyers; the seller's reservation is fully unwound.
     assert_eq!(
         core.balance(1, Asset::Pass { market_id: MARKET }).available,
         6
@@ -1395,6 +1418,289 @@ fn batch_auction_commit_reveal_clears_at_uniform_price() {
         4
     );
     assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
+    // Bidders' cash reservations are down to the actual uniform cost.
+    assert_eq!(core.balance(1, Asset::Cash).held, 0);
+    assert_eq!(core.balance(2, Asset::Cash).held, 0);
 
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn a_users_bid_never_fills_their_own_ask() {
+    let (mut core, auction) = schedule_window(100, 3_000, 1_000);
+    // User 5 both asks and bids; user 1 only bids.
+    core.issue_passes(5, MARKET, 10, 1).unwrap();
+    core.deposit_cash(5, 5_000_000, 1).unwrap();
+    core.deposit_cash(1, 5_000_000, 2).unwrap();
+
+    let salt_ask = [7u8; 32];
+    let ask_commitment = batch_commitment(4_000, 3, &salt_ask);
+    core.commit_batch_ask(
+        5,
+        CommitAsk {
+            client_order_id: 301,
+            auction_id: auction.id,
+            commitment: ask_commitment,
+        },
+        2_000,
+    )
+    .unwrap();
+
+    let salt5 = [5u8; 32];
+    core.commit_batch_bid(
+        5,
+        CommitBid {
+            client_order_id: 302,
+            auction_id: auction.id,
+            commitment: batch_commitment(5_000, 3, &salt5),
+        },
+        3_000,
+    )
+    .unwrap();
+    let salt1 = [4u8; 32];
+    core.commit_batch_bid(
+        1,
+        CommitBid {
+            client_order_id: 303,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_500, 10, &salt1),
+        },
+        3_500,
+    )
+    .unwrap();
+
+    core.reveal_batch_ask(
+        5,
+        RevealAsk {
+            client_order_id: 301,
+            auction_id: auction.id,
+            price_ticks: 4_000,
+            qty: 3,
+            salt: salt_ask,
+        },
+        7_000,
+    )
+    .unwrap();
+    core.reveal_batch_bid(
+        5,
+        RevealBid {
+            client_order_id: 302,
+            auction_id: auction.id,
+            price_ticks: 5_000,
+            qty: 3,
+            salt: salt5,
+        },
+        8_000,
+    )
+    .unwrap();
+    core.reveal_batch_bid(
+        1,
+        RevealBid {
+            client_order_id: 303,
+            auction_id: auction.id,
+            price_ticks: 4_500,
+            qty: 10,
+            salt: salt1,
+        },
+        9_000,
+    )
+    .unwrap();
+
+    // Clearing: at 4_500 demand is 13, supply 3 -> volume 3; uniform 4_500.
+    // User 5's bid cannot take their own ask, so the ask fills user 1 only.
+    let fills = core
+        .settle_batch_auction(
+            999,
+            SettleBatchAuction {
+                client_order_id: 310,
+                auction_id: auction.id,
+            },
+            12_000,
+        )
+        .unwrap();
+
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].buyer_id, 1);
+    assert_eq!(fills[0].seller_id, 5);
+    assert_eq!(fills[0].price_ticks, 4_500);
+    assert_eq!(fills[0].qty, 3);
+    // User 5's own bid lost: reservation released, passes sold to user 1.
+    assert_eq!(
+        core.balance(1, Asset::Pass { market_id: MARKET }).available,
+        3
+    );
+    assert_eq!(core.balance(1, Asset::Cash).held, 0);
+    assert_eq!(core.balance(5, Asset::Cash).held, 0);
+    assert_eq!(
+        core.balance(5, Asset::Pass { market_id: MARKET }).available,
+        7
+    );
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn an_uncrossed_window_expires_and_unwinds_everything() {
+    let (mut core, auction) = schedule_window(100, 3_000, 1_000);
+    // Sellers ask above any bid: the window cannot cross.
+    core.issue_passes(10, MARKET, 5, 1).unwrap();
+    core.deposit_cash(1, 5_000_000, 1).unwrap();
+
+    let salt_ask = [3u8; 32];
+    core.commit_batch_ask(
+        10,
+        CommitAsk {
+            client_order_id: 401,
+            auction_id: auction.id,
+            commitment: batch_commitment(5_000, 5, &salt_ask),
+        },
+        2_000,
+    )
+    .unwrap();
+    core.commit_batch_bid(
+        1,
+        CommitBid {
+            client_order_id: 402,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_500, 4, &[8u8; 32]),
+        },
+        2_500,
+    )
+    .unwrap();
+
+    core.reveal_batch_ask(
+        10,
+        RevealAsk {
+            client_order_id: 401,
+            auction_id: auction.id,
+            price_ticks: 5_000, // no bid can reach this
+            qty: 5,
+            salt: salt_ask,
+        },
+        7_000,
+    )
+    .unwrap();
+    core.reveal_batch_bid(
+        1,
+        RevealBid {
+            client_order_id: 402,
+            auction_id: auction.id,
+            price_ticks: 4_500,
+            qty: 4,
+            salt: [8u8; 32],
+        },
+        8_000,
+    )
+    .unwrap();
+
+    let fills = core
+        .settle_batch_auction(
+            999,
+            SettleBatchAuction {
+                client_order_id: 410,
+                auction_id: auction.id,
+            },
+            12_000,
+        )
+        .unwrap();
+    assert!(fills.is_empty());
+    let auc_after = core.batch_auction(auction.id).unwrap();
+    assert_eq!(auc_after.phase, BatchAuctionPhase::Expired);
+    assert_eq!(auc_after.qty_total, Some(5));
+    assert_eq!(auc_after.qty_remaining, Some(5));
+    // Both reservations came back.
+    assert_eq!(core.balance(1, Asset::Cash).held, 0);
+    assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
+    assert_eq!(
+        core.balance(10, Asset::Pass { market_id: MARKET })
+            .available,
+        5
+    );
+    // Settle is idempotent afterwards.
+    let again = core
+        .settle_batch_auction(
+            999,
+            SettleBatchAuction {
+                client_order_id: 411,
+                auction_id: auction.id,
+            },
+            13_000,
+        )
+        .unwrap();
+    assert!(again.is_empty());
+    core.check_invariants().unwrap();
+}
+
+#[test]
+fn an_ask_with_a_short_inventory_is_silently_invalid() {
+    let (mut core, auction) = schedule_window(100, 3_000, 1_000);
+    core.deposit_cash(10, 5_000_000, 1).unwrap();
+
+    let salt = [6u8; 32];
+    // User 10 holds no passes when the first ask commits...
+    core.commit_batch_ask(
+        10,
+        CommitAsk {
+            client_order_id: 501,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_000, 10, &salt),
+        },
+        2_000,
+    )
+    .unwrap();
+    // ...and only 4 of the promised 10 passes when the second commits; both
+    // commits land inside the commit phase, before anything is revealed.
+    core.issue_passes(10, MARKET, 4, 1).unwrap();
+    core.commit_batch_ask(
+        10,
+        CommitAsk {
+            client_order_id: 502,
+            auction_id: auction.id,
+            commitment: batch_commitment(4_000, 10, &salt),
+        },
+        2_500,
+    )
+    .unwrap();
+
+    let ask = core
+        .reveal_batch_ask(
+            10,
+            RevealAsk {
+                client_order_id: 501,
+                auction_id: auction.id,
+                price_ticks: 4_000,
+                qty: 10,
+                salt,
+            },
+            7_000,
+        )
+        .unwrap();
+    assert!(
+        !ask.valid,
+        "a seller without passes cannot land in the pool"
+    );
+    assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
+
+    let short = core
+        .reveal_batch_ask(
+            10,
+            RevealAsk {
+                client_order_id: 502,
+                auction_id: auction.id,
+                price_ticks: 4_000,
+                qty: 10,
+                salt,
+            },
+            7_500,
+        )
+        .unwrap();
+    assert!(!short.valid);
+    // The reservation is atomic: a partially supplied seller holds nothing —
+    // the 4 passes are still free, and none of the promised 10 are locked.
+    assert_eq!(core.balance(10, Asset::Pass { market_id: MARKET }).held, 0);
+    assert_eq!(
+        core.balance(10, Asset::Pass { market_id: MARKET })
+            .available,
+        4
+    );
     core.check_invariants().unwrap();
 }

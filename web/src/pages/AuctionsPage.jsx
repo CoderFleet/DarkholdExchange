@@ -10,6 +10,8 @@ import {
   createBatchAuction,
   commitBatchBid,
   revealBatchBid,
+  commitBatchAsk,
+  revealBatchAsk,
   settleBatchAuction,
 } from '../api'
 import { formatPrice, formatQty } from '../format'
@@ -69,14 +71,12 @@ export function AuctionsPage() {
     durationSeconds: '60',
   })
 
-  // Form for Batch
+  // Form for Batch (admin/issuer only: schedule a pooled clearing window)
   const [batchForm, setBatchForm] = useState({
     marketId: '',
-    qty: '10',
     floorTicks: '',
     commitSeconds: '30',
     revealSeconds: '30',
-    sellerUsername: '',
   })
 
   // Bid state for Batch: { [auctionId]: { priceTicks, qty, commitmentHex, saltHex } }
@@ -223,7 +223,7 @@ export function AuctionsPage() {
   const handleCreateBatch = async (event) => {
     event.preventDefault()
     if (userId == null) {
-      setError('Log in to start a batch auction.')
+      setError('Log in to schedule a clearing window.')
       return
     }
     setBusy(true)
@@ -232,20 +232,15 @@ export function AuctionsPage() {
     try {
       const commitDurationMs = Number(batchForm.commitSeconds) * 1000
       const revealDurationMs = Number(batchForm.revealSeconds) * 1000
-      const sellerUsername = isAdmin ? batchForm.sellerUsername.trim() : ''
       const created = await createBatchAuction({
         client_order_id: nextClientOrderId(),
         market_id: Number(batchForm.marketId || selectedBatchMarket?.id),
-        qty: Number(batchForm.qty),
         floor_price_ticks: Number(batchForm.floorTicks),
         commit_duration_ms: commitDurationMs,
         reveal_duration_ms: revealDurationMs,
-        seller_username: sellerUsername || undefined,
       })
       setNotice(
-        sellerUsername
-          ? `Batch auction #${created.id} created for @${sellerUsername}, Commit phase.`
-          : `Batch auction #${created.id} is created in Commit phase.`,
+        `Clearing window #${created.id} scheduled. Sellers and buyers can now commit sealed orders into the pool.`,
       )
       await load()
     } catch (nextError) {
@@ -257,10 +252,11 @@ export function AuctionsPage() {
 
   const handleCommitBid = async (auction) => {
     if (userId == null) {
-      setError('Log in to commit a bid.')
+      setError('Log in to commit a sealed order.')
       return
     }
     const currentBid = batchBidsState[auction.id]
+    const side = currentBid?.side === 'sell' ? 'sell' : 'buy'
     const priceTicks = Number(currentBid?.priceTicks || auction.floor_price_ticks)
     const qty = Number(currentBid?.qty || 1)
 
@@ -272,20 +268,32 @@ export function AuctionsPage() {
       const { commitmentHex, saltHex } = await computeCommitment(priceTicks, qty, salt)
       const clientOrderId = nextClientOrderId()
 
-      await commitBatchBid(auction.id, {
-        client_order_id: clientOrderId,
-        commitment: commitmentHex,
-      })
+      if (side === 'sell') {
+        await commitBatchAsk(auction.id, {
+          client_order_id: clientOrderId,
+          commitment: commitmentHex,
+        })
+      } else {
+        await commitBatchBid(auction.id, {
+          client_order_id: clientOrderId,
+          commitment: commitmentHex,
+        })
+      }
 
       saveBatchBidState(auction.id, {
         clientOrderId,
         priceTicks,
         qty,
+        side,
         commitmentHex,
         saltHex,
         committed: true,
       })
-      setNotice(`Sealed bid committed for Batch Auction #${auction.id}! Keep secret until reveal phase.`)
+      setNotice(
+        side === 'sell'
+          ? `Sealed ask committed for Batch Auction #${auction.id}! Your passes reserve at reveal.`
+          : `Sealed bid committed for Batch Auction #${auction.id}! Keep secret until reveal phase.`,
+      )
       await load()
     } catch (nextError) {
       setError(nextError.message)
@@ -296,12 +304,12 @@ export function AuctionsPage() {
 
   const handleRevealBid = async (auction) => {
     if (userId == null) {
-      setError('Log in to reveal a bid.')
+      setError('Log in to reveal your sealed order.')
       return
     }
     const currentBid = batchBidsState[auction.id]
     if (!currentBid?.committed || !currentBid?.saltHex) {
-      setError('No committed bid found for this auction.')
+      setError('No committed sealed order found for this auction.')
       return
     }
 
@@ -309,15 +317,24 @@ export function AuctionsPage() {
     setError(null)
     setNotice(null)
     try {
-      await revealBatchBid(auction.id, {
+      const reveal = {
         client_order_id: currentBid.clientOrderId,
         price_ticks: currentBid.priceTicks,
         qty: currentBid.qty,
         salt: currentBid.saltHex,
-      })
+      }
+      if (currentBid.side === 'sell') {
+        await revealBatchAsk(auction.id, reveal)
+      } else {
+        await revealBatchBid(auction.id, reveal)
+      }
 
       saveBatchBidState(auction.id, { revealed: true })
-      setNotice(`Bid revealed for Batch Auction #${auction.id}! Cash collateral reserved.`)
+      setNotice(
+        currentBid.side === 'sell'
+          ? `Ask revealed for Batch Auction #${auction.id}! Passes are reserved until clearing.`
+          : `Bid revealed for Batch Auction #${auction.id}! Cash collateral reserved.`,
+      )
       await load()
     } catch (nextError) {
       setError(nextError.message)
@@ -612,8 +629,8 @@ export function AuctionsPage() {
             <div className="auction-grid">
               {batchAuctions.map((auction) => {
                 const market = marketsById.get(auction.market_id)
-                const isSeller = auction.seller_id === userId
                 const savedBid = batchBidsState[auction.id] || {}
+                const savedSide = savedBid.side === 'sell' ? 'sell' : 'buy'
 
                 // Phase time calculation
                 const commitRemainingMs = Math.max(0, auction.commit_end_ms - nowMs)
@@ -629,10 +646,12 @@ export function AuctionsPage() {
                       </span>
                     </header>
                     <dl>
-                      <div>
-                        <dt>Total supply</dt>
-                        <dd>{formatQty(auction.qty_total)} passes</dd>
-                      </div>
+                      {auction.qty_total != null && (
+                        <div>
+                          <dt>Pooled supply</dt>
+                          <dd>{formatQty(auction.qty_total)} passes</dd>
+                        </div>
+                      )}
                       <div>
                         <dt>Floor price</dt>
                         <dd>{formatPrice(market, auction.floor_price_ticks)}</dd>
@@ -655,12 +674,30 @@ export function AuctionsPage() {
                       )}
                     </dl>
 
-                    {/* Commit Phase Action */}
-                    {auction.phase === 'commit' && !isSeller && (
+                    {/* Commit Phase Action — everyone can bid, everyone can ask */}
+                    {auction.phase === 'commit' && (
                       <div className="batch-bid-actions">
+                        <div className="batch-side-toggle" role="radiogroup" aria-label="Order side">
+                          <button
+                            type="button"
+                            className={savedSide === 'buy' ? 'active' : ''}
+                            disabled={busy || savedBid.committed}
+                            onClick={() => saveBatchBidState(auction.id, { side: 'buy' })}
+                          >
+                            Buy (bid)
+                          </button>
+                          <button
+                            type="button"
+                            className={savedSide === 'sell' ? 'active' : ''}
+                            disabled={busy || savedBid.committed}
+                            onClick={() => saveBatchBidState(auction.id, { side: 'sell' })}
+                          >
+                            Sell (ask)
+                          </button>
+                        </div>
                         <div className="batch-bid-inputs">
                           <label>
-                            Price (ticks)
+                            {savedSide === 'sell' ? 'Min price (ticks)' : 'Price (ticks)'}
                             <input
                               type="number"
                               min="1"
@@ -672,7 +709,7 @@ export function AuctionsPage() {
                             />
                           </label>
                           <label>
-                            Quantity
+                            {savedSide === 'sell' ? 'Passes to sell' : 'Quantity'}
                             <input
                               type="number"
                               placeholder="Qty"
@@ -690,19 +727,29 @@ export function AuctionsPage() {
                             disabled={busy || savedBid.committed}
                             onClick={() => handleCommitBid(auction)}
                           >
-                            {savedBid.committed ? 'Sealed Bid Committed' : 'Commit Sealed Bid (SHA-256)'}
+                            {savedBid.committed
+                              ? savedSide === 'sell'
+                                ? 'Sealed Ask Committed'
+                                : 'Sealed Bid Committed'
+                              : savedSide === 'sell'
+                                ? 'Commit Sealed Ask (SHA-256)'
+                                : 'Commit Sealed Bid (SHA-256)'}
                           </button>
                         ) : (
                           <div className="auction-guest">
-                            <p>Log in to commit a sealed bid.</p>
+                            <p>Log in to commit a sealed order into this window.</p>
                             <Link to="/login" state={{ from: '/auctions' }}>Log in</Link>
                           </div>
                         )}
+                        <p className="auction-hint">
+                          One sealed order per side per account. Buyers reserve cash and sellers
+                          reserve passes when they reveal — nothing locks up during commit.
+                        </p>
                       </div>
                     )}
 
                     {/* Reveal Phase Action */}
-                    {auction.phase === 'reveal' && !isSeller && (
+                    {auction.phase === 'reveal' && (
                       <div className="auction-actions">
                         <button
                           type="button"
@@ -710,7 +757,9 @@ export function AuctionsPage() {
                           onClick={() => handleRevealBid(auction)}
                         >
                           {savedBid.revealed
-                            ? 'Bid Revealed'
+                            ? savedSide === 'sell'
+                              ? 'Ask Revealed'
+                              : 'Bid Revealed'
                             : savedBid.committed
                               ? 'Reveal Pre-Image'
                               : 'No Commit Made'}
@@ -733,14 +782,11 @@ export function AuctionsPage() {
 
                     {auction.phase === 'settled' && (
                       <div className="auction-settled-badge">
-                        <span>✓</span> Settled • Remaining: {formatQty(auction.qty_remaining)}
+                        <span>✓</span> Settled
+                        {auction.qty_remaining != null && (
+                          <> • Unsold: {formatQty(auction.qty_remaining)}</>
+                        )}
                       </div>
-                    )}
-
-                    {isSeller && (
-                      <p className="auction-hint">
-                        You are selling this window — your passes are reserved until clearing.
-                      </p>
                     )}
                   </article>
                 )
@@ -751,12 +797,11 @@ export function AuctionsPage() {
           {userId ? (
             <section className="auction-panel">
               <div className="panel-header">
-                <h3>Create Batch Auction</h3>
-                <span className="panel-meta">
-                  {isAdmin ? 'Admin · can name a seller' : 'You are the seller'}
-                </span>
+                <h3>Schedule Clearing Window</h3>
+                <span className="panel-meta">{isAdmin ? 'Admin or Issuer only' : 'Unavailable for your role'}</span>
               </div>
-              <form className="auction-form" onSubmit={handleCreateBatch}>
+              {isAdmin ? (
+                <form className="auction-form" onSubmit={handleCreateBatch}>
                 <label>
                   Market
                   <select
@@ -769,28 +814,6 @@ export function AuctionsPage() {
                       </option>
                     ))}
                   </select>
-                </label>
-                {isAdmin && (
-                  <label>
-                    Seller username (optional)
-                    <input
-                      type="text"
-                      placeholder="e.g. trader1 — empty = your own passes"
-                      value={batchForm.sellerUsername}
-                      onChange={(e) =>
-                        setBatchForm((c) => ({ ...c, sellerUsername: e.target.value }))
-                      }
-                    />
-                  </label>
-                )}
-                <label>
-                  Total supply (passes)
-                  <input
-                    type="number"
-                    min="1"
-                    value={batchForm.qty}
-                    onChange={(e) => setBatchForm((c) => ({ ...c, qty: e.target.value }))}
-                  />
                 </label>
                 <label>
                   Floor price (ticks)
@@ -819,14 +842,21 @@ export function AuctionsPage() {
                   />
                 </label>
                 <button type="submit" disabled={busy || !selectedBatchMarket}>
-                  {busy ? 'Working…' : 'Create Batch Auction'}
+                  {busy ? 'Working…' : 'Schedule Window'}
                 </button>
-              </form>
-              {selectedBatchMarket && (
+                </form>
+              ) : (
+                <p className="auction-hint">
+                  Clearing windows are scheduled by the exchange. When one opens for a market you
+                  trade, submit a sealed bid (to buy) or a sealed ask (to sell) from the window card
+                  above — no inventory is needed to schedule, and no one picks their own timing.
+                </p>
+              )}
+              {isAdmin && selectedBatchMarket && (
                 <p className="auction-hint">
                   {selectedBatchMarket.name}: collar {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).floor)}{' '}
-                  – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. The seller's passes are
-                  reserved at creation — a short inventory is rejected, nothing is minted.
+                  – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. The window holds no supply of
+                  its own — sellers enter sealed asks and their passes reserve at reveal; nothing is minted.
                 </p>
               )}
             </section>
@@ -834,12 +864,14 @@ export function AuctionsPage() {
             <section className="auction-panel batch-info-panel">
               <div className="panel-header">
                 <h3>How Batch Auctions Work</h3>
-                <span className="panel-meta">Commit-Reveal · Uniform Price</span>
+                <span className="panel-meta">Pooled Window · Commit-Reveal · Uniform Price</span>
               </div>
               <p className="auction-hint">
-                Log in to create a batch auction on your own pass inventory. Buyers submit sealed SHA-256 bids during
-                the commit window, then simultaneously reveal them. The engine finds the uniform clearing price that
-                maximises matched volume — no front-running, no timing advantage.
+                Log in to take part in a pooled clearing window. The exchange schedules one window
+                per market; every seller commits a sealed SHA-256 ask and every buyer a sealed bid
+                during the commit phase, then both sides reveal simultaneously. The engine clears
+                everything at the one uniform price that maximises traded volume — no front-running,
+                and no seller can pick their own timing.
               </p>
               <div className="batch-phases">
                 <span className="batch-phase-chip">1 · Commit</span>

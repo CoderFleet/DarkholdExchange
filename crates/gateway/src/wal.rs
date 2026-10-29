@@ -11,8 +11,9 @@ use dkx_hash::AuditRecord;
 use dkx_wal::{LogRecord, Wal};
 use dx_core::Core;
 use dx_types::{
-    AcceptDutchAuction, ClientOrderId, Command, CommitBid, CreateBatchAuction, CreateDutchAuction,
-    Fill, MarketConfig, MarketId, Minor, Qty, RevealBid, SettleBatchAuction, TradeId, UserId,
+    AcceptDutchAuction, ClientOrderId, Command, CommitAsk, CommitBid, CreateBatchAuction,
+    CreateDutchAuction, Fill, MarketConfig, MarketId, Minor, Qty, RevealAsk, RevealBid,
+    SettleBatchAuction, TradeId, UserId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -87,7 +88,7 @@ pub(crate) enum WalOp {
         now_ms: u64,
     },
     CreateBatchAuction {
-        seller_id: UserId,
+        created_by: UserId,
         request: CreateBatchAuction,
         now_ms: u64,
     },
@@ -99,6 +100,16 @@ pub(crate) enum WalOp {
     RevealBatchBid {
         bidder_id: UserId,
         request: RevealBid,
+        now_ms: u64,
+    },
+    CommitBatchAsk {
+        seller_id: UserId,
+        request: CommitAsk,
+        now_ms: u64,
+    },
+    RevealBatchAsk {
+        seller_id: UserId,
+        request: RevealAsk,
         now_ms: u64,
     },
     SettleBatchAuction {
@@ -381,11 +392,11 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
                 .map_err(|reason| format!("WAL auction expire replay rejected: {reason:?}"))?;
         }
         WalOp::CreateBatchAuction {
-            seller_id,
+            created_by,
             request,
             now_ms,
         } => {
-            core.create_batch_auction(*seller_id, request.clone(), *now_ms)
+            core.create_batch_auction(*created_by, request.clone(), *now_ms)
                 .map_err(|reason| {
                     format!("WAL batch auction create replay rejected: {reason:?}")
                 })?;
@@ -409,6 +420,22 @@ fn apply_op(core: &mut Core, op: &WalOp, recent_trades: &mut Vec<Fill>) -> Resul
                 .map_err(|reason| {
                     format!("WAL batch auction reveal replay rejected: {reason:?}")
                 })?;
+        }
+        WalOp::CommitBatchAsk {
+            seller_id,
+            request,
+            now_ms,
+        } => {
+            core.commit_batch_ask(*seller_id, request.clone(), *now_ms)
+                .map_err(|reason| format!("WAL batch ask commit replay rejected: {reason:?}"))?;
+        }
+        WalOp::RevealBatchAsk {
+            seller_id,
+            request,
+            now_ms,
+        } => {
+            core.reveal_batch_ask(*seller_id, request.clone(), *now_ms)
+                .map_err(|reason| format!("WAL batch ask reveal replay rejected: {reason:?}"))?;
         }
         WalOp::SettleBatchAuction {
             caller_id,

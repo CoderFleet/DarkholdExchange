@@ -33,6 +33,6 @@ qty: number | null,
 filled_qty: number, 
 /**
  * `false` when the revealed pre-image did not match `commitment`, or
- * when the bid falls below `floor_price_ticks`.
+ * when the bid falls below `floor_price_ticks` or outside the collar.
  */
 valid: boolean, };

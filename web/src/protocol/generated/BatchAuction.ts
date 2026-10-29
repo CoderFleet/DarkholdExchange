@@ -10,23 +10,16 @@ export type BatchAuction = {
  */
 id: number, 
 /**
- * The market whose passes are being auctioned.
+ * The market whose passes this window pools.
  */
 market_id: number, 
 /**
- * Identity of the seller whose supply is reserved for this auction.
+ * The admin/issuer that scheduled the window (audit trail only; they have
+ * no supply of their own here).
  */
-seller_id: number, 
+created_by: number, 
 /**
- * Total supply entering the auction.
- */
-qty_total: number, 
-/**
- * Unsold remainder after settlement (`qty_total` until then).
- */
-qty_remaining: number, 
-/**
- * Minimum acceptable price; bids below this are invalid.
+ * Bids and asks below this price are invalid; collar-enforced at creation.
  */
 floor_price_ticks: number, 
 /**
@@ -44,4 +37,13 @@ clearing_price_ticks: number | null,
 /**
  * Current lifecycle phase.
  */
-phase: BatchAuctionPhase, };
+phase: BatchAuctionPhase, 
+/**
+ * Total quantity revealed by valid asks at settlement; `None` before settlement.
+ */
+qty_total: number | null, 
+/**
+ * Unsold quantity released back to the sellers after settlement; `None`
+ * before settlement.
+ */
+qty_remaining: number | null, };

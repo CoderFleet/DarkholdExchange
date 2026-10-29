@@ -26,12 +26,13 @@ use dkx_hash::AuditRecord;
 use dx_core::Core;
 use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
-    AcceptDutchAuction, AuctionStatus, Balance, BatchAuction, BatchAuctionFill, BatchAuctionPhase,
-    BidRecord, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse, CommitBid,
-    CreateBatchAuction, CreateDutchAuction, DutchAuction, ErrorBody, EscrowRecord, EscrowState,
-    Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor, OpenOrderView, OrderId,
-    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, SettleBatchAuction, Side,
-    Ticks, TradeId, UserId, WsClientMessage, WsServerMessage, seed_markets,
+    AcceptDutchAuction, AskRecord, AuctionStatus, Balance, BatchAuction, BatchAuctionFill,
+    BatchAuctionPhase, BidRecord, BookSnapshot, Cancel, ClientOrderId, Command, CommandResponse,
+    CommitAsk, CommitBid, CreateBatchAuction, CreateDutchAuction, DutchAuction, ErrorBody,
+    EscrowRecord, EscrowState, Fill, JournalResponse, MarketId, MarketView, MetricsSnapshot, Minor,
+    OpenOrderView, OrderId, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealAsk,
+    RevealBid, SettleBatchAuction, Side, Ticks, TradeId, UserId, WsClientMessage, WsServerMessage,
+    seed_markets,
 };
 use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
@@ -379,6 +380,18 @@ async fn main() {
         .route(
             "/api/batch-auctions/{auction_id}/bids",
             get(batch_auction_bids),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/asks",
+            get(batch_auction_asks),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/ask/commit",
+            post(batch_auction_ask_commit),
+        )
+        .route(
+            "/api/batch-auctions/{auction_id}/ask/reveal",
+            post(batch_auction_ask_reveal),
         )
         .route("/api/history", get(history_current))
         .route("/api/statements", get(statements_current))
@@ -1547,9 +1560,8 @@ struct BatchAuctionView {
     id: u64,
     market_id: MarketId,
     market_name: String,
-    seller_id: UserId,
-    qty_total: Qty,
-    qty_remaining: Qty,
+    /// The admin/issuer that scheduled this window.
+    created_by: UserId,
     floor_price_ticks: Ticks,
     floor_price_minor: Minor,
     commit_end_ms: u64,
@@ -1557,6 +1569,9 @@ struct BatchAuctionView {
     clearing_price_ticks: Option<Ticks>,
     clearing_price_minor: Option<Minor>,
     phase: BatchAuctionPhase,
+    /// Aggregated over valid revealed asks; `None` before settlement.
+    qty_total: Option<Qty>,
+    qty_remaining: Option<Qty>,
 }
 
 fn batch_auction_view(auction: &BatchAuction, markets: &[MarketView]) -> BatchAuctionView {
@@ -1583,9 +1598,7 @@ fn batch_auction_view(auction: &BatchAuction, markets: &[MarketView]) -> BatchAu
         id: auction.id,
         market_id: auction.market_id,
         market_name,
-        seller_id: auction.seller_id,
-        qty_total: auction.qty_total,
-        qty_remaining: auction.qty_remaining,
+        created_by: auction.created_by,
         floor_price_ticks: auction.floor_price_ticks,
         floor_price_minor,
         commit_end_ms: auction.commit_end_ms,
@@ -1593,6 +1606,8 @@ fn batch_auction_view(auction: &BatchAuction, markets: &[MarketView]) -> BatchAu
         clearing_price_ticks: auction.clearing_price_ticks,
         clearing_price_minor,
         phase: auction.phase.clone(),
+        qty_total: auction.qty_total,
+        qty_remaining: auction.qty_remaining,
     }
 }
 
@@ -1641,56 +1656,39 @@ async fn batch_auction_get(
 struct CreateBatchAuctionPayload {
     client_order_id: ClientOrderId,
     market_id: MarketId,
-    qty: Qty,
     floor_price_ticks: Ticks,
     commit_duration_ms: u64,
     reveal_duration_ms: u64,
-    /// Admin/issuer only: run the window on another user's inventory instead
-    /// of the caller's. The seller must hold the passes; nothing is minted.
-    seller_username: Option<String>,
 }
 
+/// Only admin/issuer schedule the window: a seller picking the start time
+/// could prearrange bots or friends, and the whole point of the shared window
+/// is fairness. Supply enters through sealed asks, never through the scheduler,
+/// so nothing is minted here.
 async fn batch_auction_create(
     State(state): State<AppState>,
     headers: HeaderMap,
     payload: Result<Json<CreateBatchAuctionPayload>, JsonRejection>,
 ) -> Result<Json<BatchAuctionView>, ApiError> {
-    let (caller_id, role) = match identify(&state.auth, &headers)? {
-        Caller::Token { user_id, role } => (user_id, role),
-        Caller::Dev(user_id) => (user_id, dx_auth::Role::Admin),
+    let created_by = match identify(&state.auth, &headers)? {
+        Caller::Token {
+            role: dx_auth::Role::Admin | dx_auth::Role::Issuer,
+            user_id,
+        } => user_id,
+        Caller::Dev(user_id) => user_id,
+        _ => return Err(forbidden()),
     };
     let body = json_body(payload)?;
-
-    // Any signed-in user can auction their own passes; only admin/issuer may
-    // schedule a window on a named seller's inventory.
-    let seller_id = match body.seller_username.as_deref() {
-        None => caller_id,
-        Some(username) => {
-            if role != dx_auth::Role::Admin && role != dx_auth::Role::Issuer {
-                return Err(forbidden());
-            }
-            state
-                .auth
-                .user_id_of(username)
-                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownUser))?
-        }
-    };
-
     let request = CreateBatchAuction {
         client_order_id: body.client_order_id,
         market_id: body.market_id,
-        qty: body.qty,
         floor_price_ticks: body.floor_price_ticks,
         commit_duration_ms: body.commit_duration_ms,
         reveal_duration_ms: body.reveal_duration_ms,
     };
-
-    // No sponsorship mint: the seller's passes are reserved at creation, and a
-    // short inventory fails with InsufficientInventory instead of inventing
-    // supply.
     let auction = state
         .writer
-        .create_batch_auction(seller_id, request, now_ms())
+        .create_batch_auction(created_by, request, now_ms())
         .await
         .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
@@ -1736,6 +1734,92 @@ async fn batch_auction_commit(
         .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
     Ok(Json(record))
+}
+
+/// Seller side of the sealed window: submit an ask commitment. The payload is
+/// identical to the bid side — same SHA-256 pre-image, salt and hex handling —
+/// only the ledger reserve at reveal differs (passes instead of cash).
+async fn batch_auction_ask_commit(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<CommitBatchPayload>, JsonRejection>,
+) -> Result<Json<AskRecord>, ApiError> {
+    let seller_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let bytes = hex::decode(body.commitment.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
+    if bytes.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
+    }
+    let mut commitment = [0u8; 32];
+    commitment.copy_from_slice(&bytes);
+
+    let request = CommitAsk {
+        client_order_id: body.client_order_id,
+        auction_id,
+        commitment,
+    };
+    let at_ms = now_ms();
+    let record = state
+        .writer
+        .commit_batch_ask(seller_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(record))
+}
+
+/// Seller side reveal: on a valid pre-image the seller's passes are reserved.
+async fn batch_auction_ask_reveal(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    payload: Result<Json<RevealBatchPayload>, JsonRejection>,
+) -> Result<Json<AskRecord>, ApiError> {
+    let seller_id = caller_user(&state, &headers)?;
+    let body = json_body(payload)?;
+    let bytes = hex::decode(body.salt.trim())
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, ReasonCode::InvalidRequest))?;
+    if bytes.len() != 32 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            ReasonCode::InvalidRequest,
+        ));
+    }
+    let mut salt = [0u8; 32];
+    salt.copy_from_slice(&bytes);
+
+    let request = RevealAsk {
+        client_order_id: body.client_order_id,
+        auction_id,
+        price_ticks: body.price_ticks,
+        qty: body.qty,
+        salt,
+    };
+    let at_ms = now_ms();
+    let record = state
+        .writer
+        .reveal_batch_ask(seller_id, request, at_ms)
+        .await
+        .map_err(writer_error)?
+        .map_err(|reason| api_error(status_for_reason(reason), reason))?;
+    Ok(Json(record))
+}
+
+async fn batch_auction_asks(
+    Path(auction_id): Path<u64>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<AskRecord>>, ApiError> {
+    let asks = state
+        .writer
+        .batch_asks(auction_id)
+        .await
+        .map_err(writer_error)?;
+    Ok(Json(asks))
 }
 
 #[derive(Deserialize)]
@@ -3287,29 +3371,16 @@ mod tests {
 
     fn batch_payload(
         client_order_id: ClientOrderId,
-        qty: Qty,
-        seller_username: Option<&str>,
+        market_id: MarketId,
+        floor: Ticks,
     ) -> CreateBatchAuctionPayload {
         CreateBatchAuctionPayload {
             client_order_id,
-            market_id: MARKET,
-            qty,
-            floor_price_ticks: PRICE,
+            market_id,
+            floor_price_ticks: floor,
             commit_duration_ms: 5_000,
             reveal_duration_ms: 5_000,
-            seller_username: seller_username.map(str::to_owned),
         }
-    }
-
-    async fn pass_held(state: &AppState, user_id: UserId) -> (i64, i64) {
-        let balances = state.writer.balances(user_id).await.unwrap();
-        let entry = balances
-            .iter()
-            .find(|b| b.asset == dx_types::Asset::Pass { market_id: MARKET });
-        (
-            entry.map(|b| b.available).unwrap_or(0),
-            entry.map(|b| b.held).unwrap_or(0),
-        )
     }
 
     fn bearer(auth: &dx_auth::AuthState, user_id: UserId, role: dx_auth::Role) -> HeaderMap {
@@ -3317,73 +3388,43 @@ mod tests {
         headers(&[("authorization", &format!("Bearer {token}"))])
     }
 
-    /// Batch auctions are seller-backed: the caller auctions their own passes,
-    /// and a short inventory is rejected instead of minting new supply.
+    /// Windows are scheduled by admin/issuer only; the scheduler holds no
+    /// supply, so scheduling never mints anything and users cannot start
+    /// windows of their own.
     #[tokio::test]
-    async fn batch_create_is_seller_backed_and_never_mints() {
+    async fn batch_window_is_admin_scheduled_with_no_sponsorship_mint() {
         let (state, _rx) = test_state();
-        state
-            .auth
-            .seed_user(2, "seller2", "pw", dx_auth::Role::User);
 
-        // test_state gives user 2 five passes and no passes to user 1.
+        // Issuer schedules a pooled window; no inventory is reserved anywhere.
         let Json(view) = batch_auction_create(
             State(state.clone()),
-            bearer(&state.auth, 2, dx_auth::Role::User),
-            Ok(Json(batch_payload(5001, 3, None))),
+            bearer(&state.auth, 2, dx_auth::Role::Issuer),
+            Ok(Json(batch_payload(5001, MARKET, PRICE))),
         )
         .await
         .unwrap();
-        assert_eq!(view.seller_id, 2);
-        assert_eq!(pass_held(&state, 2).await, (2, 3));
+        assert_eq!(view.created_by, 2);
+        assert!(view.qty_total.is_none());
+        for user_id in [1, 2, 3] {
+            let balances = state.writer.balances(user_id).await.unwrap();
+            assert!(
+                balances
+                    .iter()
+                    .all(|b| b.asset != dx_types::Asset::Pass { market_id: MARKET } || b.held == 0),
+                "scheduling must not move any passes"
+            );
+        }
 
-        // User 1 holds only cash: no auction, and importantly no mint.
+        // An ordinary user cannot schedule a window.
         let error = batch_auction_create(
             State(state.clone()),
             bearer(&state.auth, 1, dx_auth::Role::User),
-            Ok(Json(batch_payload(5010, 1, None))),
+            Ok(Json(batch_payload(5002, MARKET, PRICE))),
         )
         .await
         .err()
         .unwrap();
-        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(error.body.0.reason, ReasonCode::InsufficientInventory);
-        assert_eq!(pass_held(&state, 1).await, (0, 0));
-
-        // A named seller for an admin resolves to that user's inventory and
-        // never touches the admin's balance.
-        let Json(view) = batch_auction_create(
-            State(state.clone()),
-            bearer(&state.auth, 3, dx_auth::Role::Admin),
-            Ok(Json(batch_payload(5002, 2, Some("seller2")))),
-        )
-        .await
-        .unwrap();
-        assert_eq!(view.seller_id, 2);
-        // 3 reserved by the first auction, 2 now; nothing held against admin.
-        assert_eq!(pass_held(&state, 2).await, (0, 5));
-        assert_eq!(pass_held(&state, 3).await, (0, 0));
-
-        let unknown = batch_auction_create(
-            State(state.clone()),
-            bearer(&state.auth, 3, dx_auth::Role::Admin),
-            Ok(Json(batch_payload(5003, 1, Some("ghost")))),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
-        assert_eq!(unknown.body.0.reason, ReasonCode::UnknownUser);
-
-        let non_admin = batch_auction_create(
-            State(state.clone()),
-            bearer(&state.auth, 1, dx_auth::Role::User),
-            Ok(Json(batch_payload(5004, 1, Some("seller2")))),
-        )
-        .await
-        .err()
-        .unwrap();
-        assert_eq!(non_admin.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 }
 

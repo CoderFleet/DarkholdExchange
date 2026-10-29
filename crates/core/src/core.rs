@@ -15,12 +15,12 @@ use std::collections::HashMap;
 use dx_engine::{Engine, PlaceOutcome};
 use dx_ledger::{Ledger, LedgerError, Owner, TradeSettlement};
 use dx_types::{
-    AcceptDutchAuction, Asset, AuctionAccept, AuctionStatus, Balance, BatchAuction,
+    AcceptDutchAuction, AskRecord, Asset, AuctionAccept, AuctionStatus, Balance, BatchAuction,
     BatchAuctionFill, BatchAuctionPhase, BidRecord, BookDelta, BookSnapshot, Cancel, ClientOrderId,
-    Command, CommandResponse, CommitBid, CreateBatchAuction, CreateDutchAuction, DeliveryReceipt,
-    DutchAuction, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId, MarketStatus, Minor,
-    OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealBid, Seq, SettleBatchAuction,
-    Side, Ticks, TradeId, UserId,
+    Command, CommandResponse, CommitAsk, CommitBid, CreateBatchAuction, CreateDutchAuction,
+    DeliveryReceipt, DutchAuction, EscrowRecord, EscrowState, Fill, MarketConfig, MarketId,
+    MarketStatus, Minor, OrderStatus, PlaceLimit, PlaceMarket, Qty, ReasonCode, RevealAsk,
+    RevealBid, Seq, SettleBatchAuction, Side, Ticks, TradeId, UserId,
 };
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -78,11 +78,17 @@ pub struct Core {
     next_batch_auction_id: u64,
     /// Bids submitted for batch auctions: (auction_id, bidder_id, client_order_id) -> BidRecord.
     batch_bids: HashMap<(u64, UserId, ClientOrderId), BidRecord>,
+    /// Asks submitted for batch auctions: (auction_id, seller_id, client_order_id) -> AskRecord.
+    batch_asks: HashMap<(u64, UserId, ClientOrderId), AskRecord>,
     /// Commit idempotency: (bidder, client_order_id) -> (auction_id, commitment)
     batch_commits: HashMap<(UserId, ClientOrderId), u64>,
+    /// Ask-commit idempotency: (seller, client_order_id) -> auction_id
+    batch_ask_commits: HashMap<(UserId, ClientOrderId), u64>,
     /// Reveal idempotency: (bidder, client_order_id) -> auction_id
     batch_reveals: HashMap<(UserId, ClientOrderId), u64>,
-    /// Batch auction creates idempotency: (seller, client_order_id) -> auction_id
+    /// Ask-reveal idempotency: (seller, client_order_id) -> auction_id
+    batch_ask_reveals: HashMap<(UserId, ClientOrderId), u64>,
+    /// Batch auction creates idempotency: (creator, client_order_id) -> auction_id
     batch_creates: HashMap<(UserId, ClientOrderId), u64>,
     /// Batch settlements: (auction_id) -> Vec<BatchAuctionFill>
     batch_settlements: HashMap<u64, Vec<BatchAuctionFill>>,
@@ -130,6 +136,10 @@ impl CommandOutcome {
     }
 }
 
+/// A batch settlement plan: each winning bid with the ask fills assigned to
+/// it, in deterministic descending-bid / ascending-ask order.
+type BatchAllocations = Vec<(BidRecord, Vec<((UserId, ClientOrderId), Qty)>)>;
+
 impl Core {
     pub fn new(markets: Vec<MarketConfig>) -> Result<Self, String> {
         let engine = Engine::new(markets.clone())?;
@@ -154,8 +164,11 @@ impl Core {
             batch_auctions: HashMap::new(),
             next_batch_auction_id: 1,
             batch_bids: HashMap::new(),
+            batch_asks: HashMap::new(),
             batch_commits: HashMap::new(),
+            batch_ask_commits: HashMap::new(),
             batch_reveals: HashMap::new(),
+            batch_ask_reveals: HashMap::new(),
             batch_creates: HashMap::new(),
             batch_settlements: HashMap::new(),
             current_time_ms: 0,
@@ -1340,23 +1353,22 @@ impl Core {
     // Batch Auction (Commit-Reveal)
     // -----------------------------------------------------------------------
 
-    /// Create a seller-backed batch auction. The seller's passes are reserved immediately.
+    /// Schedule a pooled batch window for one market. No inventory is reserved
+    /// here — sellers enter sealed asks during the commit phase, and their
+    /// passes are reserved when they reveal.
     pub fn create_batch_auction(
         &mut self,
-        seller_id: UserId,
+        created_by: UserId,
         request: CreateBatchAuction,
         now_ms: u64,
     ) -> Result<BatchAuction, ReasonCode> {
-        let create_key = (seller_id, request.client_order_id);
+        let create_key = (created_by, request.client_order_id);
         if let Some(auction_id) = self.batch_creates.get(&create_key).copied()
             && let Some(existing) = self.batch_auctions.get(&auction_id)
         {
             return Ok(existing.clone());
         }
 
-        if request.qty == 0 {
-            return Err(ReasonCode::InvalidQuantity);
-        }
         if request.commit_duration_ms == 0 || request.reveal_duration_ms == 0 {
             return Err(ReasonCode::InvalidRequest);
         }
@@ -1370,37 +1382,19 @@ impl Core {
             return Err(ReasonCode::OutsideCollar);
         }
 
-        let Ok(qty) = i64::try_from(request.qty) else {
-            return Err(ReasonCode::InvalidQuantity);
-        };
-        if let Err(error) = self.ledger.reserve(
-            seller_id,
-            Asset::Pass {
-                market_id: market.id,
-            },
-            qty,
-        ) {
-            return Err(ledger_reason(
-                &error,
-                Asset::Pass {
-                    market_id: market.id,
-                },
-            ));
-        }
-
         let commit_end_ms = now_ms.saturating_add(request.commit_duration_ms);
         let reveal_end_ms = commit_end_ms.saturating_add(request.reveal_duration_ms);
         let auction = BatchAuction {
             id: self.next_batch_auction_id,
             market_id: market.id,
-            seller_id,
-            qty_total: request.qty,
-            qty_remaining: request.qty,
+            created_by,
             floor_price_ticks: request.floor_price_ticks,
             commit_end_ms,
             reveal_end_ms,
             clearing_price_ticks: None,
             phase: BatchAuctionPhase::Commit,
+            qty_total: None,
+            qty_remaining: None,
         };
         self.next_batch_auction_id = self.next_batch_auction_id.saturating_add(1);
         self.batch_auctions.insert(auction.id, auction.clone());
@@ -1409,7 +1403,7 @@ impl Core {
         Ok(auction)
     }
 
-    /// Submit a hash commitment during the commit phase.
+    /// Submit a bid hash commitment during the commit phase.
     pub fn commit_batch_bid(
         &mut self,
         bidder_id: UserId,
@@ -1431,9 +1425,6 @@ impl Core {
         if auction.phase != BatchAuctionPhase::Commit || now_ms >= auction.commit_end_ms {
             return Err(ReasonCode::AuctionPhaseMismatch);
         }
-        if bidder_id == auction.seller_id {
-            return Err(ReasonCode::SelfTrade);
-        }
 
         let record = BidRecord {
             bidder_id,
@@ -1450,6 +1441,48 @@ impl Core {
             record.clone(),
         );
         self.batch_commits.insert(commit_key, auction.id);
+        self.bump_state_version();
+        Ok(record)
+    }
+
+    /// Submit an ask hash commitment during the commit phase (seller side).
+    pub fn commit_batch_ask(
+        &mut self,
+        seller_id: UserId,
+        request: CommitAsk,
+        now_ms: u64,
+    ) -> Result<AskRecord, ReasonCode> {
+        let commit_key = (seller_id, request.client_order_id);
+        if let Some(existing_auction_id) = self.batch_ask_commits.get(&commit_key).copied()
+            && let Some(ask) =
+                self.batch_asks
+                    .get(&(existing_auction_id, seller_id, request.client_order_id))
+        {
+            return Ok(ask.clone());
+        }
+
+        let Some(auction) = self.batch_auctions.get(&request.auction_id) else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+        if auction.phase != BatchAuctionPhase::Commit || now_ms >= auction.commit_end_ms {
+            return Err(ReasonCode::AuctionPhaseMismatch);
+        }
+
+        let record = AskRecord {
+            seller_id,
+            client_order_id: request.client_order_id,
+            commitment: request.commitment,
+            price_ticks: None,
+            qty: None,
+            filled_qty: 0,
+            valid: true,
+        };
+
+        self.batch_asks.insert(
+            (auction.id, seller_id, request.client_order_id),
+            record.clone(),
+        );
+        self.batch_ask_commits.insert(commit_key, auction.id);
         self.bump_state_version();
         Ok(record)
     }
@@ -1535,7 +1568,107 @@ impl Core {
         Ok(result)
     }
 
+    /// Reveal an ask pre-image during the reveal phase (seller side).
+    ///
+    /// A matching, priced ask reserves the seller's passes right away, so a
+    /// fair settlement never needs passes the seller does not have. A short
+    /// inventory silently marks the ask invalid — the same treatment an
+    /// unaffordable cash reservation gets on the bid side.
+    pub fn reveal_batch_ask(
+        &mut self,
+        seller_id: UserId,
+        request: RevealAsk,
+        now_ms: u64,
+    ) -> Result<AskRecord, ReasonCode> {
+        let reveal_key = (seller_id, request.client_order_id);
+        if let Some(existing_auction_id) = self.batch_ask_reveals.get(&reveal_key).copied()
+            && let Some(ask) =
+                self.batch_asks
+                    .get(&(existing_auction_id, seller_id, request.client_order_id))
+        {
+            return Ok(ask.clone());
+        }
+
+        let Some(auction) = self.batch_auctions.get_mut(&request.auction_id) else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+        // Update phase to Reveal if past commit_end_ms
+        if now_ms >= auction.commit_end_ms && now_ms < auction.reveal_end_ms {
+            auction.phase = BatchAuctionPhase::Reveal;
+        }
+        if auction.phase != BatchAuctionPhase::Reveal {
+            return Err(ReasonCode::AuctionPhaseMismatch);
+        }
+
+        let Some(ask) = self
+            .batch_asks
+            .get_mut(&(auction.id, seller_id, request.client_order_id))
+        else {
+            return Err(ReasonCode::OrderNotFound);
+        };
+        if ask.client_order_id != request.client_order_id {
+            return Err(ReasonCode::InvalidRequest);
+        }
+
+        // Verify commitment: sha256(price_ticks_le8 || qty_le8 || salt32)
+        let preimage =
+            CommitBid::commitment_preimage(request.price_ticks, request.qty, &request.salt);
+        let mut hasher = Sha256::new();
+        hasher.update(preimage);
+        let expected_hash: [u8; 32] = hasher.finalize().into();
+
+        if expected_hash != ask.commitment {
+            ask.valid = false;
+            return Err(ReasonCode::InvalidCommitment);
+        }
+
+        // Verify collar and floor price
+        let Some(market) = self.markets.get(&auction.market_id) else {
+            return Err(ReasonCode::InternalError);
+        };
+        ask.valid = market.price_in_collar(request.price_ticks)
+            && request.price_ticks >= auction.floor_price_ticks;
+
+        ask.price_ticks = Some(request.price_ticks);
+        ask.qty = Some(request.qty);
+
+        // Reserve the seller's passes for valid asks
+        if ask.valid && request.qty > 0 {
+            let Ok(qty) = i64::try_from(request.qty) else {
+                ask.valid = false;
+                return Ok(ask.clone());
+            };
+            if self
+                .ledger
+                .reserve(
+                    seller_id,
+                    Asset::Pass {
+                        market_id: auction.market_id,
+                    },
+                    qty,
+                )
+                .is_err()
+            {
+                ask.valid = false;
+            }
+        } else {
+            ask.valid = false;
+        }
+
+        let result = ask.clone();
+        self.batch_ask_reveals.insert(reveal_key, auction.id);
+        self.bump_state_version();
+        Ok(result)
+    }
+
     /// Settle the batch auction at a single uniform price after reveal_end_ms.
+    ///
+    /// The clearing price maximises executable volume (highest such price);
+    /// winning bids are filled from the cheapest asks in deterministic order.
+    /// Bids pay `uniform_price * qty` plus the taker fee, sellers receive
+    /// `uniform_price * qty`, and every reservation is unwound exactly:
+    /// winners get their over-reservation released, losers the whole amount,
+    /// sellers the unsold part of their reserved passes.
     pub fn settle_batch_auction(
         &mut self,
         _caller_id: UserId,
@@ -1564,13 +1697,11 @@ impl Core {
 
         auction.phase = BatchAuctionPhase::Clearing;
         let market_id = auction.market_id;
-        let seller_id = auction.seller_id;
-        let total_supply = auction.qty_remaining;
         let Some(market) = self.markets.get(&market_id).cloned() else {
             return Err(ReasonCode::InternalError);
         };
 
-        // Gather all valid bids for this auction that were revealed
+        // Gather valid revealed orders on both sides of this window.
         let auction_id = auction.id;
         let mut valid_bids: Vec<_> = self
             .batch_bids
@@ -1578,149 +1709,266 @@ impl Core {
             .filter(|b| b.valid && b.price_ticks.is_some() && b.qty.is_some() && b.qty.unwrap() > 0)
             .cloned()
             .collect();
+        let mut valid_asks: Vec<_> = self
+            .batch_asks
+            .values()
+            .filter(|a| a.valid && a.price_ticks.is_some() && a.qty.is_some() && a.qty.unwrap() > 0)
+            .cloned()
+            .collect();
 
-        // Sort bids by price descending; ties broken by client_order_id ascending (deterministic)
+        // Sort bids by price descending; asks by price ascending; ties broken
+        // by client_order_id ascending (deterministic on both sides).
         valid_bids.sort_by(|a, b| {
             b.price_ticks
                 .unwrap()
                 .cmp(&a.price_ticks.unwrap())
                 .then_with(|| a.client_order_id.cmp(&b.client_order_id))
         });
+        valid_asks.sort_by(|a, b| {
+            a.price_ticks
+                .unwrap()
+                .cmp(&b.price_ticks.unwrap())
+                .then_with(|| a.client_order_id.cmp(&b.client_order_id))
+        });
 
-        // Determine uniform clearing price:
-        // Walk down valid bids accumulating demand until total_supply is satisfied.
-        let mut cum_demand: Qty = 0;
-        let mut clearing_price = None;
-        let mut winning_bids = Vec::new();
+        let total_revealed_supply: Qty = valid_asks.iter().map(|a| a.qty.unwrap()).sum();
 
-        for bid in &valid_bids {
-            let bid_price = bid.price_ticks.unwrap();
-            let bid_qty = bid.qty.unwrap();
-            cum_demand = cum_demand.saturating_add(bid_qty);
-            clearing_price = Some(bid_price);
-            winning_bids.push((bid.clone(), bid_qty));
-            if cum_demand >= total_supply {
-                break;
-            }
-        }
-
-        // If no bids or no supply allocated, expire auction and return seller inventory
-        if winning_bids.is_empty() || clearing_price.is_none() {
-            let refund_qty = if let Some(auc) = self.batch_auctions.get_mut(&auction_id) {
-                auc.phase = BatchAuctionPhase::Expired;
-                auc.qty_remaining
-            } else {
-                0
-            };
-            if refund_qty > 0 {
-                let _ = self.release_pass(seller_id, market_id, refund_qty);
-            }
-            // Release reserved cash for all bidders
-            for bid in valid_bids {
-                if let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty)
-                    && let Some(notional) = market.notional_minor(price, qty)
-                {
-                    let fee = market.taker_fee_minor(notional);
-                    if let Some(cash) = notional.checked_add(fee) {
-                        let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
-                    }
-                }
-            }
+        // No counterpart on at least one side: expire the window.
+        if valid_bids.is_empty() || valid_asks.is_empty() {
+            self.expire_batch_auction(auction_id, &market, &valid_bids, &valid_asks);
             self.batch_settlements.insert(auction_id, Vec::new());
             self.bump_state_version();
             return Ok(Vec::new());
         }
 
-        let uniform_price = clearing_price.unwrap();
-        let mut supply_left = total_supply;
-        let mut fills = Vec::new();
+        // Determine the uniform clearing price by testing each candidate
+        // price (the reveal prices of both sides, descending) with a dry
+        // pairing run: winning bids (price >= candidate) fill from the
+        // qualifying asks (price <= candidate, ascending, cheapest first), a
+        // user's bid never fills their own ask. The winning candidate is the
+        // one whose dry run maximises *executable* volume, with the higher
+        // price preferred on ties (seller-favourable). Testing with the real
+        // pairing rules keeps the selection consistent with what is later
+        // settled, so a price whose only trades would be self-trades never
+        // wins.
+        let mut candidates: Vec<_> = valid_bids
+            .iter()
+            .map(|b| b.price_ticks.unwrap())
+            .chain(valid_asks.iter().map(|a| a.price_ticks.unwrap()))
+            .collect();
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.reverse();
 
-        for (bid, wanted_qty) in winning_bids {
-            if supply_left == 0 {
-                break;
+        let mut best_volume: Qty = 0;
+        let mut best_price: Option<Ticks> = None;
+        let mut best_allocations: BatchAllocations = Vec::new();
+        let mut best_ask_remaining: HashMap<(UserId, ClientOrderId), Qty> = HashMap::new();
+        for &candidate in &candidates {
+            // Dry pairing at `candidate`.
+            let mut ask_remaining: HashMap<(UserId, ClientOrderId), Qty> = HashMap::new();
+            for ask in &valid_asks {
+                if ask.price_ticks.unwrap() <= candidate {
+                    ask_remaining.insert((ask.seller_id, ask.client_order_id), ask.qty.unwrap());
+                }
             }
-            let alloc_qty = wanted_qty.min(supply_left);
-            supply_left -= alloc_qty;
+            let mut allocations: BatchAllocations = Vec::new();
+            let mut volume: Qty = 0;
+            for bid in &valid_bids {
+                if bid.price_ticks.unwrap() < candidate {
+                    continue;
+                }
+                let mut pairs: Vec<((UserId, ClientOrderId), Qty)> = Vec::new();
+                let mut bid_left = bid.qty.unwrap();
+                for ask in &valid_asks {
+                    if bid_left == 0 {
+                        break;
+                    }
+                    if ask.price_ticks.unwrap() > candidate {
+                        break;
+                    }
+                    let ask_left =
+                        match ask_remaining.get_mut(&(ask.seller_id, ask.client_order_id)) {
+                            Some(left) if *left > 0 => *left,
+                            _ => continue,
+                        };
+                    if ask.seller_id == bid.bidder_id {
+                        continue;
+                    }
+                    let qty = bid_left.min(ask_left);
+                    let key = (ask.seller_id, ask.client_order_id);
+                    pairs.push((key, qty));
+                    *ask_remaining.get_mut(&key).unwrap() -= qty;
+                    bid_left -= qty;
+                    volume += qty;
+                }
+                allocations.push((bid.clone(), pairs));
+            }
+            if volume > best_volume {
+                best_volume = volume;
+                best_price = Some(candidate);
+                best_allocations = allocations;
+                best_ask_remaining = ask_remaining;
+            }
+        }
 
-            let Some(notional) = market.notional_minor(uniform_price, alloc_qty) else {
+        // No candidate produces an executable trade: expire the window.
+        if best_price.is_none() {
+            self.expire_batch_auction(auction_id, &market, &valid_bids, &valid_asks);
+            self.batch_settlements.insert(auction_id, Vec::new());
+            self.bump_state_version();
+            return Ok(Vec::new());
+        }
+        let uniform_price = best_price.unwrap();
+        let allocations = best_allocations;
+        let ask_remaining = best_ask_remaining;
+
+        // Execute the fills.
+        let mut filled_by_bid: HashMap<(UserId, ClientOrderId), Qty> = HashMap::new();
+        let mut fills: Vec<BatchAuctionFill> = Vec::new();
+        for (bid, pairs) in &allocations {
+            if pairs.is_empty() {
                 continue;
-            };
-            let fee = market.taker_fee_minor(notional);
-            let trade_id = self.engine.alloc_trade_id();
-
-            // Release the difference between the max bid price reserved and uniform price settled
-            let bid_price = bid.price_ticks.unwrap();
-            let bid_qty = bid.qty.unwrap();
-            let reserved_notional = market.notional_minor(bid_price, bid_qty).unwrap_or(0);
-            let reserved_fee = market.taker_fee_minor(reserved_notional);
-            let total_reserved = reserved_notional.saturating_add(reserved_fee);
-            let actual_needed = notional.saturating_add(fee);
-            let excess = total_reserved.saturating_sub(actual_needed);
-            if excess > 0 {
-                let _ = self.ledger.release(bid.bidder_id, Asset::Cash, excess);
             }
-
-            let settlement = TradeSettlement {
-                trade_id,
-                market_id,
-                buyer_id: bid.bidder_id,
-                seller_id,
-                qty: alloc_qty,
-                notional,
-                fee,
-                fee_payer: bid.bidder_id,
-                escrow: false,
-            };
-
-            if self.ledger.settle_trade(settlement).is_ok() {
+            let mut filled: Qty = 0;
+            for ((seller_id, ask_order_id), qty) in pairs {
+                let Some(notional) = market.notional_minor(uniform_price, *qty) else {
+                    continue;
+                };
+                let fee = market.taker_fee_minor(notional);
+                let trade_id = self.engine.alloc_trade_id();
+                let settlement = TradeSettlement {
+                    trade_id,
+                    market_id,
+                    buyer_id: bid.bidder_id,
+                    seller_id: *seller_id,
+                    qty: *qty,
+                    notional,
+                    fee,
+                    fee_payer: bid.bidder_id,
+                    escrow: false,
+                };
+                if self.ledger.settle_trade(settlement).is_err() {
+                    continue;
+                }
                 fills.push(BatchAuctionFill {
                     auction_id,
                     trade_id,
                     market_id,
                     buyer_id: bid.bidder_id,
-                    seller_id,
-                    qty: alloc_qty,
+                    seller_id: *seller_id,
+                    qty: *qty,
                     price_ticks: uniform_price,
                     notional,
                     fee,
                 });
-                if let Some(stored_bid) =
+                filled += qty;
+                if let Some(stored_ask) =
+                    self.batch_asks
+                        .get_mut(&(auction_id, *seller_id, *ask_order_id))
+                {
+                    stored_ask.filled_qty += qty;
+                }
+            }
+            filled_by_bid.insert((bid.bidder_id, bid.client_order_id), filled);
+            if filled > 0
+                && let Some(stored_bid) =
                     self.batch_bids
                         .get_mut(&(auction_id, bid.bidder_id, bid.client_order_id))
-                {
-                    stored_bid.filled_qty = alloc_qty;
-                }
-            }
-        }
-
-        // Release cash for losing bids
-        let winning_user_ids: std::collections::HashSet<_> =
-            fills.iter().map(|f| f.buyer_id).collect();
-        for bid in &valid_bids {
-            if !winning_user_ids.contains(&bid.bidder_id)
-                && let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty)
-                && let Some(notional) = market.notional_minor(price, qty)
             {
-                let fee = market.taker_fee_minor(notional);
-                if let Some(cash) = notional.checked_add(fee) {
-                    let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
+                stored_bid.filled_qty = filled;
+            }
+        }
+
+        // Return whatever the pool did not buy to each seller.
+        let mut unsold_total: Qty = 0;
+        for ask in &valid_asks {
+            let remaining = if ask.price_ticks.unwrap() > uniform_price {
+                // Never qualified for clearing: fully unsold.
+                ask.qty.unwrap()
+            } else {
+                ask_remaining
+                    .get(&(ask.seller_id, ask.client_order_id))
+                    .copied()
+                    .unwrap_or(ask.qty.unwrap())
+            };
+            if remaining > 0 {
+                let _ = self.release_pass(ask.seller_id, market_id, remaining);
+            }
+            unsold_total = unsold_total.saturating_add(remaining);
+        }
+
+        // Unwind every bid reservation: winners release the part of their
+        // reservation the pool did not consume (they reserved at their bid
+        // price for the whole bid, but the trade settled the filled part at
+        // the uniform price); losers release the whole reservation.
+        for bid in &valid_bids {
+            let Some(reserved) = market.notional_minor(bid.price_ticks.unwrap(), bid.qty.unwrap())
+            else {
+                continue;
+            };
+            let reserved_cash = reserved
+                .checked_add(market.taker_fee_minor(reserved))
+                .unwrap_or(reserved);
+            let filled = filled_by_bid
+                .get(&(bid.bidder_id, bid.client_order_id))
+                .copied()
+                .unwrap_or(0);
+            if filled == 0 {
+                let _ = self
+                    .ledger
+                    .release(bid.bidder_id, Asset::Cash, reserved_cash);
+            } else if let Some(consumed) = market.notional_minor(uniform_price, filled) {
+                let consumed_cash = consumed
+                    .checked_add(market.taker_fee_minor(consumed))
+                    .unwrap_or(consumed);
+                let excess = reserved_cash - consumed_cash;
+                if excess > 0 {
+                    let _ = self.ledger.release(bid.bidder_id, Asset::Cash, excess);
                 }
             }
         }
 
-        // Return unsold supply to seller
         if let Some(auc) = self.batch_auctions.get_mut(&auction_id) {
-            auc.qty_remaining = supply_left;
+            auc.qty_total = Some(total_revealed_supply);
+            auc.qty_remaining = Some(unsold_total);
             auc.clearing_price_ticks = Some(uniform_price);
             auc.phase = BatchAuctionPhase::Settled;
-        }
-        if supply_left > 0 {
-            let _ = self.release_pass(seller_id, market_id, supply_left);
         }
 
         self.batch_settlements.insert(auction_id, fills.clone());
         self.bump_state_version();
         Ok(fills)
+    }
+
+    /// Release every reservation of an unmatched or uncrossing window and mark
+    /// it expired. Bidders get their cash back, sellers their passes.
+    fn expire_batch_auction(
+        &mut self,
+        auction_id: u64,
+        market: &MarketConfig,
+        bids: &[BidRecord],
+        asks: &[AskRecord],
+    ) {
+        if let Some(auc) = self.batch_auctions.get_mut(&auction_id) {
+            auc.phase = BatchAuctionPhase::Expired;
+            let total_revealed_supply: Qty = asks.iter().map(|a| a.qty.unwrap_or(0)).sum();
+            auc.qty_total = Some(total_revealed_supply);
+            auc.qty_remaining = Some(total_revealed_supply);
+        }
+        for bid in bids {
+            if let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty)
+                && let Some(notional) = market.notional_minor(price, qty)
+            {
+                let cash = notional.saturating_add(market.taker_fee_minor(notional));
+                let _ = self.ledger.release(bid.bidder_id, Asset::Cash, cash);
+            }
+        }
+        for ask in asks {
+            if let Some(qty) = ask.qty {
+                let _ = self.release_pass(ask.seller_id, market.id, qty);
+            }
+        }
     }
 
     pub fn batch_auction(&self, auction_id: u64) -> Option<&BatchAuction> {
@@ -1743,6 +1991,14 @@ impl Core {
             .iter()
             .filter(|((id, _, _), _)| *id == auction_id)
             .map(|(_, b)| b.clone())
+            .collect()
+    }
+
+    pub fn batch_asks(&self, auction_id: u64) -> Vec<AskRecord> {
+        self.batch_asks
+            .iter()
+            .filter(|((id, _, _), _)| *id == auction_id)
+            .map(|(_, a)| a.clone())
             .collect()
     }
 

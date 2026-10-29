@@ -413,7 +413,7 @@ export const getBatchAuctions = (query = {}) => {
 }
 
 /**
- * @param {{ client_order_id: number, market_id: number, qty: number, floor_price_ticks: number, commit_duration_ms: number, reveal_duration_ms: number, seller_username?: string }} body
+ * @param {{ client_order_id: number, market_id: number, floor_price_ticks: number, commit_duration_ms: number, reveal_duration_ms: number }} body
  * @returns {Promise<any>}
  */
 export const createBatchAuction = (body) =>
@@ -422,6 +422,39 @@ export const createBatchAuction = (body) =>
     headers: jsonHeaders,
     body: JSON.stringify(body),
   })
+
+/**
+ * Seller side of a pooled window: commit a sealed ask.
+ * @param {number} auctionId
+ * @param {{ client_order_id: number, commitment: string }} body
+ * @returns {Promise<any>}
+ */
+export const commitBatchAsk = (auctionId, body) =>
+  request(`/api/batch-auctions/${auctionId}/ask/commit`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * Seller side reveal: reserves the seller's passes on a valid pre-image.
+ * @param {number} auctionId
+ * @param {{ client_order_id: number, price_ticks: number, qty: number, salt: string }} body
+ * @returns {Promise<any>}
+ */
+export const revealBatchAsk = (auctionId, body) =>
+  request(`/api/batch-auctions/${auctionId}/ask/reveal`, {
+    method: 'POST',
+    headers: jsonHeaders,
+    body: JSON.stringify(body),
+  })
+
+/**
+ * @param {number} auctionId
+ * @returns {Promise<any[]>}
+ */
+export const getBatchAsks = (auctionId) =>
+  request(`/api/batch-auctions/${auctionId}/asks`)
 
 /**
  * @param {number} auctionId
