@@ -1,10 +1,12 @@
 //! Journal keys and entries. Keys are fixed-size and allocation-free.
 
+use serde::{Deserialize, Serialize};
+
 use dx_types::{ClientOrderId, MarketId, TradeId, UserId};
 
 use crate::Posting;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum JournalKey {
     Trade(TradeId),
     Deposit {
@@ -20,7 +22,7 @@ pub enum JournalKey {
     EscrowRefund(TradeId),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalEntry {
     pub id: u64,
     pub key: JournalKey,

@@ -1173,6 +1173,7 @@ fn process_command_batch(
     metrics: &MetricsState,
     snapshot_cache: &mut SnapshotCache,
     wal: &mut Option<WalSession>,
+    audit_chain: &[AuditRecord],
     jobs: &Receiver<WriterJob>,
     stashed_job: &mut Option<WriterJob>,
     first_enqueued_at: Instant,
@@ -1279,6 +1280,16 @@ fn process_command_batch(
             }
         }
         let _ = reply.send(response);
+    }
+
+    // Snapshot when due, strictly after the batch's WAL records and the tape
+    // update: the snapshot then covers exactly the durable ops, and the audit
+    // records for these trades are appended to the log afterwards (they survive
+    // compaction only because they land past the snapshot's sequence).
+    if let Some(wal) = wal
+        && let Err(error) = wal.maybe_snapshot(core, audit_chain, recent_trades)
+    {
+        panic!("WAL snapshot failed: {error}");
     }
 
     disconnected
@@ -1391,6 +1402,7 @@ fn writer_loop(
                     &metrics,
                     &mut snapshot_cache,
                     &mut wal,
+                    &audit_chain,
                     &jobs,
                     &mut stashed_job,
                     enqueued_at,
@@ -2727,14 +2739,8 @@ mod tests {
         drop(writer);
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
-        let mut restored = funded_core();
-        let mut replayed_audit = Vec::new();
-        let fills = crate::wal::replay_with_audit(
-            &recovered.replayed_records,
-            &mut restored,
-            &mut replayed_audit,
-        )
-        .unwrap();
+        let (restored, fills, replayed_audit) =
+            crate::wal::restore_core_and_audit(&recovered, funded_core()).unwrap();
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(
             build_solvency_snapshot(&restored, &[]).unwrap().seq,
@@ -2781,11 +2787,8 @@ mod tests {
 
         // Restart: rebuild the core and the audit chain from the log.
         let recovered = dkx_wal::recover(dir.path()).unwrap();
-        let mut restored = funded_core();
-        let mut audit = Vec::new();
-        let fills =
-            crate::wal::replay_with_audit(&recovered.replayed_records, &mut restored, &mut audit)
-                .unwrap();
+        let (restored, fills, audit) =
+            crate::wal::restore_core_and_audit(&recovered, funded_core()).unwrap();
         assert_eq!(audit.last().unwrap().hash, expected_head.hash);
 
         let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();

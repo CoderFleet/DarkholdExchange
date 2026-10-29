@@ -25,6 +25,8 @@ use dx_types::{
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
+pub mod snapshot;
+
 /// How long a buyer's cash and a seller's passes stay in escrow before a refund
 /// can be requested. Kept short for the demo; production would use a market-level
 /// policy.
@@ -2236,6 +2238,69 @@ impl Core {
                 }
                 _ => {}
             }
+        }
+
+        // In-flight batch-auction reservations: a valid revealed bid holds
+        // worst-case cash (notional plus taker fee) and a valid revealed ask
+        // holds its passes. Settled and expired windows already released or
+        // consumed every reservation, so only live phases contribute.
+        for (key, bid) in &self.batch_bids {
+            let (Some(price), Some(qty)) = (bid.price_ticks, bid.qty) else {
+                continue;
+            };
+            if !bid.valid || qty == 0 {
+                continue;
+            }
+            let Some(auction) = self.batch_auctions.get(&key.0) else {
+                return Err(format!(
+                    "batch bid for user {} references missing auction {}",
+                    bid.bidder_id, key.0
+                ));
+            };
+            if matches!(
+                auction.phase,
+                BatchAuctionPhase::Settled | BatchAuctionPhase::Expired
+            ) {
+                continue;
+            }
+            let Some(market) = self.markets.get(&auction.market_id) else {
+                return Err(format!("missing market {}", auction.market_id));
+            };
+            let Some(notional) = market.notional_minor(price, qty) else {
+                return Err("batch bid notional overflow".to_string());
+            };
+            let fee = market.taker_fee_minor(notional);
+            let entry = expected_cash.entry(bid.bidder_id).or_default();
+            *entry = entry
+                .checked_add(notional)
+                .and_then(|value| value.checked_add(fee))
+                .ok_or_else(|| "expected batch cash overflow".to_string())?;
+        }
+        for (key, ask) in &self.batch_asks {
+            let (Some(_price), Some(qty)) = (ask.price_ticks, ask.qty) else {
+                continue;
+            };
+            if !ask.valid || qty == 0 {
+                continue;
+            }
+            let Some(auction) = self.batch_auctions.get(&key.0) else {
+                return Err(format!(
+                    "batch ask for user {} references missing auction {}",
+                    ask.seller_id, key.0
+                ));
+            };
+            if matches!(
+                auction.phase,
+                BatchAuctionPhase::Settled | BatchAuctionPhase::Expired
+            ) {
+                continue;
+            }
+            let entry = expected_pass
+                .entry((ask.seller_id, auction.market_id))
+                .or_default();
+            *entry = entry
+                .checked_add(qty)
+                .ok_or_else(|| "expected batch pass overflow".to_string())?;
         }
 
         for (key, account) in self.ledger.accounts() {

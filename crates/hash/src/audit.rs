@@ -1,9 +1,10 @@
 use crate::error::HashError;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const AUDIT_PREFIX: &[u8] = b"DKX-AUD-v1";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditRecord {
     pub seq: u64,
     pub ts_micros: u64,

@@ -28,6 +28,14 @@ const CHECKPOINT_EVERY: usize = 1;
 #[cfg(not(test))]
 const CHECKPOINT_EVERY: usize = 256;
 
+/// Full-state snapshots amortize restarts: recovery loads the newest snapshot and
+/// replays only the records written after it. The first snapshot gives every WAL
+/// a baseline immediately; later ones wait for this many operations.
+#[cfg(test)]
+const SNAPSHOT_EVERY_OPS: usize = 4;
+#[cfg(not(test))]
+const SNAPSHOT_EVERY_OPS: usize = 10_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum WalOp {
     Command {
@@ -122,6 +130,8 @@ pub(crate) enum WalOp {
 pub(crate) struct WalSession {
     wal: Wal,
     ops_since_state: usize,
+    snapshot_taken: bool,
+    ops_since_snapshot: usize,
 }
 
 /// The audit entry as it is persisted to the log: the exact fields of
@@ -179,8 +189,16 @@ impl WalSession {
             .map(|wal| Self {
                 wal,
                 ops_since_state: 0,
+                snapshot_taken: false,
+                ops_since_snapshot: 0,
             })
             .map_err(|error| format!("open WAL: {error}"))
+    }
+
+    /// Current last persisted WAL sequence.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn last_seq(&self) -> u64 {
+        self.wal.last_seq()
     }
 
     /// Append one operation and its post-state hash as one fsynced batch.
@@ -218,6 +236,7 @@ impl WalSession {
         } else {
             self.ops_since_state = self.ops_since_state.saturating_add(ops.len());
         }
+        self.ops_since_snapshot = self.ops_since_snapshot.saturating_add(ops.len());
         self.wal
             .append_batch(&records)
             .map(|_| ())
@@ -236,11 +255,84 @@ impl WalSession {
             .map(|_| ())
             .map_err(|error| format!("append audit record: {error}"))
     }
+
+    /// Write a full-state snapshot when one is due: the first time (so every WAL
+    /// gets a compact baseline immediately) and again every
+    /// [`SNAPSHOT_EVERY_OPS`] operations.
+    ///
+    /// The snapshot is written to the WAL directory and the log is compacted
+    /// right after: every pre-snapshot segment and older snapshot file is
+    /// deleted. Because the snapshot carries the audit chain and recent-trade
+    /// tape, the observational state survives compaction. The caller must give
+    /// the state exactly as of this moment — the same state the last appended
+    /// operation's post-state hash committed to.
+    pub(crate) fn maybe_snapshot(
+        &mut self,
+        core: &Core,
+        audit_chain: &[AuditRecord],
+        recent_trades: &[Fill],
+    ) -> Result<(), String> {
+        let due = !self.snapshot_taken || self.ops_since_snapshot >= SNAPSHOT_EVERY_OPS;
+        if !due {
+            return Ok(());
+        }
+
+        let (ledger_bytes, escrow_bytes, rest_bytes) = core
+            .wal_snapshot_blobs(audit_chain, recent_trades)
+            .map_err(|error| format!("encode WAL snapshot: {error}"))?;
+        self.wal
+            .take_snapshot(&move |_, _| {
+                (
+                    ledger_bytes.clone(),
+                    escrow_bytes.clone(),
+                    rest_bytes.clone(),
+                )
+            })
+            .map_err(|error| format!("write WAL snapshot: {error}"))?;
+
+        self.snapshot_taken = true;
+        self.ops_since_snapshot = 0;
+        Ok(())
+    }
+}
+
+/// Rebuild state after `dkx_wal::recover`: a snapshot replaces the caller's
+/// baseline (the log records before it were compacted away), and the surviving
+/// records replay on top of it. Returns the core, the recent-trade tape (the
+/// tape carried by the snapshot plus any replayed fills), and the audit chain
+/// (snapshot prefix plus replayed suffix).
+pub(crate) fn restore_core_and_audit(
+    recovered: &dkx_wal::RecoveredState,
+    without_snapshot: Core,
+) -> Result<(Core, Vec<Fill>, Vec<AuditRecord>), String> {
+    let (mut core, mut tape, mut audit) = match &recovered.snapshot {
+        Some(snapshot) => {
+            let restored = Core::from_wal_snapshot(
+                &snapshot.ledger_bytes,
+                &snapshot.escrow_bytes,
+                &snapshot.engine_bytes,
+            )
+            .map_err(|error| format!("WAL snapshot restore: {error}"))?;
+            (restored.core, restored.recent_trades, restored.audit_chain)
+        }
+        None => (without_snapshot, Vec::new(), Vec::new()),
+    };
+
+    // Snapshot audit-chain verification expects records past the snapshot to
+    // continue the persisted prefix, and fills go after the recovered tape.
+    let replayed_fills = replay_with_audit(&recovered.replayed_records, &mut core, &mut audit)?;
+    tape.extend(replayed_fills);
+    Ok((core, tape, audit))
 }
 
 /// Rebuild a core from WAL records, verifying every post-state checkpoint, and
-/// collect the persisted audit chain so a restart can continue the published
-/// log instead of starting from genesis.
+/// collect the audit chain so a restart can continue the published log instead
+/// of starting from genesis.
+///
+/// The caller may pass audit records recovered from a snapshot in `audit`;
+/// replayed audit records are appended after them so the whole published chain —
+/// snapshot prefix plus replayed suffix — stays unbroken. Callers that start from
+/// an empty log pass an empty vec.
 pub(crate) fn replay_with_audit(
     records: &[LogRecord],
     core: &mut Core,
@@ -248,7 +340,6 @@ pub(crate) fn replay_with_audit(
 ) -> Result<Vec<Fill>, String> {
     let mut recent_trades = Vec::new();
     let mut ops_since_state = 0usize;
-    audit.clear();
 
     for record in records {
         match record.kind {
@@ -548,6 +639,103 @@ mod tests {
             restored.balance(1, dx_types::Asset::Cash).available,
             990_000
         );
+        assert!(restored.config(100).is_some());
+    }
+
+    #[test]
+    fn snapshot_mid_log_restores_state_and_compacts_the_log() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut wal =
+            WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let mut core = Core::new(seed_markets()).unwrap();
+
+        let mut config = seed_markets().into_iter().next().unwrap();
+        config.id = 100;
+        config.event_id = 99;
+        config.name = "WAL market".into();
+        apply_and_log(&mut core, &mut wal, WalOp::AddMarket { config });
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Deposit {
+                user_id: 1,
+                amount: 2_000_000,
+                client_request_id: 1,
+            },
+        );
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Issue {
+                user_id: 2,
+                market_id: 100,
+                qty: 2,
+                client_request_id: 1,
+            },
+        );
+
+        // Snapshot in the middle of the log, like the writer does between
+        // command batches.
+        let tape: Vec<Fill> = Vec::new();
+        wal.maybe_snapshot(&core, &[], &tape).unwrap();
+        let snapshot_seq = wal.last_seq();
+
+        // Audit records and further operations land after the snapshot.
+        let prev = dkx_hash::GENESIS_PREV_HASH;
+        let audit = dkx_hash::AuditRecord {
+            seq: 1,
+            ts_micros: 1,
+            prev,
+            kind: 1,
+            market: 100,
+            qty: 2,
+            price: 500_000,
+            hash: dkx_hash::hash_audit_entry(1, 1, &prev, 1, 100, 2, 500_000),
+        };
+        wal.append_audit(&audit).unwrap();
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Command {
+                user_id: 2,
+                command: Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: 100,
+                    side: Side::Sell,
+                    price_ticks: 5_000,
+                    qty: 2,
+                    escrow: false,
+                }),
+                now_ms: 0,
+            },
+        );
+        let expected_hash = core.state_hash();
+
+        // Compaction: one surviving segment and one snapshot file.
+        let entry_count = |subdir: &str| {
+            std::fs::read_dir(dir.path().join("data").join(subdir))
+                .unwrap()
+                .count()
+        };
+        assert_eq!(entry_count("log"), 1);
+        assert_eq!(entry_count("snap"), 1);
+
+        // Restart: recovery replays only what the snapshot does not cover.
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        assert_eq!(recovered.snapshot.as_ref().unwrap().last_seq, snapshot_seq);
+        assert!(
+            recovered
+                .replayed_records
+                .iter()
+                .all(|record| record.seq > snapshot_seq)
+        );
+
+        let (restored, tape, restored_audit) =
+            restore_core_and_audit(&recovered, Core::new(seed_markets()).unwrap()).unwrap();
+        assert_eq!(restored.state_hash(), expected_hash);
+        assert_eq!(tape.len(), 0);
+        assert_eq!(restored_audit, vec![audit]);
         assert!(restored.config(100).is_some());
     }
 

@@ -633,11 +633,14 @@ dependencies = [
 name = "dx-core"
 version = "0.1.0"
 dependencies = [
+ "dkx-hash",
  "dx-engine",
  "dx-ledger",
  "dx-types",
  "ed25519-dalek",
  "proptest",
+ "rmp-serde",
+ "serde",
  "sha2",
 ]
 
@@ -648,6 +651,7 @@ dependencies = [
  "criterion",
  "dx-types",
  "proptest",
+ "serde",
  "sha2",
 ]
 

@@ -63,7 +63,7 @@
 | 19 | Order-book replay/scrubber | 🟡 | Core replay test; no live replay API. | Add snapshot + delta replay endpoint and a UI time scrubber. |
 | 20 | Live metrics/latency panel | ✅ | `/api/metrics/latency`, gateway histograms, `/speed`, `latency.*`, `SpeedPanel.jsx`. | Populate it by placing orders during the demo. |
 | 21 | PostgreSQL read models | 🟡 | `crates/dkx-projection`, migrations, SQL queries. Not wired into gateway. | Start the projection worker behind a flag; add integration test. |
-| 22 | WAL + crash recovery | ✅ | `dkx-wal` record/hash-chain/recovery plus gateway `wal.rs`; writer group-commits commands, deposits, issuance, and market creation, with a post-state checkpoint at least every 256 operations. Live check placed 261 commands (crossing a state checkpoint) plus a resting order, `SIGKILL`ed the gateway, restarted, and matched `/api/state/hash` and the book exactly. | Full-log replay is wired; periodic snapshots/compaction are still a follow-up. |
+| 22 | WAL + crash recovery | ✅ | `dkx-wal` record/hash-chain/recovery plus gateway `wal.rs`; writer group-commits commands, deposits, issuance, and market creation, with a post-state checkpoint at least every 256 operations. Snapshots/compaction are wired (row 22 follow-up resolved): the writer snapshots the full core state on the first batch and every 10,000 operations; `dkx-wal` fsyncs the snapshot, rolls a new segment, then deletes every pre-snapshot segment and older snapshot file; startup restores from the snapshot (verified state hash) and replays only post-snapshot records. Live check: fresh WAL, one resting order → 1 segment + 1 snapshot; `SIGKILL`, restart, `/api/state/hash` matched; second order past the snapshot, second `SIGKILL`, restarted, hash matched again. | — |
 | 23 | Docker/Caddy/nginx deployment | ✅ | `deploy/gateway.Dockerfile`, `deploy/web.Dockerfile`, `deploy/Caddyfile`, full `docker-compose.yml` with health checks and restart policy. Built and run in Docker on 2026-10-28; seeded, logged in, live feed through the proxy. | HTTPS needs a real domain; no automated container test in CI yet. |
 | 24 | Performance targets | ✅ | `bench/results/` records WAL-on 2026-10-26 runs: 995.50 placements/s, 999.90 fills/s, 7.54 ms place ack p99, 8.88 ms fill ack p99. | Add CI thresholds or clearly document the substitute. |
 | 25 | Differential matcher test | ❌ | No reference matcher. Deferred by T1. | Not planned for the current demo; revisit only if matching correctness needs stronger verification. |
@@ -93,18 +93,23 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Optional Playwright place/match/cancel smoke test (row 28). |
-| **T2 — Shraddha** | Private per-user WS push (row 7, done — the web wallet store now consumes the push) — audit-chain restart persistence (row 15) is done; PostgreSQL projection wiring (row 21); WAL snapshot compaction (row 22); replay service + UI scrubber (row 19). |
+| **T2 — Shraddha** | Private per-user WS push (row 7, done — the web wallet store now consumes the push) — audit-chain restart persistence (row 15) is done; WAL snapshot compaction (row 22, done: the gateway now hosts the dkx-wal snapshot path with startup restore, state-hash verification, and log compaction); PostgreSQL projection wiring (row 21); replay service + UI scrubber (row 19). |
 | **T3 — Stuti** | Bot-defence UI / attack-defence scenarios (row 18); k6/Locust thresholds or a documented substitute (row 27); Playwright suite (row 28, with T1); optional push-based escrow timer and Dutch-auction expiry timer/background cancellation. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
 ## Known caveats / quick fixes
 
-- **WAL snapshots/compaction are not wired:** startup rejects a snapshot and replays the full log.
-  Periodic snapshots remain a follow-up; the current path is correct but grows with the log.
+- **WAL snapshots/compaction are wired:** the writer takes a full-state snapshot at the first batch
+  and every 10,000 operations (`SNAPSHOT_EVERY_OPS`, 4 in tests); `dkx-wal` fsyncs the snapshot into
+  `data/snap`, rolls a fresh segment, then deletes every pre-snapshot segment and older snapshot
+  file. Startup restores from the newest snapshot, verifies the rebuilt state hash, and replays only
+  the post-snapshot records. The snapshot also carries the audit chain and recent-trade tape, so
+  compaction cannot desync them.
 - **WAL replay baseline is the demo seed:** `seed_demo` is not logged. Changing the seed changes the
   starting state, so an old log will fail its stored state-hash check and startup will abort. Clear
-  `data/log` after changing the seed in development.
+  `data/log` after changing the seed in development. Once a snapshot exists, the snapshot replaces
+  the seed baseline entirely (a snapshot + post-snapshot records replay without `seed_demo`).
 - **WAL is enabled by default:** records land under `<DX_WAL_DIR>/data/log` (default `./data/log`).
   Set `DX_WAL=0` for in-memory benchmarks. If append/fsync fails, the writer stops rather than
   serving unlogged state.

@@ -201,3 +201,117 @@ fn test_snapshot_midway_recovers_to_same_final_state() {
     assert_eq!(recovered.replayed_records[0].seq, 6);
     assert_eq!(recovered.replayed_records[4].seq, 10);
 }
+
+#[test]
+fn test_snapshot_compacts_the_log_and_keeps_recovery_continuous() {
+    let dir = tempdir().expect("tempdir");
+    let queue = Arc::new(ArrayQueue::new(1024));
+    let durable = Arc::new(AtomicU64::new(0));
+
+    let mut writer =
+        WalWriter::new(dir.path(), queue, durable, 0, GENESIS_PREV_HASH).expect("writer");
+
+    // Two pre-snapshot segments: records 1..=4 and 5..=8.
+    let mut prev = GENESIS_PREV_HASH;
+    for (start, end) in [(1, 4), (5, 8)] {
+        let mut batch = Vec::new();
+        for seq in start..=end {
+            let payload = rmp_serde::to_vec_named(&format!("command-{}", seq)).expect("payload");
+            let rec = LogRecord::new(seq, 1000 + seq, prev, 1, payload).expect("record");
+            prev = rec.hash;
+            batch.push(rec);
+        }
+        writer.commit_batch(&batch).expect("commit");
+        writer.roll_segment().expect("roll");
+    }
+
+    let segment_count_before = count_files(dir.path(), "log");
+    assert!(segment_count_before >= 3, "expected several segments");
+
+    // Snapshot at seq 8, then log records 9..=12 continue after the roll that
+    // compaction performs right after the snapshot.
+    writer
+        .take_snapshot(&|_seq, _hash| (vec![7], vec![8], vec![9]))
+        .expect("snapshot");
+
+    for seq in 9..=12 {
+        let payload = rmp_serde::to_vec_named(&format!("command-{}", seq)).expect("payload");
+        let rec = LogRecord::new(seq, 1000 + seq, prev, 1, payload).expect("record");
+        prev = rec.hash;
+        writer
+            .commit_batch(std::slice::from_ref(&rec))
+            .expect("commit");
+    }
+
+    let segments = verify_segments(dir.path());
+    assert!(!segments.is_empty());
+    // Compaction deleted the pre-snapshot snapshot files; only one remains.
+    assert_eq!(count_files(dir.path(), "snap"), 1);
+
+    // Recovery verifies the hash chain across the snapshot and the surviving
+    // segment; records 1..=8 are covered by the snapshot, only 9..=12 replay.
+    let recovered = recover(dir.path()).expect("recover");
+    assert_eq!(recovered.last_seq, 12);
+    assert_eq!(recovered.last_hash, prev);
+    let snapshot = recovered.snapshot.expect("snapshot");
+    assert_eq!(snapshot.last_seq, 8);
+    assert_eq!(recovered.replayed_records.len(), 4);
+    assert_eq!(recovered.replayed_records[0].seq, 9);
+}
+
+#[test]
+fn test_sync_wal_take_snapshot_and_reload() {
+    let dir = tempdir().expect("tempdir");
+    let mut wal = Wal::open(dir.path(), 0, GENESIS_PREV_HASH).expect("open wal");
+
+    wal.append_batch(&[
+        (1, b"op-1".to_vec()),
+        (1, b"op-2".to_vec()),
+        (1, b"op-3".to_vec()),
+    ])
+    .expect("append");
+
+    let last_seq = wal.last_seq();
+    wal.take_snapshot(&|_seq, _hash| (vec![1], vec![2], vec![3]))
+        .expect("snapshot");
+
+    assert_eq!(count_files(dir.path(), "log"), 1);
+    assert_eq!(count_files(dir.path(), "snap"), 1);
+
+    for seq in (last_seq + 1)..=(last_seq + 3) {
+        wal.append_batch(&[(1, format!("op-{}", seq).into_bytes())])
+            .expect("append");
+    }
+
+    let recovered = recover(dir.path()).expect("recover");
+    assert_eq!(recovered.last_seq, 6);
+    assert_eq!(
+        recovered.last_hash,
+        last_hash_after(&recovered, wal.last_hash())
+    );
+    assert!(recovered.snapshot.is_some());
+    assert_eq!(recovered.replayed_records.len(), 3);
+    assert_eq!(recovered.replayed_records[0].seq, 4);
+}
+
+fn count_files(dir: &std::path::Path, subdir: &str) -> usize {
+    fs::read_dir(dir.join("data").join(subdir))
+        .expect("read dir")
+        .flatten()
+        .count()
+}
+
+fn verify_segments(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fs::read_dir(path.join("data").join("log"))
+        .expect("read dir")
+        .flatten()
+        .map(|entry| entry.path())
+        .collect()
+}
+
+fn last_hash_after(recovered: &dkx_wal::RecoveredState, fallback: [u8; 32]) -> [u8; 32] {
+    if recovered.replayed_records.is_empty() {
+        return fallback;
+    }
+    recovered.replayed_records.last().expect("record").hash
+}

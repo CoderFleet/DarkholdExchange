@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use dx_types::{
     BookDelta, BookLevel, BookSeq, BookSnapshot, LevelChange, MarketConfig, MarketId, MarketStatus,
     OrderId, OrderStatus, Qty, ReasonCode, Side, Ticks, TradeId, UserId,
@@ -10,6 +12,7 @@ use dx_types::{
 use sha2::{Digest, Sha256};
 
 /// A FIFO queue of orders at one price.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PriceLevel {
     pub head: Option<u32>,
     pub tail: Option<u32>,
@@ -17,6 +20,7 @@ pub(crate) struct PriceLevel {
 }
 
 /// One resting order. `prev`/`next` are slab indices, not pointers.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
     pub user_id: UserId,
@@ -72,6 +76,7 @@ pub struct CancelOutcome {
 }
 
 /// One side of the book, indexed by `price_ticks - floor`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BookSide {
     side: Side,
     floor: Ticks,
@@ -269,6 +274,7 @@ impl BookSide {
 }
 
 /// One market's order book.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderBook {
     config: MarketConfig,
     bids: BookSide,

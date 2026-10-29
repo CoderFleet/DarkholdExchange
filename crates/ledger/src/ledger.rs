@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use dx_types::{Asset, Balance, ClientOrderId, MarketId, Minor, Qty, TradeId, UserId};
 
 use crate::{
@@ -27,6 +29,7 @@ pub struct TradeSettlement {
     pub escrow: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct Ledger {
     accounts: HashMap<AccountKey, Account>,
     journals: Vec<JournalEntry>,

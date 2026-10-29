@@ -3,11 +3,14 @@
 
 use std::collections::HashMap;
 
+use serde::{Deserialize, Serialize};
+
 use dx_types::{MarketConfig, MarketId, OrderId, Qty, ReasonCode, Side, Ticks, TradeId, UserId};
 use sha2::{Digest, Sha256};
 
 use crate::book::{CancelOutcome, OrderBook, PlaceOutcome};
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Engine {
     books: HashMap<MarketId, OrderBook>,
     next_order_id: OrderId,

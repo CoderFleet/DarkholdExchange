@@ -272,16 +272,10 @@ fn seeded_core() -> (Core, Vec<Fill>) {
 fn open_state(
     wal_dir: &str,
 ) -> Result<(Core, Vec<Fill>, Vec<AuditRecord>, wal::WalSession), String> {
-    let (mut core, mut recent_trades) = seeded_core();
     let recovered = dkx_wal::recover(wal_dir).map_err(|error| format!("WAL recovery: {error}"))?;
-    if recovered.snapshot.is_some() {
-        return Err("WAL snapshots are not supported yet".into());
-    }
 
-    let mut replayed_audit = Vec::new();
-    let replayed_fills =
-        wal::replay_with_audit(&recovered.replayed_records, &mut core, &mut replayed_audit)?;
-    recent_trades.extend(replayed_fills);
+    let (core, recent_trades, replayed_audit) =
+        wal::restore_core_and_audit(&recovered, seeded_core().0)?;
     core.check_invariants()?;
     let session = wal::WalSession::open(wal_dir, recovered.last_seq, recovered.last_hash)?;
     Ok((core, recent_trades, replayed_audit, session))

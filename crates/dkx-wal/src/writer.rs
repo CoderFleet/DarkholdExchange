@@ -25,6 +25,7 @@ pub struct WalWriter {
     last_seq: u64,
     last_hash: [u8; 32],
     current_segment: Option<File>,
+    current_segment_path: Option<PathBuf>,
     current_segment_index: u64,
     current_segment_size: u64,
     records_since_snapshot: u64,
@@ -50,6 +51,7 @@ impl WalWriter {
             last_seq: start_seq,
             last_hash: start_hash,
             current_segment: None,
+            current_segment_path: None,
             current_segment_index: 0,
             current_segment_size: 0,
             records_since_snapshot: 0,
@@ -127,7 +129,10 @@ impl WalWriter {
         Ok(())
     }
 
-    fn roll_segment(&mut self) -> Result<(), WalError> {
+    /// Force a new log segment. Tests use this to produce multi-segment logs;
+    /// compaction also rolls immediately before deleting superseded segments.
+    #[doc(hidden)]
+    pub fn roll_segment(&mut self) -> Result<(), WalError> {
         if let Some(ref mut file) = self.current_segment {
             file.sync_all()?;
         }
@@ -160,7 +165,57 @@ impl WalWriter {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         self.current_segment = Some(file);
+        self.current_segment_path = Some(path);
         self.current_segment_size = 0;
+        Ok(())
+    }
+
+    /// Delete old WAL artifacts that a fresh snapshot makes unnecessary.
+    ///
+    /// Called right after a snapshot is durable. Every record already in the log
+    /// has sequence <= the snapshot's `last_seq`, and the just-created segment
+    /// starts at `last_seq + 1`, so all pre-roll segments only hold records the
+    /// snapshot already covers. Deleting them shrinks the log to the post-snapshot
+    /// records; recovery replays the snapshot plus the surviving records.
+    fn compact(&mut self) -> Result<(), WalError> {
+        self.roll_segment()?;
+
+        let current =
+            self.current_segment_path
+                .clone()
+                .ok_or(WalError::Io(std::io::Error::other(
+                    "no current segment after roll",
+                )))?;
+        let current_name = current.file_name().map(|name| name.to_os_string());
+
+        for entry in fs::read_dir(self.base_dir.join("data/log"))? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("log") {
+                continue;
+            }
+            if path.file_name().map(|name| name.to_os_string()) == current_name {
+                continue;
+            }
+            fs::remove_file(&path)?;
+        }
+
+        // Keep only the newest snapshot: the one just written.
+        let snap_dir = self.base_dir.join("data/snap");
+        for entry in fs::read_dir(&snap_dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("snap") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.parse::<u64>().ok());
+            if stem == Some(self.last_seq) {
+                continue;
+            }
+            fs::remove_file(&path)?;
+        }
+
         Ok(())
     }
 
@@ -185,6 +240,11 @@ impl WalWriter {
         let mut file = File::create(&path)?;
         file.write_all(&bytes)?;
         file.sync_all()?;
+
+        // The snapshot is durable: oldest log records and older snapshots can go.
+        if self.current_segment.is_some() {
+            self.compact()?;
+        }
 
         self.records_since_snapshot = 0;
         self.last_snapshot_time = Instant::now();

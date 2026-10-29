@@ -72,6 +72,18 @@ impl Wal {
     pub fn last_hash(&self) -> [u8; 32] {
         self.last_hash
     }
+
+    /// Write a full-state snapshot of `self.last_seq`/`last_hash` and compact the
+    /// log: after the snapshot is durable, every pre-snapshot segment and older
+    /// snapshot file is deleted. `generator` must serialize the state *exactly as
+    /// of this moment* into the three snapshot blobs.
+    #[allow(clippy::type_complexity)]
+    pub fn take_snapshot(
+        &mut self,
+        generator: &dyn Fn(u64, [u8; 32]) -> (Vec<u8>, Vec<u8>, Vec<u8>),
+    ) -> Result<(), WalError> {
+        self.writer.take_snapshot(generator)
+    }
 }
 
 fn now_micros() -> u64 {
