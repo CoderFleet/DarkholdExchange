@@ -40,6 +40,16 @@ checkpoint does not match.
 - [Spec checklist](docs/SPEC_CHECKLIST.md) — current implementation status vs. the Webster spec
 - [Load baselines](bench/results/README.md) — repeatable gateway benchmark and recorded runs
 
+## Known limitations
+
+The core engine, escrow, auctions, auth, and solvency proof are complete and
+tested (see `docs/SPEC_CHECKLIST.md` for the row-by-row status). Deliberate
+gaps at submission: the replay/scrubber service is skipped (row 19), the
+k6/Locust and Playwright suites are not written (rows 27/28), the bot-defence
+run is CLI-only (row 18), and the projection is a persistent replica — HTTP
+reads still serve from the in-memory core (row 21). Fill-ack p99 tails under
+heavy foreground app load; see `docs/FINAL_BENCH_REPORT.md`.
+
 ## Layout
 crates/{types,engine,ledger,core,solvency,simulator,gateway} · web/ · contracts/ · bench/ · docs/
 
