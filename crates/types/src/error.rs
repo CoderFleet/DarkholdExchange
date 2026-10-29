@@ -14,6 +14,7 @@ pub enum ReasonCode {
     HoldingLimitExceeded,
     SelfTrade,
     UnknownMarket,
+    UnknownUser,
     MarketClosed,
     DuplicateClientOrderId,
     InvalidQuantity,

@@ -187,7 +187,7 @@ fn status_for_reason(reason: ReasonCode) -> StatusCode {
         | InsufficientInventory
         | HoldingLimitExceeded
         | SelfTrade => StatusCode::UNPROCESSABLE_ENTITY,
-        UnknownMarket | OrderNotFound => StatusCode::NOT_FOUND,
+        UnknownMarket | UnknownUser | OrderNotFound => StatusCode::NOT_FOUND,
         NotOrderOwner => StatusCode::FORBIDDEN,
         DuplicateClientOrderId
         | MarketClosed
@@ -1645,6 +1645,9 @@ struct CreateBatchAuctionPayload {
     floor_price_ticks: Ticks,
     commit_duration_ms: u64,
     reveal_duration_ms: u64,
+    /// Admin/issuer only: run the window on another user's inventory instead
+    /// of the caller's. The seller must hold the passes; nothing is minted.
+    seller_username: Option<String>,
 }
 
 async fn batch_auction_create(
@@ -1652,14 +1655,27 @@ async fn batch_auction_create(
     headers: HeaderMap,
     payload: Result<Json<CreateBatchAuctionPayload>, JsonRejection>,
 ) -> Result<Json<BatchAuctionView>, ApiError> {
-    let (admin_id, role) = match identify(&state.auth, &headers)? {
+    let (caller_id, role) = match identify(&state.auth, &headers)? {
         Caller::Token { user_id, role } => (user_id, role),
         Caller::Dev(user_id) => (user_id, dx_auth::Role::Admin),
     };
-    if role != dx_auth::Role::Admin && role != dx_auth::Role::Issuer {
-        return Err(forbidden());
-    }
     let body = json_body(payload)?;
+
+    // Any signed-in user can auction their own passes; only admin/issuer may
+    // schedule a window on a named seller's inventory.
+    let seller_id = match body.seller_username.as_deref() {
+        None => caller_id,
+        Some(username) => {
+            if role != dx_auth::Role::Admin && role != dx_auth::Role::Issuer {
+                return Err(forbidden());
+            }
+            state
+                .auth
+                .user_id_of(username)
+                .ok_or_else(|| api_error(StatusCode::NOT_FOUND, ReasonCode::UnknownUser))?
+        }
+    };
+
     let request = CreateBatchAuction {
         client_order_id: body.client_order_id,
         market_id: body.market_id,
@@ -1668,36 +1684,13 @@ async fn batch_auction_create(
         commit_duration_ms: body.commit_duration_ms,
         reveal_duration_ms: body.reveal_duration_ms,
     };
-    let at_ms = now_ms();
 
-    // Ensure the admin/issuer account holds the passes to sponsor this batch auction window.
-    let balances = state
-        .writer
-        .balances(admin_id)
-        .await
-        .map_err(writer_error)?;
-    let avail = balances
-        .iter()
-        .find(|b| {
-            b.asset
-                == dx_types::Asset::Pass {
-                    market_id: body.market_id,
-                }
-        })
-        .map(|b| b.available)
-        .unwrap_or(0);
-    if avail < body.qty as i64 {
-        let needed = (body.qty as i64) - avail;
-        let issue_req_id = 8_000_000_000 + body.client_order_id;
-        let _ = state
-            .writer
-            .issue(admin_id, body.market_id, needed as u64, issue_req_id)
-            .await;
-    }
-
+    // No sponsorship mint: the seller's passes are reserved at creation, and a
+    // short inventory fails with InsufficientInventory instead of inventing
+    // supply.
     let auction = state
         .writer
-        .create_batch_auction(admin_id, request, at_ms)
+        .create_batch_auction(seller_id, request, now_ms())
         .await
         .map_err(writer_error)?
         .map_err(|reason| api_error(status_for_reason(reason), reason))?;
@@ -3290,6 +3283,107 @@ mod tests {
         let user_map = headers(&[("authorization", &format!("Bearer {user_token}"))]);
         let error = issuer_supply(State(state), user_map).await.err().unwrap();
         assert_eq!(error.status, StatusCode::FORBIDDEN);
+    }
+
+    fn batch_payload(
+        client_order_id: ClientOrderId,
+        qty: Qty,
+        seller_username: Option<&str>,
+    ) -> CreateBatchAuctionPayload {
+        CreateBatchAuctionPayload {
+            client_order_id,
+            market_id: MARKET,
+            qty,
+            floor_price_ticks: PRICE,
+            commit_duration_ms: 5_000,
+            reveal_duration_ms: 5_000,
+            seller_username: seller_username.map(str::to_owned),
+        }
+    }
+
+    async fn pass_held(state: &AppState, user_id: UserId) -> (i64, i64) {
+        let balances = state.writer.balances(user_id).await.unwrap();
+        let entry = balances
+            .iter()
+            .find(|b| b.asset == dx_types::Asset::Pass { market_id: MARKET });
+        (
+            entry.map(|b| b.available).unwrap_or(0),
+            entry.map(|b| b.held).unwrap_or(0),
+        )
+    }
+
+    fn bearer(auth: &dx_auth::AuthState, user_id: UserId, role: dx_auth::Role) -> HeaderMap {
+        let token = token_for(auth, user_id, role);
+        headers(&[("authorization", &format!("Bearer {token}"))])
+    }
+
+    /// Batch auctions are seller-backed: the caller auctions their own passes,
+    /// and a short inventory is rejected instead of minting new supply.
+    #[tokio::test]
+    async fn batch_create_is_seller_backed_and_never_mints() {
+        let (state, _rx) = test_state();
+        state
+            .auth
+            .seed_user(2, "seller2", "pw", dx_auth::Role::User);
+
+        // test_state gives user 2 five passes and no passes to user 1.
+        let Json(view) = batch_auction_create(
+            State(state.clone()),
+            bearer(&state.auth, 2, dx_auth::Role::User),
+            Ok(Json(batch_payload(5001, 3, None))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.seller_id, 2);
+        assert_eq!(pass_held(&state, 2).await, (2, 3));
+
+        // User 1 holds only cash: no auction, and importantly no mint.
+        let error = batch_auction_create(
+            State(state.clone()),
+            bearer(&state.auth, 1, dx_auth::Role::User),
+            Ok(Json(batch_payload(5010, 1, None))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.body.0.reason, ReasonCode::InsufficientInventory);
+        assert_eq!(pass_held(&state, 1).await, (0, 0));
+
+        // A named seller for an admin resolves to that user's inventory and
+        // never touches the admin's balance.
+        let Json(view) = batch_auction_create(
+            State(state.clone()),
+            bearer(&state.auth, 3, dx_auth::Role::Admin),
+            Ok(Json(batch_payload(5002, 2, Some("seller2")))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view.seller_id, 2);
+        // 3 reserved by the first auction, 2 now; nothing held against admin.
+        assert_eq!(pass_held(&state, 2).await, (0, 5));
+        assert_eq!(pass_held(&state, 3).await, (0, 0));
+
+        let unknown = batch_auction_create(
+            State(state.clone()),
+            bearer(&state.auth, 3, dx_auth::Role::Admin),
+            Ok(Json(batch_payload(5003, 1, Some("ghost")))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(unknown.status, StatusCode::NOT_FOUND);
+        assert_eq!(unknown.body.0.reason, ReasonCode::UnknownUser);
+
+        let non_admin = batch_auction_create(
+            State(state.clone()),
+            bearer(&state.auth, 1, dx_auth::Role::User),
+            Ok(Json(batch_payload(5004, 1, Some("seller2")))),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(non_admin.status, StatusCode::FORBIDDEN);
     }
 }
 

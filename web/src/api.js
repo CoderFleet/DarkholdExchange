@@ -413,7 +413,7 @@ export const getBatchAuctions = (query = {}) => {
 }
 
 /**
- * @param {{ client_order_id: number, market_id: number, qty: number, floor_price_ticks: number, commit_duration_ms: number, reveal_duration_ms: number }} body
+ * @param {{ client_order_id: number, market_id: number, qty: number, floor_price_ticks: number, commit_duration_ms: number, reveal_duration_ms: number, seller_username?: string }} body
  * @returns {Promise<any>}
  */
 export const createBatchAuction = (body) =>

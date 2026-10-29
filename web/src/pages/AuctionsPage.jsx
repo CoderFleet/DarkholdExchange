@@ -76,6 +76,7 @@ export function AuctionsPage() {
     floorTicks: '',
     commitSeconds: '30',
     revealSeconds: '30',
+    sellerUsername: '',
   })
 
   // Bid state for Batch: { [auctionId]: { priceTicks, qty, commitmentHex, saltHex } }
@@ -231,6 +232,7 @@ export function AuctionsPage() {
     try {
       const commitDurationMs = Number(batchForm.commitSeconds) * 1000
       const revealDurationMs = Number(batchForm.revealSeconds) * 1000
+      const sellerUsername = isAdmin ? batchForm.sellerUsername.trim() : ''
       const created = await createBatchAuction({
         client_order_id: nextClientOrderId(),
         market_id: Number(batchForm.marketId || selectedBatchMarket?.id),
@@ -238,8 +240,13 @@ export function AuctionsPage() {
         floor_price_ticks: Number(batchForm.floorTicks),
         commit_duration_ms: commitDurationMs,
         reveal_duration_ms: revealDurationMs,
+        seller_username: sellerUsername || undefined,
       })
-      setNotice(`Batch auction #${created.id} is created in Commit phase.`)
+      setNotice(
+        sellerUsername
+          ? `Batch auction #${created.id} created for @${sellerUsername}, Commit phase.`
+          : `Batch auction #${created.id} is created in Commit phase.`,
+      )
       await load()
     } catch (nextError) {
       setError(nextError.message)
@@ -731,7 +738,9 @@ export function AuctionsPage() {
                     )}
 
                     {isSeller && (
-                      <p className="auction-hint">Exchange window.</p>
+                      <p className="auction-hint">
+                        You are selling this window — your passes are reserved until clearing.
+                      </p>
                     )}
                   </article>
                 )
@@ -739,11 +748,13 @@ export function AuctionsPage() {
             </div>
           </section>
 
-          {isAdmin ? (
+          {userId ? (
             <section className="auction-panel">
               <div className="panel-header">
-                <h3>Schedule Clearing Window</h3>
-                <span className="panel-meta">Admin only</span>
+                <h3>Create Batch Auction</h3>
+                <span className="panel-meta">
+                  {isAdmin ? 'Admin · can name a seller' : 'You are the seller'}
+                </span>
               </div>
               <form className="auction-form" onSubmit={handleCreateBatch}>
                 <label>
@@ -759,6 +770,19 @@ export function AuctionsPage() {
                     ))}
                   </select>
                 </label>
+                {isAdmin && (
+                  <label>
+                    Seller username (optional)
+                    <input
+                      type="text"
+                      placeholder="e.g. trader1 — empty = your own passes"
+                      value={batchForm.sellerUsername}
+                      onChange={(e) =>
+                        setBatchForm((c) => ({ ...c, sellerUsername: e.target.value }))
+                      }
+                    />
+                  </label>
+                )}
                 <label>
                   Total supply (passes)
                   <input
@@ -795,13 +819,14 @@ export function AuctionsPage() {
                   />
                 </label>
                 <button type="submit" disabled={busy || !selectedBatchMarket}>
-                  {busy ? 'Working…' : 'Schedule Batch Window'}
+                  {busy ? 'Working…' : 'Create Batch Auction'}
                 </button>
               </form>
               {selectedBatchMarket && (
                 <p className="auction-hint">
                   {selectedBatchMarket.name}: collar {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).floor)}{' '}
-                  – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. Sponsoring passes are reserved from the exchange inventory.
+                  – {formatPrice(selectedBatchMarket, collarFor(selectedBatchMarket).cap)}. The seller's passes are
+                  reserved at creation — a short inventory is rejected, nothing is minted.
                 </p>
               )}
             </section>
@@ -812,7 +837,9 @@ export function AuctionsPage() {
                 <span className="panel-meta">Commit-Reveal · Uniform Price</span>
               </div>
               <p className="auction-hint">
-                Batch clearing windows are scheduled exclusively by the exchange. All buyers submit sealed SHA-256 bids during the commit window, then simultaneously reveal them. The engine finds the uniform clearing price that maximises matched volume — no front-running, no timing advantage.
+                Log in to create a batch auction on your own pass inventory. Buyers submit sealed SHA-256 bids during
+                the commit window, then simultaneously reveal them. The engine finds the uniform clearing price that
+                maximises matched volume — no front-running, no timing advantage.
               </p>
               <div className="batch-phases">
                 <span className="batch-phase-chip">1 · Commit</span>
