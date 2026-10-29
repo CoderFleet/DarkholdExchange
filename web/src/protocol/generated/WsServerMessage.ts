@@ -2,9 +2,10 @@
 import type { Balance } from "./Balance";
 import type { BookDelta } from "./BookDelta";
 import type { BookSnapshot } from "./BookSnapshot";
+import type { EscrowRecord } from "./EscrowRecord";
 import type { Fill } from "./Fill";
 import type { MarketConfig } from "./MarketConfig";
 import type { MetricsSnapshot } from "./MetricsSnapshot";
 import type { ReasonCode } from "./ReasonCode";
 
-export type WsServerMessage = { "type": "Hello", markets: Array<MarketConfig>, user_id: number | null, } | { "type": "Snapshot", snapshot: BookSnapshot, } | { "type": "Delta", delta: BookDelta, } | { "type": "Trade", fill: Fill, } | { "type": "ResyncRequired", market_id: number, } | { "type": "Metrics", metrics: MetricsSnapshot, } | { "type": "Balances", user_id: number, balances: Array<Balance>, } | { "type": "Pong" } | { "type": "Error", code: ReasonCode, };
+export type WsServerMessage = { "type": "Hello", markets: Array<MarketConfig>, user_id: number | null, } | { "type": "Snapshot", snapshot: BookSnapshot, } | { "type": "Delta", delta: BookDelta, } | { "type": "Trade", fill: Fill, } | { "type": "ResyncRequired", market_id: number, } | { "type": "Metrics", metrics: MetricsSnapshot, } | { "type": "Balances", user_id: number, balances: Array<Balance>, } | { "type": "FillSelf", fill: Fill, } | { "type": "EscrowUpdate", record: EscrowRecord, } | { "type": "Pong" } | { "type": "Error", code: ReasonCode, };

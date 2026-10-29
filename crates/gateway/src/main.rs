@@ -37,7 +37,9 @@ use futures_util::SinkExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::TryRecvError;
-use writer::{MetricsState, StreamBaseline, WriterError, WriterHandle, spawn_writer_with_wal};
+use writer::{
+    MetricsState, PrivateEvent, StreamBaseline, WriterError, WriterHandle, spawn_writer_with_wal,
+};
 
 #[derive(Clone)]
 struct AppState {
@@ -301,9 +303,20 @@ async fn main() {
     };
     println!("core state hash: {}", hex::encode(core.state_hash()));
 
+    // Private per-user push (row 7): the writer knows exactly whose state each
+    // event touches; sockets route the events by token-checked identity.
+    let (private_tx, _) = broadcast::channel::<writer::PrivateEvent>(512);
+
     let (tx, _) = broadcast::channel(512);
-    let (writer, metrics) =
-        spawn_writer_with_wal(core, tx, seed_fills, queue_capacity(), wal, audit_backfill);
+    let (writer, metrics) = spawn_writer_with_wal(
+        core,
+        tx,
+        seed_fills,
+        queue_capacity(),
+        wal,
+        audit_backfill,
+        Some(private_tx),
+    );
     // Events and tiers for the admin console. Publishing creates a live market
     // through the same single-writer queue as every other core change.
     let admin = admin_state(writer.clone());
@@ -2140,9 +2153,18 @@ async fn handle_socket(
     initial.push(WsServerMessage::Metrics {
         metrics: metrics_snapshot(&state),
     });
+    // Private baseline for a token-checked user: balances and escrow state,
+    // so the wallet and escrow views start consistent before any push.
+    if let Some(user_id) = user_id {
+        initial.extend(private_baseline_messages(&state, user_id).await);
+    }
     if !send_batch(&mut socket, initial).await {
         return;
     }
+
+    // Only a signed-in socket listens for private events; an anonymous viewer
+    // can never receive one (row 7).
+    let mut private_rx = user_id.and_then(|_| state.writer.subscribe_private());
 
     loop {
         tokio::select! {
@@ -2252,8 +2274,88 @@ async fn handle_socket(
                     Err(broadcast::error::RecvError::Closed) => return,
                 }
             }
+            private = poll_private(&mut private_rx) => {
+                match private {
+                    PrivatePoll::Event(event) => {
+                        // Targeted by user id: another user's event is dropped
+                        // server-side, never sent to this socket.
+                        if owned_by_socket(&event, user_id)
+                            && !send_msg(&mut socket, &event.message).await
+                        {
+                            return;
+                        }
+                    }
+                    PrivatePoll::Lagged => {
+                        // Missed events include balance updates, so a lagged
+                        // private stream must re-baseline, not just continue.
+                        if !resync_private_socket(&state, &mut socket, user_id).await {
+                            return;
+                        }
+                    }
+                    PrivatePoll::Closed => private_rx = None,
+                }
+            }
         }
     }
+}
+
+/// What a select-branch poll of the private stream returned. With no
+/// subscription (anonymous viewer, or a writer without a private channel) the
+/// future never resolves, so the branch stays idle.
+#[derive(Debug)]
+enum PrivatePoll {
+    Event(PrivateEvent),
+    Lagged,
+    Closed,
+}
+
+async fn poll_private(private_rx: &mut Option<broadcast::Receiver<PrivateEvent>>) -> PrivatePoll {
+    match private_rx {
+        Some(rx) => match rx.recv().await {
+            Ok(event) => PrivatePoll::Event(event),
+            Err(broadcast::error::RecvError::Lagged(_)) => PrivatePoll::Lagged,
+            Err(broadcast::error::RecvError::Closed) => PrivatePoll::Closed,
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether a private event belongs to this socket's token-checked user. The
+/// anonymous case (`None`) never matches, so a viewer without a token can
+/// never receive private state (row 7).
+fn owned_by_socket(event: &PrivateEvent, socket_user: Option<UserId>) -> bool {
+    socket_user.is_some_and(|socket_user| socket_user == event.user_id)
+}
+
+/// Reply with this user's full private state: balances plus escrow records.
+async fn private_baseline_messages(state: &AppState, user_id: UserId) -> Vec<WsServerMessage> {
+    let mut messages = Vec::new();
+    if let Ok(balances) = state.writer.balances(user_id).await {
+        messages.push(WsServerMessage::Balances { user_id, balances });
+    }
+    if let Ok(records) = state.writer.escrows(user_id).await {
+        messages.extend(
+            records
+                .into_iter()
+                .map(|record| WsServerMessage::EscrowUpdate { record }),
+        );
+    }
+    messages
+}
+
+/// After a private stream falls behind, resend the full private state: a
+/// missed balance update seen as a delta would be a lie about money.
+async fn resync_private_socket(
+    state: &AppState,
+    socket: &mut WebSocket,
+    user_id: Option<UserId>,
+) -> bool {
+    let Some(user_id) = user_id else {
+        return true;
+    };
+    state.metrics.slow_consumers.fetch_add(1, Ordering::Relaxed);
+    let messages = private_baseline_messages(state, user_id).await;
+    messages.is_empty() || send_batch(socket, messages).await
 }
 
 async fn resync_socket(
@@ -2486,6 +2588,23 @@ mod tests {
         execute_command(state, user_id, command).await.unwrap()
     }
 
+    /// Row 7: private pushes are routed by the token-checked identity, so an
+    /// anonymous socket (`None`, dev-header fallback) never matches, and a
+    /// user only matches their own events.
+    #[test]
+    fn private_events_route_to_the_token_user_only() {
+        let event = PrivateEvent {
+            user_id: 7,
+            message: WsServerMessage::Balances {
+                user_id: 7,
+                balances: Vec::new(),
+            },
+        };
+        assert!(owned_by_socket(&event, Some(7)));
+        assert!(!owned_by_socket(&event, Some(8)));
+        assert!(!owned_by_socket(&event, None));
+    }
+
     #[tokio::test]
     async fn wal_open_state_replays_on_the_seeded_baseline() {
         let dir = tempdir().unwrap();
@@ -2496,7 +2615,7 @@ mod tests {
         let seed_fill_count = seed_fills.len();
         let (tx, _rx) = broadcast::channel(16);
         let (writer, _metrics) =
-            spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal), Vec::new());
+            spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal), Vec::new(), None);
 
         let response = writer
             .command(1, limit(900001, Side::Sell, 5_200, 1))

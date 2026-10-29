@@ -1,0 +1,21 @@
+{
+  "type": "EscrowUpdate",
+  "record": {
+    "trade_id": 31,
+    "market_id": 1,
+    "buyer_id": 9,
+    "seller_id": 2,
+    "qty": 2,
+    "notional": 100000,
+    "fee": 1500,
+    "fee_payer": 9,
+    "state": "pending_delivery",
+    "created_at_ms": 1000,
+    "deadline_ms": 301000,
+    "delivered_at_ms": null,
+    "seller_public_key": [
+      26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26, 26,
+      26, 26, 26, 26, 26, 26, 26, 26, 26
+    ]
+  }
+}

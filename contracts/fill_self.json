@@ -1,0 +1,15 @@
+{
+  "type": "FillSelf",
+  "fill": {
+    "trade_id": 31,
+    "market_id": 1,
+    "maker_order_id": 11,
+    "taker_order_id": 12,
+    "maker_user_id": 2,
+    "taker_user_id": 9,
+    "maker_side": "Sell",
+    "price_ticks": 5000,
+    "qty": 2,
+    "seq": 77
+  }
+}

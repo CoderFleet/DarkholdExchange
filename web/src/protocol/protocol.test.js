@@ -89,3 +89,17 @@ it('decodes the golden MessagePack resync frame', () => {
 it('decodes the golden MessagePack metrics frame', () => {
   expect(decodeServerMessage(goldFrame('metrics.msgpack'))).toEqual(fixture('metrics.json'))
 })
+
+it('decodes the golden MessagePack balances push frame', () => {
+  expect(decodeServerMessage(goldFrame('balances.msgpack'))).toEqual(fixture('balances.json'))
+})
+
+it('decodes the golden MessagePack private fill frame', () => {
+  expect(decodeServerMessage(goldFrame('fill_self.msgpack'))).toEqual(fixture('fill_self.json'))
+})
+
+it('decodes the golden MessagePack escrow push frame', () => {
+  expect(decodeServerMessage(goldFrame('escrow_update.msgpack'))).toEqual(
+    fixture('escrow_update.json'),
+  )
+})

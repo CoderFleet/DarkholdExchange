@@ -7,8 +7,8 @@ use std::fs;
 use std::path::Path;
 
 use dx_types::{
-    BookDelta, BookLevel, BookSnapshot, LevelChange, MetricsSnapshot, Side, WsClientMessage,
-    WsServerMessage,
+    Asset, Balance, BookDelta, BookLevel, BookSnapshot, EscrowRecord, EscrowState, Fill,
+    LevelChange, MetricsSnapshot, Side, WsClientMessage, WsServerMessage,
 };
 
 fn main() {
@@ -82,6 +82,58 @@ fn main() {
                 core_p99_us: 210,
                 ws_clients: 32,
                 slow_consumers: 1,
+            },
+        },
+    );
+    write(
+        &dir,
+        "balances.msgpack",
+        &WsServerMessage::Balances {
+            user_id: 9,
+            balances: vec![Balance {
+                asset: Asset::Cash,
+                available: 150_000,
+                held: 2_000,
+            }],
+        },
+    );
+    write(
+        &dir,
+        "fill_self.msgpack",
+        &WsServerMessage::FillSelf {
+            fill: Fill {
+                trade_id: 31,
+                market_id: 1,
+                maker_order_id: 11,
+                taker_order_id: 12,
+                maker_user_id: 2,
+                taker_user_id: 9,
+                maker_side: Side::Sell,
+                price_ticks: 5_000,
+                qty: 2,
+                seq: 77,
+                escrow_id: None,
+            },
+        },
+    );
+    write(
+        &dir,
+        "escrow_update.msgpack",
+        &WsServerMessage::EscrowUpdate {
+            record: crate::EscrowRecord {
+                trade_id: 31,
+                market_id: 1,
+                buyer_id: 9,
+                seller_id: 2,
+                qty: 2,
+                notional: 100_000,
+                fee: 1_500,
+                fee_payer: 9,
+                state: EscrowState::PendingDelivery,
+                created_at_ms: 1_000,
+                deadline_ms: 301_000,
+                delivered_at_ms: None,
+                seller_public_key: [0x1a; 32],
             },
         },
     );

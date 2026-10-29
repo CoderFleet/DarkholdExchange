@@ -2,8 +2,8 @@
 //! canonical readable contract.
 
 use crate::{
-    Balance, BookDelta, BookSnapshot, Fill, MarketConfig, MarketId, MetricsSnapshot, ReasonCode,
-    UserId,
+    Balance, BookDelta, BookSnapshot, EscrowRecord, Fill, MarketConfig, MarketId, MetricsSnapshot,
+    ReasonCode, UserId,
 };
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -49,6 +49,16 @@ pub enum WsServerMessage {
     Balances {
         user_id: UserId,
         balances: Vec<Balance>,
+    },
+    /// A fill this user was a side of. Only ever pushed on a token-checked
+    /// private stream (row 7): never on the public market broadcast.
+    FillSelf {
+        fill: Fill,
+    },
+    /// One escrow record of this user changed state. Only ever pushed on a
+    /// token-checked private stream.
+    EscrowUpdate {
+        record: EscrowRecord,
     },
     Pong,
     Error {

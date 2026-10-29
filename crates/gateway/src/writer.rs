@@ -415,9 +415,17 @@ struct WriterJob {
 pub(crate) struct WriterHandle {
     tx: SyncSender<WriterJob>,
     metrics: Arc<MetricsState>,
+    private: Option<broadcast::Sender<PrivateEvent>>,
 }
 
 impl WriterHandle {
+    /// Subscribe to this user's private event stream. Private events carry the
+    /// affected `user_id`; routing to sockets happens in main.rs, keyed by the
+    /// token-checked identity, so a connection must know whom to listen for.
+    pub(crate) fn subscribe_private(&self) -> Option<broadcast::Receiver<PrivateEvent>> {
+        self.private.as_ref().map(|private| private.subscribe())
+    }
+
     pub(crate) async fn command(
         &self,
         user_id: UserId,
@@ -919,7 +927,7 @@ pub(crate) fn spawn_writer(
     recent_trades: Vec<Fill>,
     capacity: usize,
 ) -> (WriterHandle, Arc<MetricsState>) {
-    spawn_writer_with_wal(core, tx, recent_trades, capacity, None, Vec::new())
+    spawn_writer_with_wal(core, tx, recent_trades, capacity, None, Vec::new(), None)
 }
 
 pub(crate) fn spawn_writer_with_wal(
@@ -929,10 +937,12 @@ pub(crate) fn spawn_writer_with_wal(
     capacity: usize,
     wal: Option<WalSession>,
     audit_backfill: Vec<AuditRecord>,
+    private: Option<broadcast::Sender<PrivateEvent>>,
 ) -> (WriterHandle, Arc<MetricsState>) {
     let metrics = Arc::new(MetricsState::new(core.last_seq()));
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel(capacity.max(1));
     let writer_metrics = metrics.clone();
+    let writer_private = private.clone();
     if recent_trades.len() > RECENT_TRADES_LIMIT {
         let excess = recent_trades.len() - RECENT_TRADES_LIMIT;
         recent_trades.drain(0..excess);
@@ -949,6 +959,7 @@ pub(crate) fn spawn_writer_with_wal(
                 job_rx,
                 wal,
                 audit_backfill,
+                writer_private,
             )
         })
         .expect("spawn core writer");
@@ -956,6 +967,7 @@ pub(crate) fn spawn_writer_with_wal(
     let handle = WriterHandle {
         tx: job_tx,
         metrics: metrics.clone(),
+        private,
     };
     (handle, metrics)
 }
@@ -965,6 +977,76 @@ fn append_wal(wal: &mut Option<WalSession>, op: &WalOp, state_hash: [u8; 32]) {
         && let Err(error) = wal.append(op, state_hash)
     {
         panic!("WAL append failed: {error}");
+    }
+}
+
+/// One private push: a state change that matters only to `user_id`. The writer
+/// publishes these on a second channel; sockets target them by token, so an
+/// anonymous viewer never subscribes and a user only ever sees their own
+/// events (row 7).
+#[derive(Debug, Clone)]
+pub(crate) struct PrivateEvent {
+    pub user_id: UserId,
+    pub message: WsServerMessage,
+}
+
+/// Push one private message to its user's sockets. A send error only means no
+/// receiver is subscribed right now, which is fine for push.
+fn push_private(
+    private: &Option<broadcast::Sender<PrivateEvent>>,
+    user_id: UserId,
+    message: WsServerMessage,
+) {
+    if let Some(private) = private {
+        let _ = private.send(PrivateEvent { user_id, message });
+    }
+}
+
+/// Fresh balance snapshot for `user_id`, pushed after his ledger changed.
+fn push_balances(private: &Option<broadcast::Sender<PrivateEvent>>, core: &Core, user_id: UserId) {
+    push_private(
+        private,
+        user_id,
+        WsServerMessage::Balances {
+            user_id,
+            balances: core.balances(user_id),
+        },
+    );
+}
+
+/// Both parties of a settled escrow hear the new record state and get a
+/// balance refresh, because a release refunds the held notional and a refund
+/// returns the held cash.
+fn push_escrow_settled(
+    private: &Option<broadcast::Sender<PrivateEvent>>,
+    core: &Core,
+    record: &EscrowRecord,
+) {
+    for user_id in [record.buyer_id, record.seller_id] {
+        push_private(
+            private,
+            user_id,
+            WsServerMessage::EscrowUpdate {
+                record: record.clone(),
+            },
+        );
+        push_balances(private, core, user_id);
+    }
+}
+
+/// Same as `push_escrow_settled` for the paths that settle by trade id and do
+/// not hold the record: look the canonical record up in the core.
+fn push_escrow_settled_by_trade(
+    private: &Option<broadcast::Sender<PrivateEvent>>,
+    core: &Core,
+    trade_id: u64,
+) {
+    if let Some(record) = core
+        .all_escrow_records()
+        .into_iter()
+        .find(|record| record.trade_id == trade_id)
+    {
+        push_escrow_settled(private, core, &record);
     }
 }
 
@@ -1151,6 +1233,7 @@ fn process_command_batch(
     disconnected
 }
 
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     mut core: Core,
     tx: broadcast::Sender<WsServerMessage>,
@@ -1159,6 +1242,7 @@ fn writer_loop(
     jobs: Receiver<WriterJob>,
     mut wal: Option<WalSession>,
     audit_backfill: Vec<AuditRecord>,
+    private: Option<broadcast::Sender<PrivateEvent>>,
 ) {
     let mut snapshot_cache = SnapshotCache::default();
     let mut stashed_job: Option<WriterJob> = None;
@@ -1268,6 +1352,7 @@ fn writer_loop(
                 let new_fills_count = recent_trades.len().saturating_sub(prev_fills_count);
                 if new_fills_count > 0 {
                     let start_idx = recent_trades.len() - new_fills_count;
+                    let mut balance_users: Vec<UserId> = Vec::new();
                     for fill in &recent_trades[start_idx..] {
                         let tick_size = core
                             .config(fill.market_id)
@@ -1284,6 +1369,28 @@ fn writer_loop(
                             price_paise,
                         );
                         persist_audit(&mut wal, &record);
+                        // Private push: each side of a trade hears about it
+                        // even in a market that viewer is not subscribed to.
+                        push_private(
+                            &private,
+                            fill.maker_user_id,
+                            WsServerMessage::FillSelf { fill: fill.clone() },
+                        );
+                        push_private(
+                            &private,
+                            fill.taker_user_id,
+                            WsServerMessage::FillSelf { fill: fill.clone() },
+                        );
+                        if !balance_users.contains(&fill.maker_user_id) {
+                            balance_users.push(fill.maker_user_id);
+                        }
+                        if !balance_users.contains(&fill.taker_user_id) {
+                            balance_users.push(fill.taker_user_id);
+                        }
+                    }
+                    // One fresh balance snapshot per side, after all fills settled.
+                    for user_id in &balance_users {
+                        push_balances(&private, &core, *user_id);
                     }
                 }
                 // Populate escrow store from any newly escrowed fills
@@ -1398,6 +1505,7 @@ fn writer_loop(
                 let result = core.deposit_cash(user_id, amount, client_request_id);
                 if result.is_ok() {
                     append_wal(&mut wal, &wal_op, core.state_hash());
+                    push_balances(&private, &core, user_id);
                 }
                 let _ = reply.send(result);
             }
@@ -1417,6 +1525,7 @@ fn writer_loop(
                 let result = core.issue_passes(user_id, market_id, qty, client_request_id);
                 if result.is_ok() {
                     append_wal(&mut wal, &wal_op, core.state_hash());
+                    push_balances(&private, &core, user_id);
                     let record = record_audit(
                         &mut audit_chain,
                         &mut next_audit_seq,
@@ -1490,6 +1599,7 @@ fn writer_loop(
                         price_paise,
                     );
                     persist_audit(&mut wal, &audit_record);
+                    push_escrow_settled(&private, &core, record);
                 }
                 let _ = reply.send(result);
             }
@@ -1522,6 +1632,7 @@ fn writer_loop(
                         price_paise,
                     );
                     persist_audit(&mut wal, &audit_record);
+                    push_escrow_settled(&private, &core, record);
                 }
                 let _ = reply.send(result);
             }
@@ -1701,6 +1812,7 @@ fn writer_loop(
                         let settle_res = core.admin_settle_escrow(record.trade_id, false);
                         if settle_res.is_ok() {
                             append_wal(&mut wal, &wal_op, core.state_hash());
+                            push_escrow_settled_by_trade(&private, &core, record.trade_id);
                         }
                     }
                     records.push(record);
@@ -1717,6 +1829,7 @@ fn writer_loop(
                         let settle_res = core.admin_settle_escrow(record.trade_id, false);
                         if settle_res.is_ok() {
                             append_wal(&mut wal, &wal_op, core.state_hash());
+                            push_escrow_settled_by_trade(&private, &core, record.trade_id);
                         }
                     }
                     record
@@ -1734,6 +1847,9 @@ fn writer_loop(
                         let settle_res = core.admin_settle_escrow(id, false);
                         if settle_res.is_ok() {
                             append_wal(&mut wal, &wal_op, core.state_hash());
+                            if let Some((record, _)) = escrow_store.get(id) {
+                                push_escrow_settled_by_trade(&private, &core, record.trade_id);
+                            }
                         }
                         settle_res.map(|_| ())
                     }
@@ -1776,6 +1892,9 @@ fn writer_loop(
                         let settle_res = core.admin_settle_escrow(escrow_id, refund_to_buyer);
                         if settle_res.is_ok() {
                             append_wal(&mut wal, &wal_op, core.state_hash());
+                            if let Some((record, _)) = escrow_store.get(escrow_id) {
+                                push_escrow_settled_by_trade(&private, &core, record.trade_id);
+                            }
                         }
                         settle_res.map(|_| ())
                     }
@@ -2399,6 +2518,7 @@ mod tests {
         let handle = WriterHandle {
             tx,
             metrics: metrics.clone(),
+            private: None,
         };
 
         let (reply, _reply_rx) = oneshot::channel();
@@ -2465,8 +2585,15 @@ mod tests {
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
         let (tx, _rx) = broadcast::channel(16);
-        let (writer, _metrics) =
-            spawn_writer_with_wal(funded_core(), tx, Vec::new(), 16, Some(wal), Vec::new());
+        let (writer, _metrics) = spawn_writer_with_wal(
+            funded_core(),
+            tx,
+            Vec::new(),
+            16,
+            Some(wal),
+            Vec::new(),
+            None,
+        );
 
         writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
         let mut config = seed_markets().into_iter().next().unwrap();
@@ -2548,8 +2675,15 @@ mod tests {
         )
         .unwrap();
         let (tx1, _rx1) = broadcast::channel(16);
-        let (writer, _metrics) =
-            spawn_writer_with_wal(funded_core(), tx1, Vec::new(), 16, Some(wal), Vec::new());
+        let (writer, _metrics) = spawn_writer_with_wal(
+            funded_core(),
+            tx1,
+            Vec::new(),
+            16,
+            Some(wal),
+            Vec::new(),
+            None,
+        );
 
         writer.issue(2, MARKET, 2, 7).await.unwrap().unwrap();
         let expected_head = writer.audit_head().await.unwrap().unwrap();
@@ -2568,7 +2702,8 @@ mod tests {
 
         let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
         let (tx2, _rx2) = broadcast::channel(16);
-        let (writer, _metrics) = spawn_writer_with_wal(restored, tx2, fills, 16, Some(wal), audit);
+        let (writer, _metrics) =
+            spawn_writer_with_wal(restored, tx2, fills, 16, Some(wal), audit, None);
 
         // New records continue the previous head, not a fresh sequence.
         writer.issue(2, MARKET, 1, 77).await.unwrap().unwrap();
@@ -2748,5 +2883,239 @@ mod tests {
         assert_eq!(after.last_trade_price, Some(5_000));
         assert_ne!(before.book_seq, after.book_seq);
         assert_eq!(Some(after), core.snapshot(MARKET, 20));
+    }
+
+    /// Drain one private event and destructure it for assertions.
+    async fn next_private(rx: &mut broadcast::Receiver<PrivateEvent>) -> (UserId, WsServerMessage) {
+        let event = rx.recv().await.unwrap();
+        (event.user_id, event.message)
+    }
+
+    /// Take everything published so far without waiting.
+    fn drain_ready(rx: &mut broadcast::Receiver<PrivateEvent>) -> Vec<(UserId, WsServerMessage)> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push((event.user_id, event.message));
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn ledger_changes_push_balances_to_their_user() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (private_tx, mut private_rx) = broadcast::channel::<PrivateEvent>(64);
+        let (writer, _metrics) = spawn_writer_with_wal(
+            funded_core(),
+            tx,
+            Vec::new(),
+            8,
+            None,
+            Vec::new(),
+            Some(private_tx),
+        );
+
+        writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 3);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+
+        // The recipient is pushed, not the calling issuer.
+        writer.issue(2, MARKET, 1, 8).await.unwrap().unwrap();
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 2);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_trade_pushes_fills_and_balances_to_both_sides() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (private_tx, mut private_rx) = broadcast::channel::<PrivateEvent>(64);
+        let (writer, _metrics) = spawn_writer_with_wal(
+            funded_core(),
+            tx,
+            Vec::new(),
+            8,
+            None,
+            Vec::new(),
+            Some(private_tx),
+        );
+
+        writer
+            .command(
+                2,
+                Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: MARKET,
+                    side: Side::Sell,
+                    price_ticks: 5_000,
+                    qty: 2,
+                    escrow: false,
+                }),
+            )
+            .await
+            .unwrap();
+        let response = writer
+            .command(
+                1,
+                Command::PlaceMarket(PlaceMarket {
+                    client_order_id: 2,
+                    market_id: MARKET,
+                    side: Side::Buy,
+                    qty: 2,
+                    protect_price_ticks: 5_000,
+                    escrow: false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, OrderStatus::Filled);
+
+        // Each side hears about its own fill even if it is not watching this
+        // market's public feed.
+        let (maker, message) = next_private(&mut private_rx).await;
+        assert_eq!(maker, 2);
+        let WsServerMessage::FillSelf { fill } = &message else {
+            panic!("expected a private fill, got {message:?}");
+        };
+        assert_eq!(fill.maker_user_id, 2);
+        assert_eq!(fill.taker_user_id, 1);
+        assert_eq!(fill.qty, 2);
+        let (taker, message) = next_private(&mut private_rx).await;
+        assert_eq!(taker, 1);
+        assert!(matches!(message, WsServerMessage::FillSelf { .. }));
+
+        // Then one balance refresh per side, after the fill settled.
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 2);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 1);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+    }
+
+    #[tokio::test]
+    async fn escrow_settlement_pushes_to_both_parties() {
+        let (tx, _rx) = broadcast::channel(16);
+        let (private_tx, mut private_rx) = broadcast::channel::<PrivateEvent>(64);
+        let (writer, _metrics) = spawn_writer_with_wal(
+            funded_core(),
+            tx,
+            Vec::new(),
+            8,
+            None,
+            Vec::new(),
+            Some(private_tx),
+        );
+
+        // Escrowed fills need an escrow-enabled market and a seller key.
+        const ESCROW_MARKET: MarketId = 3;
+        let seller_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        writer
+            .register_public_key(2, seller_key)
+            .await
+            .unwrap()
+            .unwrap();
+        writer.deposit(2, 100_000_000, 11).await.unwrap().unwrap();
+        writer.deposit(1, 100_000_000, 12).await.unwrap().unwrap();
+        writer
+            .issue(2, ESCROW_MARKET, 1, 13)
+            .await
+            .unwrap()
+            .unwrap();
+        // Clear the setup pushes so the fill events can be asserted in order.
+        assert_eq!(drain_ready(&mut private_rx).len(), 3);
+
+        writer
+            .command(
+                2,
+                Command::PlaceLimit(PlaceLimit {
+                    client_order_id: 1,
+                    market_id: ESCROW_MARKET,
+                    side: Side::Sell,
+                    price_ticks: 4_000,
+                    qty: 1,
+                    escrow: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let response = writer
+            .command(
+                1,
+                Command::PlaceMarket(PlaceMarket {
+                    client_order_id: 2,
+                    market_id: ESCROW_MARKET,
+                    side: Side::Buy,
+                    qty: 1,
+                    protect_price_ticks: 4_000,
+                    escrow: true,
+                }),
+            )
+            .await
+            .unwrap();
+        let OrderStatus::Filled = response.status else {
+            panic!("expected an escrow fill, got {:?}", response.status);
+        };
+
+        // Each side hears its own fill, and it carries the escrow id.
+        let (maker, message) = next_private(&mut private_rx).await;
+        assert_eq!(maker, 2);
+        let WsServerMessage::FillSelf { fill } = &message else {
+            panic!("expected a private fill, got {message:?}");
+        };
+        assert_eq!(fill.escrow_id, Some(1));
+        assert_eq!(fill.taker_user_id, 1);
+        let (taker, message) = next_private(&mut private_rx).await;
+        assert_eq!(taker, 1);
+        assert!(matches!(message, WsServerMessage::FillSelf { .. }));
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 2);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+        let (user_id, message) = next_private(&mut private_rx).await;
+        assert_eq!(user_id, 1);
+        assert!(matches!(message, WsServerMessage::Balances { .. }));
+
+        // No settle pushes exist yet.
+        assert!(drain_ready(&mut private_rx).is_empty());
+
+        // The buyer disputes the delivery, the admin rules for the seller.
+        let escrow = writer
+            .escrows(1)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|record| record.market_id == ESCROW_MARKET)
+            .expect("escrow created for the fill");
+        writer
+            .escrow_reject(1, escrow.trade_id, "late delivery".into(), "".into())
+            .await
+            .unwrap()
+            .unwrap();
+        writer
+            .admin_rule(
+                3,
+                escrow.trade_id,
+                dkx_escrow::AdminRuling::Seller,
+                "ok".into(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Both parties learn the ruling and get a balance refresh, buyer first.
+        for user_id in [1, 2] {
+            let (pushed, message) = next_private(&mut private_rx).await;
+            assert_eq!(pushed, user_id);
+            let WsServerMessage::EscrowUpdate { record } = &message else {
+                panic!("expected an escrow push, got {message:?}");
+            };
+            assert_eq!(record.trade_id, escrow.trade_id);
+            let (pushed, message) = next_private(&mut private_rx).await;
+            assert_eq!(pushed, user_id);
+            assert!(matches!(message, WsServerMessage::Balances { .. }));
+        }
+        assert!(drain_ready(&mut private_rx).is_empty());
     }
 }

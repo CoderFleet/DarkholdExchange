@@ -1,0 +1,5 @@
+{
+  "type": "Balances",
+  "user_id": 9,
+  "balances": [{ "asset": { "kind": "cash" }, "available": 150000, "held": 2000 }]
+}

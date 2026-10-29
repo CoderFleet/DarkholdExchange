@@ -42,6 +42,72 @@ fn rejected_matches_fixture() {
 }
 
 #[test]
+fn balances_matches_fixture() {
+    let m = WsServerMessage::Balances {
+        user_id: 9,
+        balances: vec![Balance {
+            asset: Asset::Cash,
+            available: 150_000,
+            held: 2_000,
+        }],
+    };
+    assert_eq!(serde_json::to_value(&m).unwrap(), fixture("balances.json"));
+    let back: WsServerMessage = serde_json::from_value(fixture("balances.json")).unwrap();
+    assert_eq!(back, m);
+}
+
+/// Private per-user fill push (row 7): only token-checked private streams
+/// carry it, so skipping `escrow_id` means a plain spot fill.
+#[test]
+fn fill_self_matches_fixture() {
+    let m = WsServerMessage::FillSelf {
+        fill: Fill {
+            trade_id: 31,
+            market_id: 1,
+            maker_order_id: 11,
+            taker_order_id: 12,
+            maker_user_id: 2,
+            taker_user_id: 9,
+            maker_side: Side::Sell,
+            price_ticks: 5_000,
+            qty: 2,
+            seq: 77,
+            escrow_id: None,
+        },
+    };
+    assert_eq!(serde_json::to_value(&m).unwrap(), fixture("fill_self.json"));
+    let back: WsServerMessage = serde_json::from_value(fixture("fill_self.json")).unwrap();
+    assert_eq!(back, m);
+}
+
+#[test]
+fn escrow_update_matches_fixture() {
+    let m = WsServerMessage::EscrowUpdate {
+        record: EscrowRecord {
+            trade_id: 31,
+            market_id: 1,
+            buyer_id: 9,
+            seller_id: 2,
+            qty: 2,
+            notional: 100_000,
+            fee: 1_500,
+            fee_payer: 9,
+            state: EscrowState::PendingDelivery,
+            created_at_ms: 1_000,
+            deadline_ms: 301_000,
+            delivered_at_ms: None,
+            seller_public_key: [0x1a; 32],
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&m).unwrap(),
+        fixture("escrow_update.json")
+    );
+    let back: WsServerMessage = serde_json::from_value(fixture("escrow_update.json")).unwrap();
+    assert_eq!(back, m);
+}
+
+#[test]
 fn delta_matches_fixture() {
     let m = WsServerMessage::Delta {
         delta: BookDelta {
