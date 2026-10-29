@@ -2,7 +2,7 @@
 
 > **Source of truth:** [`docs/spec/darkhold-spec.pdf`](spec/darkhold-spec.pdf)
 >
-> **Baseline audited:** `main` @ `9a764ee` on 2026-10-28
+> **Baseline audited:** `main` @ `249db4a` on 2026-10-29
 >
 > **Purpose:** this is the short working checklist for the Webster 2026 spec. Update the relevant
 > row when work lands instead of re-reading the PDF or re-auditing the whole repository.
@@ -21,7 +21,7 @@
 | Frequent batch auctions with commit-reveal | ✅ | Complete 3-phase engine: Commit (SHA-256 hash commitment), Reveal (pre-image verification + cash reservation), and Settlement (clearing at uniform price that clears supply; ties broken deterministically). WAL ops, gateway REST endpoints (`/api/batch-auctions/...`), and tests are live. |
 | Escrow with signed delivery receipts, disputes, and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. A buyer can open a dispute after delivery and an admin ruling resolves it to a buyer refund or seller release. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
-| Hash-chained public audit log + browser verification | 🟡 | Hash primitives and browser verifier exist and are tested, but no audit records are produced or exposed, and there is no audit UI. |
+| Hash-chained public audit log + browser verification | ✅ | The gateway writes hash-chained records for trades, issuances, escrow releases/refunds and market publishes (kinds 1–5). `GET /api/audit/log` + `/api/audit/head` are public, and `/verify` verifies the chain plus golden-vector/property tests (`web/src/lib/hash.test.ts`). Caveat: the chain lives in gateway memory and starts from genesis at every restart — persistence (WAL or the `0003` Postgres tables) is not wired yet. |
 | Per-identity/per-IP rate limits + adaptive proof-of-work | ✅ | Token-bucket rate limits per IP, per user and for login/sign-up (429 + `Retry-After`, `docs/AUTH.md` section 8). Addresses that keep hitting them must solve signed, single-use, rising-difficulty puzzles (428; `docs/AUTH.md` section 9). |
 | Bot/scalper simulator + bots-vs-humans switch | 🟡 | `dx-simulator` / `dx-load` can generate load, but there is no attack/defence UI switch. |
 | Order-book replay/scrubber | 🟡 | Core replay is covered by a test; there is no replay API or UI scrubber. |
@@ -34,7 +34,7 @@
 | Deterministic replay from the log | ✅ | Gateway recovery replays WAL operations into the seeded core and checks stored post-state checkpoints. Workspace tests and a live SIGKILL restart produce the same final hash. |
 | k6/Locust thresholds | ❌ | `bench/k6` and `bench/locust` are empty; the custom Rust harness is the current substitute. |
 | Playwright E2E | ❌ | `@playwright/test` is installed, but there is no config or E2E suite. |
-| fast-check property tests | ❌ | `fast-check` is installed, but no frontend property tests use it. |
+| fast-check property tests | ✅ | Used by `web/src/lib/hash.test.ts` for Merkle-path tamper and audit-chain property tests; book-rebuild/resync property tests are still an optional extension. |
 | TypeScript frontend | 🚫 | Deliberate decision to stay on JavaScript; see `docs/DECISIONS.md`. |
 | Comlink worker RPC | 🚫 | `comlink` is a declared dependency, but the worker uses raw `postMessage`. Keep the dependency only if there is a plan to use it, otherwise remove it. |
 
@@ -47,16 +47,16 @@
 | 3 | Per-identity holding limits | ✅ | Core tracks open buys, held passes, and pending escrow passes for the buyer. | — |
 | 4 | Double-entry ledger, reservations before matching | ✅ | `crates/ledger`, atomic settlement, conservation and negative-balance tests. | — |
 | 5 | Idempotency keys and replay-safe retries | ✅ | Core idempotency cache + tests. | — |
-| 6 | JWT auth + roles | 🟡 | Real login/signup/JWT, admin/issuer roles, durable accounts when `DATABASE_URL` is set. Private terminal/wallet/history routes require a login; the client never sends an impersonating dev header. | - |
+| 6 | JWT auth + roles | ✅ | Real login/signup/JWT, admin/issuer roles, durable accounts when `DATABASE_URL` is set. Private terminal/wallet/history routes require a login; the client never sends an impersonating dev header. WS feeds check the same token (row 7). | — |
 | 7 | WebSocket auth | ✅ | `/ws` and `/ws/market/{id}` verify `?token=<jwt>` before upgrading; a bad token or a `user_id` that is not the token's user is refused (401/403). A bare `?user_id=` counts only while `DX_DEV_AUTH` is on; with neither the connection is an anonymous viewer of public market data. | Private per-user messages (T2) must require a token, not an anonymous viewer. |
 | 8 | L2 snapshot + sequenced diffs + gap resync | ✅ | Gateway publisher, worker rebuild, market terminal. | — |
 | 9 | 20–50 ms batching and slow-consumer protection | ✅ | WS batching, bounded buffers, slow-consumer metrics. | — |
 | 10 | Dutch auction | ✅ | `crates/types/src/auction.rs` (integer decay curve), core create/accept/expire with CAS quantity, reserved seller passes, atomic settlement, WAL replay, and the `/auctions` UI. | Optional: background expiry timer and seller cancellation before the deadline. |
 | 11 | Batch auction + commit-reveal | ✅ | Complete 3-phase lifecycle: Commit (SHA-256 hash), Reveal (pre-image verification, cash reserved), and Settle (uniform-price clearing with deterministic tie-breaks). Exposed via `/api/batch-auctions/...`, verified by backend unit/integration tests, and fully interactive in the web UI at `/auctions` (tabs, sealed bid commitment, pre-image reveal, and clearing trigger). | — |
-| 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered → Released` on a valid receipt, or `Refunded` after the deadline. After delivery the buyer can open `Disputed`; an admin ruling resolves it to `Released` (seller) or `Refunded` (buyer). Ledger hold/release/refund journals, writer state, admin routes, and the admin disputes page are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. Refund is triggered manually by either party after the deadline; there is no background timer yet. | Optional T3 timer service to auto-submit refunds. |
+| 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered → Released` on a valid receipt, or `Refunded` after the deadline. The buyer can accept, open `Disputed` (admin ruling resolves to `Released` or `Refunded`), or stay silent: when the inspection window (`ESCROW_INSPECTION_SECS`) passes with no complaint, escrow auto-releases to the seller on the next read, and the UI counts it down. Ledger journals, writer state, admin routes and the admin disputes page are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. A pre-deadline refund must still be triggered manually; auto-release is lazy (on read), not a background scanner. | Optional: push-based timer instead of read-triggered auto-release. |
 | 13 | ed25519 signed delivery receipts | ✅ | `dx-types` canonical bytes, core seller-key registry, `ed25519-dalek` verification, WAL-logged key registration/release, and browser Web Crypto seller signing. | — |
 | 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
-| 15 | Hash-chained audit log | 🟡 | `crates/hash/src/audit.rs` + `web/src/lib/hash.ts` + golden vectors. No records/endpoint/UI. | Record sequenced commands, expose `GET /api/audit`, verify the chain on `/verify`. |
+| 15 | Hash-chained audit log | ✅ | Gateway writer appends hash-chained records for fills (kind 1), issuance (kind 2), escrow release (kind 3), escrow refund (kind 4) and admin-published markets (kind 5). Public `GET /api/audit/log?from_seq=` and `/api/audit/head`; `/verify` re-verifies the chain with the shared `dkx-hash` vectors (`web/src/lib/hash.test.ts`). | Chain still resets to genesis at a gateway restart — persistence (WAL op or the `0003_stage7_solvency_audit.sql` tables) is not wired yet. |
 | 16 | Per-user/per-IP rate limits | ✅ | `crates/limits` token buckets, applied by `crates/gateway/src/rate.rs`; 429 + `Retry-After`; env-configurable; off for load tests. | Keep numbers under review after the load test. |
 | 17 | Adaptive proof-of-work | ✅ | `crates/pow` (signed single-use challenges, strikes), `GET /api/pow/challenge`, 428 `pow_required`, browser Web Worker solver in `web/src/pow/`. | Tune the difficulty after the load test. |
 | 18 | Bot/scalper simulator + defence switch | 🟡 | `dx-simulator`, `dx-load`, `scripts/load-test.sh`, recorded results. | Add attack/defence scenarios and a UI toggle if the demo needs it. |
@@ -70,7 +70,7 @@
 | 26 | Deterministic WAL replay | ✅ | `wal::replay` rebuilds state and verifies periodic post-state checkpoints; writer recovery tests and the live restart check pass. | — |
 | 27 | k6/Locust load thresholds | ❌ | Empty `bench/k6` and `bench/locust`; Rust harness used instead. | Add k6 or document a justified equivalent. |
 | 28 | Playwright E2E | ❌ | Package installed; no config/tests. | Add smoke flows: login, place order, fill, verify, speed. |
-| 29 | fast-check frontend tests | ❌ | Package installed; no usage in `web/src`. | Add property tests for book rebuild/resync or remove the dependency. |
+| 29 | fast-check frontend tests | ✅ | `web/src/lib/hash.test.ts` uses `fast-check` properties for Merkle paths (tamper detection) and audit chains (broken links, bad hash, reordering). 125 web tests cover calls and flows. | Optional: property-test the worker's book rebuild/resync. |
 | 30 | TypeScript frontend | 🚫 | JavaScript decision recorded in `docs/DECISIONS.md`. | Keep the decision documented; do not half-migrate. |
 | 31 | Comlink worker RPC | 🚫 | Package installed; worker uses raw `postMessage`. | Either adopt it or remove the unused dependency. |
 | 32 | Admin publishing reaches the engine | ✅ | Admin publish → writer `CreateMarket` → `Core::add_market` → engine book; tested at engine, core, writer, and gateway. Live check published market 100 and `/api/markets` returned it `Open` with book seq 0. | New markets appear via `/api/markets` on reload; no WS market-opened frame yet. |
@@ -92,9 +92,9 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 
 | Owner | Remaining checklist items |
 |---|---|
-| **T1 — Rudransh** | optional Playwright place/match/cancel smoke test. |
-| **T2 — Shraddha** | Audit-chain records + `GET /api/audit` + browser verification; WAL snapshot compaction; PostgreSQL projection; replay service/page; private user WS. |
-| **T3 — Stuti** | Batch auction + commit-reveal; escrow timer service; bot simulator UI; k6/Locust thresholds; Playwright setup. |
+| **T1 — Rudransh** | Optional Playwright place/match/cancel smoke test (row 28). |
+| **T2 — Shraddha** | Private per-user WS push (row 7 finish); persist the audit chain across restarts (row 15); PostgreSQL projection wiring (row 21); WAL snapshot compaction (row 22); replay service + UI scrubber (row 19). |
+| **T3 — Stuti** | Bot-defence UI / attack-defence scenarios (row 18); k6/Locust thresholds or a documented substitute (row 27); Playwright suite (row 28, with T1); optional push-based escrow timer and Dutch-auction expiry timer/background cancellation. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
 
@@ -115,9 +115,12 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 - **Admin-published markets need a reload:** publishing creates the market and its book in the
   engine, but there is no WebSocket “market opened” frame yet. The market appears through
   `/api/markets` on the next load. Issuance is still required before trading.
-- **Escrow timeout is 5 minutes and manual:** either party can trigger the refund after the deadline;
-  there is no background timer service yet. Buyer disputes and admin rulings are implemented after
-  delivery, but they are still opened and resolved manually.
+- **Escrow settles itself at the deadline:** when the inspection window passes with no buyer complaint, escrow
+  auto-releases to the seller (checked lazily on escrow reads, with a countdown in the UI). A pre-deadline refund
+  or a dispute is still opened/resolved manually by the parties/admin; there is no push-based background scanner.
+- **The audit chain resets on restart:** it lives in gateway memory and starts from genesis each boot, so the
+  published head before a restart is not carried over. Rows 15/24 stand until the chain is WAL-persisted or
+  written to the `0003_stage7_solvency_audit.sql` tables (which exist but are unused).
 - **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
   core/WAL, but the private key is browser-local and is not a production key-management story.
 - **Dutch auctions expire manually:** after the deadline the seller must call expire to recover
@@ -128,7 +131,8 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 - **Market 3 is the seeded escrow market:** it starts with an empty book and seeded pass inventory.
   Old WALs from before the market-3 seed change fail their state-hash checkpoint; clear `data/log`
   in development.
-- **WebSocket feed is public:** an anonymous viewer may connect to the market feed. A future private user WebSocket must refuse anonymous viewers.
+- **WebSocket identity requires a token:** `/ws` and `/ws/market/{id}` verify `?token=`; an anonymous viewer still
+  receives the public market feed. A future private per-user WS (own order/balance updates) must reuse that check.
 - **`web/full-smoke-run.mjs` is not part of the repo:** it has a hard-coded temp path and imports
   `playwright` instead of the declared `@playwright/test`. Keep it untracked or rewrite it as a real
   Playwright test.
@@ -137,19 +141,21 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 ## Recommended work queue
 
-1. **Trust finish (T2 — Shraddha):** audit-chain records + `GET /api/audit` + browser verification section.
-2. **Escrow follow-ups (T3):** background timer service for automatic timeout refunds. Buyer disputes and admin rulings are already implemented.
-3. **Batch auction (T3 — Stuti, with T1 engine hooks):** commit-reveal and uniform clearing.
-4. **Fairness (T3 — Stuti):** rate limits and adaptive proof-of-work are done (rows 16 and 17). The bot-defence UI (bot simulator page) is still to do.
-5. **Verification (T1/T2/T3):** optional Playwright E2E, k6 or documented substitute, fast-check usage. WAL replay is done; the differential matcher is deferred.
-6. **Operations (T2 + T3):** WAL snapshot compaction, PostgreSQL projection. (Docker/Caddy deployment is done.)
+1. **Bot defence UI (T3 — Stuti, row 18):** attack/defence scenarios in `dx-simulator` and a demo toggle.
+2. **Private per-user WS push (T2 — Shraddha):** own order/fill/balance updates on a token-checked connection.
+3. **Audit persistence (T2 — Shraddha, row 15):** WAL op or the `0003` Postgres tables so the published head survives a restart.
+4. **Replay service + UI scrubber (T2/T1, row 19).**
+5. **PostgreSQL projection wiring (T2 — Shraddha, row 21).**
+6. **Verification (T1/T3):** Playwright E2E suite; k6/Locust thresholds or a documented equivalent (rows 27/28).
+7. **Operations (T2 — Shraddha, row 22):** wire the existing `dkx-wal` snapshot path into the gateway for compaction.
 
 ## Submission honesty
 
-The PDF abstract names a Dutch-auction engine, escrow, and a cryptographic proof of solvency. The
-Dutch auction, escrow v1, and solvency proof are now real. Batch auction is still missing. Before the
-deadline, either implement it or explicitly mark it as **not delivered** in the final README and demo
-script. Do not let the abstract imply that a running feature exists when it does not.
+The PDF abstract names a Dutch-auction engine, frequent batch auction, escrow, and a cryptographic
+proof of solvency. All four are now real: Dutch auction, batch auction with commit-reveal, escrow
+with receipts/disputes/auto-release, and Merkle-sum solvency with browser verification. The honest
+gaps are the audit chain's restart persistence, the bot-defence UI, the unused Postgres projection
+and `dkx-wal` snapshot path, and public replay/scrubber. Say so explicitly in the README/demo script.
 
 ## Verification commands
 
