@@ -662,6 +662,7 @@ dependencies = [
  "axum",
  "dkx-escrow",
  "dkx-hash",
+ "dkx-projection",
  "dkx-wal",
  "dx-admin",
  "dx-auth",

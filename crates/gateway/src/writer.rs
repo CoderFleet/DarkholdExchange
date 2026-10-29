@@ -12,12 +12,14 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::projection::ProjectionFeed;
 use crate::wal::{WalOp, WalSession};
 use dkx_escrow::{AdminRuling, DisputeRecord};
 use dkx_hash::{
     AuditRecord, GENESIS_PREV_HASH, hash_audit_entry, hash_merkle_leaf, hash_merkle_node,
     pair_with_empty,
 };
+use dkx_projection::ProjectionEvent;
 use dx_core::Core;
 use dx_solvency::SolvencySnapshot;
 use dx_types::{
@@ -978,9 +980,19 @@ pub(crate) fn spawn_writer(
     recent_trades: Vec<Fill>,
     capacity: usize,
 ) -> (WriterHandle, Arc<MetricsState>) {
-    spawn_writer_with_wal(core, tx, recent_trades, capacity, None, Vec::new(), None)
+    spawn_writer_with_wal(
+        core,
+        tx,
+        recent_trades,
+        capacity,
+        None,
+        Vec::new(),
+        None,
+        None,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_writer_with_wal(
     core: Core,
     tx: broadcast::Sender<WsServerMessage>,
@@ -989,6 +1001,9 @@ pub(crate) fn spawn_writer_with_wal(
     wal: Option<WalSession>,
     audit_backfill: Vec<AuditRecord>,
     private: Option<broadcast::Sender<PrivateEvent>>,
+    // Row 21: channel the projection events flow through (already connected to
+    // the database worker, together with the last persisted projection seq).
+    projection: Option<(tokio::sync::mpsc::UnboundedSender<ProjectionEvent>, u64)>,
 ) -> (WriterHandle, Arc<MetricsState>) {
     let metrics = Arc::new(MetricsState::new(core.last_seq()));
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel(capacity.max(1));
@@ -1011,6 +1026,7 @@ pub(crate) fn spawn_writer_with_wal(
                 wal,
                 audit_backfill,
                 writer_private,
+                projection,
             )
         })
         .expect("spawn core writer");
@@ -1305,7 +1321,11 @@ fn writer_loop(
     mut wal: Option<WalSession>,
     audit_backfill: Vec<AuditRecord>,
     private: Option<broadcast::Sender<PrivateEvent>>,
+    projection: Option<(tokio::sync::mpsc::UnboundedSender<ProjectionEvent>, u64)>,
 ) {
+    // Row 21: convert core state changes into projection events, ordered from
+    // the sequence the database worker last persisted.
+    let mut projection = projection.map(|(sender, last_seq)| ProjectionFeed::new(sender, last_seq));
     let mut snapshot_cache = SnapshotCache::default();
     let mut stashed_job: Option<WriterJob> = None;
 
@@ -1366,7 +1386,21 @@ fn writer_loop(
     for record in core.all_escrow_records() {
         escrow_store.maybe_create_from_core_record(&record);
     }
+    // A restart replays the recent tape as trade rows; trade inserts dedupe on
+    // the trade id, and older rows the tape no longer holds were already
+    // projected (the only lost ones can be trades from the crash window if the
+    // projection lagged the WAL).
+    if let Some(feed) = projection.as_mut() {
+        for fill in &recent_trades {
+            feed.emit_trade(fill);
+        }
+    }
     loop {
+        // Row 21: publish anything the projection worker may have missed
+        // (also the catch-up flush right after a restart).
+        if let Some(feed) = projection.as_mut() {
+            feed.flush(&core);
+        }
         // Periodic 30s Merkle tree rebuild
         if last_tree_build_time.elapsed() >= Duration::from_secs(30)
             || current_solvency_tree.is_none()
@@ -1454,6 +1488,15 @@ fn writer_loop(
                     // One fresh balance snapshot per side, after all fills settled.
                     for user_id in &balance_users {
                         push_balances(&private, &core, *user_id);
+                    }
+                    // Row 21: each fresh fill is one trade row in the read model.
+                    if let Some(feed) = projection.as_mut() {
+                        for fill in &recent_trades[start_idx..] {
+                            feed.emit_trade(fill);
+                        }
+                        // Also flush the journal/escrow state this batch just
+                        // created, even when the writer is about to stop.
+                        feed.flush(&core);
                     }
                 }
                 // Populate escrow store from any newly escrowed fills
@@ -2068,6 +2111,12 @@ fn writer_loop(
                     .and_then(|tree| tree.proof(user_id));
                 let _ = reply.send(proof_data);
             }
+        }
+        // Row 21: flush projection events after every processed job, so money
+        // and escrow changes never wait for the next command before being
+        // projected.
+        if let Some(feed) = projection.as_mut() {
+            feed.flush(&core);
         }
     }
 }
@@ -2693,6 +2742,7 @@ mod tests {
             Some(wal),
             Vec::new(),
             None,
+            None,
         );
 
         writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
@@ -2777,6 +2827,7 @@ mod tests {
             Some(wal),
             Vec::new(),
             None,
+            None,
         );
 
         writer.issue(2, MARKET, 2, 7).await.unwrap().unwrap();
@@ -2794,7 +2845,7 @@ mod tests {
         let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
         let (tx2, _rx2) = broadcast::channel(16);
         let (writer, _metrics) =
-            spawn_writer_with_wal(restored, tx2, fills, 16, Some(wal), audit, None);
+            spawn_writer_with_wal(restored, tx2, fills, 16, Some(wal), audit, None, None);
 
         // New records continue the previous head, not a fresh sequence.
         writer.issue(2, MARKET, 1, 77).await.unwrap().unwrap();
@@ -3003,6 +3054,7 @@ mod tests {
             None,
             Vec::new(),
             Some(private_tx),
+            None,
         );
 
         writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
@@ -3029,6 +3081,7 @@ mod tests {
             None,
             Vec::new(),
             Some(private_tx),
+            None,
         );
 
         writer
@@ -3096,6 +3149,7 @@ mod tests {
             None,
             Vec::new(),
             Some(private_tx),
+            None,
         );
 
         // Escrowed fills need an escrow-enabled market and a seller key.

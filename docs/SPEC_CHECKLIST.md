@@ -60,9 +60,9 @@
 | 16 | Per-user/per-IP rate limits | ✅ | `crates/limits` token buckets, applied by `crates/gateway/src/rate.rs`; 429 + `Retry-After`; env-configurable; off for load tests. | Keep numbers under review after the load test. |
 | 17 | Adaptive proof-of-work | ✅ | `crates/pow` (signed single-use challenges, strikes), `GET /api/pow/challenge`, 428 `pow_required`, browser Web Worker solver in `web/src/pow/`. | Tune the difficulty after the load test. |
 | 18 | Bot/scalper simulator + defence switch | 🟡 | `dx-simulator`, `dx-load`, `scripts/load-test.sh`, recorded results. | Add attack/defence scenarios and a UI toggle if the demo needs it. |
-| 19 | Order-book replay/scrubber | 🟡 | Core replay test; no live replay API. | Add snapshot + delta replay endpoint and a UI time scrubber. |
+| 19 | Order-book replay/scrubber | 🚫 | Core replay test; no live replay API. **Deliberate skip:** the replay data is already available in the WAL and the read model; decided too low value for the remaining budget. | Not planned; revisit only if a demo needs historical book playback. |
 | 20 | Live metrics/latency panel | ✅ | `/api/metrics/latency`, gateway histograms, `/speed`, `latency.*`, `SpeedPanel.jsx`. | Populate it by placing orders during the demo. |
-| 21 | PostgreSQL read models | 🟡 | `crates/dkx-projection`, migrations, SQL queries. Not wired into gateway. | Start the projection worker behind a flag; add integration test. |
+| 21 | PostgreSQL read models | ✅ | `crates/dkx-projection` is now wired into the gateway (row 21 follow-up resolved): when `DATABASE_URL` is set and `DX_PROJECTION` != 0, the gateway bootstraps `schema.sql` (projection_state, ledger_entries/legs, balances, pass_balances, trades, escrows, disputes) and spawns an apply worker; the writer thread feeds `ProjectionEvent`s (journal entries with id-keyed dedup, executed trades, escrow upserts, absolute per-user balance snapshots since real reservations are unjournaled). HTTP routes still serve from the in-memory core, so the DB is a persistent replica that survives restarts: a restart re-emits all journals/the recent trade tape/escrow state and every insert is idempotent (live-verified: balances, trades and `ledger_legs` are byte-identical across restarts; a fresh container rebuilt the full history). Disputes stay memory-side (the core has no dispute records to publish). The worker retries failed batches, which are idempotent by seq. | — |
 | 22 | WAL + crash recovery | ✅ | `dkx-wal` record/hash-chain/recovery plus gateway `wal.rs`; writer group-commits commands, deposits, issuance, and market creation, with a post-state checkpoint at least every 256 operations. Snapshots/compaction are wired (row 22 follow-up resolved): the writer snapshots the full core state on the first batch and every 10,000 operations; `dkx-wal` fsyncs the snapshot, rolls a new segment, then deletes every pre-snapshot segment and older snapshot file; startup restores from the snapshot (verified state hash) and replays only post-snapshot records. Live check: fresh WAL, one resting order → 1 segment + 1 snapshot; `SIGKILL`, restart, `/api/state/hash` matched; second order past the snapshot, second `SIGKILL`, restarted, hash matched again. | — |
 | 23 | Docker/Caddy/nginx deployment | ✅ | `deploy/gateway.Dockerfile`, `deploy/web.Dockerfile`, `deploy/Caddyfile`, full `docker-compose.yml` with health checks and restart policy. Built and run in Docker on 2026-10-28; seeded, logged in, live feed through the proxy. | HTTPS needs a real domain; no automated container test in CI yet. |
 | 24 | Performance targets | ✅ | `bench/results/` records WAL-on 2026-10-26 runs: 995.50 placements/s, 999.90 fills/s, 7.54 ms place ack p99, 8.88 ms fill ack p99. | Add CI thresholds or clearly document the substitute. |
@@ -93,7 +93,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Optional Playwright place/match/cancel smoke test (row 28). |
-| **T2 — Shraddha** | PostgreSQL projection wiring (row 21); replay service + UI scrubber (row 19). Rows 7, 15, and 22 are done. |
+| **T2 — Shraddha** | Replay service + UI scrubber (row 19, deliberately skipped). Rows 7, 15, 21, and 22 are done. |
 | **T3 — Stuti** | Bot-defence UI / attack-defence scenarios (row 18); k6/Locust thresholds or a documented substitute (row 27); Playwright suite (row 28, with T1); optional push-based escrow timer and Dutch-auction expiry timer/background cancellation. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
@@ -160,8 +160,8 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 1. **Bot defence UI (T3 — Stuti, row 18):** attack/defence scenarios in `dx-simulator` and a demo toggle.
 2. **Private per-user WS push (T2 — Shraddha):** own order/fill/balance updates on a token-checked connection.
 3. **Audit persistence (T2 — Shraddha, row 15):** ~~WAL op or the `0003` Postgres tables so the published head survives a restart~~ **Done:** audit records are persisted verbatim in the WAL and re-verified on recovery.
-4. **Replay service + UI scrubber (T2/T1, row 19).**
-5. **PostgreSQL projection wiring (T2 — Shraddha, row 21).**
+4. ~~**Replay service + UI scrubber (T2/T1, row 19).**~~ **Skipped:** decided against (see row 19).
+5. ~~**PostgreSQL projection wiring (T2 — Shraddha, row 21).**~~ **Done:** worker behind `DATABASE_URL` + `DX_PROJECTION`, schema bootstrap from `crates/dkx-projection/schema.sql`, writer-side event feed, idempotent restart catch-up.
 6. **Verification (T1/T3):** Playwright E2E suite; k6/Locust thresholds or a documented equivalent (rows 27/28).
 7. **Operations (T2 — Shraddha, row 22):** wire the existing `dkx-wal` snapshot path into the gateway for compaction.
 
@@ -170,8 +170,9 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 The PDF abstract names a Dutch-auction engine, frequent batch auction, escrow, and a cryptographic
 proof of solvency. All four are now real: Dutch auction, batch auction with commit-reveal, escrow
 with receipts/disputes/auto-release, and Merkle-sum solvency with browser verification. The honest
-gaps are the bot-defence UI, the unused Postgres projection, the `dkx-wal` snapshot path, and public
-replay/scrubber. (The audit chain now also persists across restarts via the WAL.) Say so explicitly in the README/demo script.
+gaps are the bot-defence UI, the skipped replay service (row 19), and the missing k6/Playwright
+suites. (The audit chain persists across restarts via the WAL, and the Postgres projection is
+wired and idempotent.) Say so explicitly in the README/demo script.
 
 ## Verification commands
 

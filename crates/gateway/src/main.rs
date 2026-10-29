@@ -6,6 +6,7 @@
 //! (the default locally), a request without a token may identify itself with an explicit
 //! `x-dev-user` header; there is no default dev user.
 
+mod projection;
 mod rate;
 mod wal;
 mod writer;
@@ -303,6 +304,8 @@ async fn main() {
     let (private_tx, _) = broadcast::channel::<writer::PrivateEvent>(512);
 
     let (tx, _) = broadcast::channel(512);
+    // Row 21: PostgreSQL projection feed — None when disabled or unreachable.
+    let projection = projection::spawn_projection_worker().await;
     let (writer, metrics) = spawn_writer_with_wal(
         core,
         tx,
@@ -311,6 +314,7 @@ async fn main() {
         wal,
         audit_backfill,
         Some(private_tx),
+        projection,
     );
     // Events and tiers for the admin console. Publishing creates a live market
     // through the same single-writer queue as every other core change.
@@ -2686,7 +2690,7 @@ mod tests {
         let seed_fill_count = seed_fills.len();
         let (tx, _rx) = broadcast::channel(16);
         let (writer, _metrics) =
-            spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal), Vec::new(), None);
+            spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal), Vec::new(), None, None);
 
         let response = writer
             .command(1, limit(900001, Side::Sell, 5_200, 1))

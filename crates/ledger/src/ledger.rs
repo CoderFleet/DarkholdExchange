@@ -523,6 +523,18 @@ impl Ledger {
         self.journals.len()
     }
 
+    /// Journal entries with id greater than `after_id`, in ascending id order.
+    /// Journal ids are contiguous (id n sits at index n-1), so this is a slice
+    /// off the end of the journal log. Row 21 uses this to forward new entries
+    /// to the PostgreSQL projection.
+    pub fn journals_since(&self, after_id: u64) -> Vec<JournalEntry> {
+        self.journals
+            .iter()
+            .skip((after_id as usize).min(self.journals.len()))
+            .cloned()
+            .collect()
+    }
+
     pub fn journal(&self, key: JournalKey) -> Option<&JournalEntry> {
         self.key_index
             .get(&key)

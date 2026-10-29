@@ -987,6 +987,12 @@ impl Core {
         records
     }
 
+    /// Journal entries with id greater than `after_id` (ascending). Convenience
+    /// accessor for the PostgreSQL projection feed (row 21).
+    pub fn journals_since(&self, after_id: u64) -> Vec<dx_ledger::JournalEntry> {
+        self.ledger.journals_since(after_id)
+    }
+
     /// Escrow records where `user_id` is the buyer or seller, oldest first.
     pub fn escrow_records(&self, user_id: UserId) -> Vec<EscrowRecord> {
         let mut records: Vec<_> = self

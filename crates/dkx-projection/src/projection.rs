@@ -22,6 +22,22 @@ impl ProjectionWorker {
         Self { pool }
     }
 
+    /// Connects to a PostgreSQL instance. Caller decides how to surface a
+    /// failure; the gateway falls back to memory-only operation.
+    pub async fn connect(url: &str) -> Result<Self, sqlx::Error> {
+        Ok(Self {
+            pool: sqlx::PgPool::connect(url).await?,
+        })
+    }
+
+    /// Creates the read-model schema (idempotent). Row 21 wiring entry point.
+    pub async fn bootstrap(&self) -> Result<(), sqlx::Error> {
+        sqlx::raw_sql(include_str!("../schema.sql"))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn get_last_seq(&self) -> Result<u64, ProjectionError> {
         let row: (i64,) = sqlx::query_as("SELECT last_seq FROM projection_state WHERE id = 1")
             .fetch_one(&self.pool)
@@ -59,8 +75,12 @@ impl ProjectionWorker {
                         let kind_str = format!("{:?}", entry.kind);
                         let idem_str = entry.key.0.to_string();
 
-                        // 1. Insert header (ON CONFLICT DO NOTHING for idempotency)
-                        sqlx::query(
+                        // 1. Insert header (ON CONFLICT DO NOTHING for idempotency).
+                        // If the header already exists the whole entry was
+                        // projected before (rows_affected == 0), so the legs and
+                        // balance updates are skipped too — they are not
+                        // conflict-guarded and would otherwise double-count.
+                        let inserted = sqlx::query(
                             r#"
                             INSERT INTO ledger_entries (id, seq, idem_key, kind, ts)
                             VALUES ($1, $2, $3::NUMERIC, $4, $5)
@@ -79,26 +99,27 @@ impl ProjectionWorker {
                         .await?;
 
                         // 2. Insert legs and update balances
-                        for leg in &entry.legs {
-                            let account_str = format!("{:?}", leg.account);
-                            let asset_str = format!("{:?}", leg.asset);
+                        if inserted.rows_affected() > 0 {
+                            for leg in &entry.legs {
+                                let account_str = format!("{:?}", leg.account);
+                                let asset_str = format!("{:?}", leg.asset);
 
-                            sqlx::query(
-                                r#"
+                                sqlx::query(
+                                    r#"
                                 INSERT INTO ledger_legs (entry_id, account, asset, amount)
                                 VALUES ($1, $2, $3, $4)
                                 "#,
-                            )
-                            .bind(entry.id as i64)
-                            .bind(account_str)
-                            .bind(asset_str)
-                            .bind(leg.amount)
-                            .execute(&mut *tx)
-                            .await?;
+                                )
+                                .bind(entry.id as i64)
+                                .bind(account_str)
+                                .bind(asset_str)
+                                .bind(leg.amount)
+                                .execute(&mut *tx)
+                                .await?;
 
-                            match leg.account {
-                                Account::CashAvail(user_id) => {
-                                    sqlx::query(
+                                match leg.account {
+                                    Account::CashAvail(user_id) => {
+                                        sqlx::query(
                                         r#"
                                         INSERT INTO balances (user_id, cash_avail, cash_locked, escrow_cash, updated_seq)
                                         VALUES ($1, $2, 0, 0, $3)
@@ -111,9 +132,9 @@ impl ProjectionWorker {
                                     .bind(*event_seq as i64)
                                     .execute(&mut *tx)
                                     .await?;
-                                }
-                                Account::CashLocked(user_id) => {
-                                    sqlx::query(
+                                    }
+                                    Account::CashLocked(user_id) => {
+                                        sqlx::query(
                                         r#"
                                         INSERT INTO balances (user_id, cash_avail, cash_locked, escrow_cash, updated_seq)
                                         VALUES ($1, 0, $2, 0, $3)
@@ -126,9 +147,9 @@ impl ProjectionWorker {
                                     .bind(*event_seq as i64)
                                     .execute(&mut *tx)
                                     .await?;
-                                }
-                                Account::PassAvail(user_id, market_id) => {
-                                    sqlx::query(
+                                    }
+                                    Account::PassAvail(user_id, market_id) => {
+                                        sqlx::query(
                                         r#"
                                         INSERT INTO pass_balances (user_id, market_id, avail, locked, held)
                                         VALUES ($1, $2, $3, 0, 0)
@@ -141,9 +162,9 @@ impl ProjectionWorker {
                                     .bind(leg.amount)
                                     .execute(&mut *tx)
                                     .await?;
-                                }
-                                Account::PassLocked(user_id, market_id) => {
-                                    sqlx::query(
+                                    }
+                                    Account::PassLocked(user_id, market_id) => {
+                                        sqlx::query(
                                         r#"
                                         INSERT INTO pass_balances (user_id, market_id, avail, locked, held)
                                         VALUES ($1, $2, 0, $3, 0)
@@ -156,9 +177,9 @@ impl ProjectionWorker {
                                     .bind(leg.amount)
                                     .execute(&mut *tx)
                                     .await?;
-                                }
-                                Account::PassHeld(user_id, market_id) => {
-                                    sqlx::query(
+                                    }
+                                    Account::PassHeld(user_id, market_id) => {
+                                        sqlx::query(
                                         r#"
                                         INSERT INTO pass_balances (user_id, market_id, avail, locked, held)
                                         VALUES ($1, $2, 0, 0, $3)
@@ -171,9 +192,10 @@ impl ProjectionWorker {
                                     .bind(leg.amount)
                                     .execute(&mut *tx)
                                     .await?;
+                                    }
+                                    Account::EscrowCash => {}
+                                    _ => {}
                                 }
-                                Account::EscrowCash => {}
-                                _ => {}
                             }
                         }
                     }
@@ -264,6 +286,49 @@ impl ProjectionWorker {
                         .bind(note)
                         .execute(&mut *tx)
                         .await?;
+                    }
+                    ProjectionEvent::BalancesSet {
+                        seq,
+                        user_id,
+                        snapshot,
+                    } => {
+                        // Absolute state: overwrite the cash row and replace the
+                        // user's pass rows. Order in the stream matters — the
+                        // writer re-states balances after every job.
+                        sqlx::query(
+                            r#"
+                            INSERT INTO balances (user_id, cash_avail, cash_locked, escrow_cash, updated_seq)
+                            VALUES ($1, $2, $3, 0, $4)
+                            ON CONFLICT (user_id) DO UPDATE
+                            SET cash_avail = $2, cash_locked = $3, updated_seq = $4
+                            "#,
+                        )
+                        .bind(*user_id as i64)
+                        .bind(snapshot.cash_available)
+                        .bind(snapshot.cash_held)
+                        .bind(*seq as i64)
+                        .execute(&mut *tx)
+                        .await?;
+
+                        sqlx::query("DELETE FROM pass_balances WHERE user_id = $1")
+                            .bind(*user_id as i64)
+                            .execute(&mut *tx)
+                            .await?;
+
+                        for pass in &snapshot.passes {
+                            sqlx::query(
+                                r#"
+                                INSERT INTO pass_balances (user_id, market_id, avail, locked, held)
+                                VALUES ($1, $2, $3, 0, $4)
+                                "#,
+                            )
+                            .bind(*user_id as i64)
+                            .bind(pass.market_id as i32)
+                            .bind(pass.available)
+                            .bind(pass.held)
+                            .execute(&mut *tx)
+                            .await?;
+                        }
                     }
                 }
 

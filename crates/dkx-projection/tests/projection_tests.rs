@@ -68,6 +68,7 @@ fn test_projection_events_generation() {
         },
         fee: 100,
         escrow_id: None,
+        seq: 11,
     });
 
     assert_eq!(trade_event.seq(), 11);

@@ -17,6 +17,7 @@ dkx-hash = { version = "0.1.0", path = "../hash" }
 dx-store = { version = "0.1.0", path = "../store" }
 dx-types = { version = "0.1.0", path = "../types" }
 dkx-wal = { version = "0.1.0", path = "../dkx-wal" }
+dkx-projection = { version = "0.1.0", path = "../dkx-projection" }
 ed25519-dalek = { version = "2.1", default-features = false, features = ["fast", "std"] }
 futures-util = "0.3"
 hex = "0.4"
