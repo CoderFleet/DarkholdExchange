@@ -93,7 +93,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Optional Playwright place/match/cancel smoke test (row 28). |
-| **T2 — Shraddha** | Private per-user WS push (row 7, done — the web wallet store now consumes the push) — audit-chain restart persistence (row 15) is done; WAL snapshot compaction (row 22, done: the gateway now hosts the dkx-wal snapshot path with startup restore, state-hash verification, and log compaction); PostgreSQL projection wiring (row 21); replay service + UI scrubber (row 19). |
+| **T2 — Shraddha** | PostgreSQL projection wiring (row 21); replay service + UI scrubber (row 19). Rows 7, 15, and 22 are done. |
 | **T3 — Stuti** | Bot-defence UI / attack-defence scenarios (row 18); k6/Locust thresholds or a documented substitute (row 27); Playwright suite (row 28, with T1); optional push-based escrow timer and Dutch-auction expiry timer/background cancellation. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
