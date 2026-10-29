@@ -21,7 +21,7 @@
 | Frequent batch auctions with commit-reveal | ✅ | Complete 3-phase engine: Commit (SHA-256 hash commitment), Reveal (pre-image verification + cash reservation), and Settlement (clearing at uniform price that clears supply; ties broken deterministically). WAL ops, gateway REST endpoints (`/api/batch-auctions/...`), and tests are live. |
 | Escrow with signed delivery receipts, disputes, and timeout refunds | ✅ | Per-market escrow holds buyer cash and seller passes in system accounts, releases only against an ed25519 receipt, and refunds after the deadline. A buyer can open a dispute after delivery and an admin ruling resolves it to a buyer refund or seller release. Live flow released a market-3 trade and survived WAL restart. |
 | Merkle-sum proof of solvency | ✅ | Real per-asset Merkle-sum trees, inclusion proofs, `/api/solvency`, `/api/me/solvency`, and `/verify`. Live check showed 4/4 proofs valid. |
-| Hash-chained public audit log + browser verification | ✅ | The gateway writes hash-chained records for trades, issuances, escrow releases/refunds and market publishes (kinds 1–5). `GET /api/audit/log` + `/api/audit/head` are public, and `/verify` verifies the chain plus golden-vector/property tests (`web/src/lib/hash.test.ts`). Caveat: the chain lives in gateway memory and starts from genesis at every restart — persistence (WAL or the `0003` Postgres tables) is not wired yet. |
+| Hash-chained public audit log + browser verification | ✅ | The gateway writes hash-chained records for trades, issuances, escrow releases/refunds and market publishes (kinds 1–5). `GET /api/audit/log` + `/api/audit/head` are public, `/verify` verifies the chain, and every record is also persisted to the WAL so the chain continues across restarts (recovery re-verifies the links from the genesis hash and refuses a tampered log). |
 | Per-identity/per-IP rate limits + adaptive proof-of-work | ✅ | Token-bucket rate limits per IP, per user and for login/sign-up (429 + `Retry-After`, `docs/AUTH.md` section 8). Addresses that keep hitting them must solve signed, single-use, rising-difficulty puzzles (428; `docs/AUTH.md` section 9). |
 | Bot/scalper simulator + bots-vs-humans switch | 🟡 | `dx-simulator` / `dx-load` can generate load, but there is no attack/defence UI switch. |
 | Order-book replay/scrubber | 🟡 | Core replay is covered by a test; there is no replay API or UI scrubber. |
@@ -56,7 +56,7 @@
 | 12 | Escrow state machine | ✅ | `PendingDelivery → Delivered → Released` on a valid receipt, or `Refunded` after the deadline. The buyer can accept, open `Disputed` (admin ruling resolves to `Released` or `Refunded`), or stay silent: when the inspection window (`ESCROW_INSPECTION_SECS`) passes with no complaint, escrow auto-releases to the seller on the next read, and the UI counts it down. Ledger journals, writer state, admin routes and the admin disputes page are tested. Market 3 is escrow-enabled; admin-published tiers can opt in. A pre-deadline refund must still be triggered manually; auto-release is lazy (on read), not a background scanner. | Optional: push-based timer instead of read-triggered auto-release. |
 | 13 | ed25519 signed delivery receipts | ✅ | `dx-types` canonical bytes, core seller-key registry, `ed25519-dalek` verification, WAL-logged key registration/release, and browser Web Crypto seller signing. | — |
 | 14 | Merkle-sum solvency | ✅ | `crates/solvency`, `crates/hash/src/merkle.rs`, gateway routes, `/verify`, shared golden vectors. Snapshot `seq` uses the core state version, so deposits and issuance advance it. | — |
-| 15 | Hash-chained audit log | ✅ | Gateway writer appends hash-chained records for fills (kind 1), issuance (kind 2), escrow release (kind 3), escrow refund (kind 4) and admin-published markets (kind 5). Public `GET /api/audit/log?from_seq=` and `/api/audit/head`; `/verify` re-verifies the chain with the shared `dkx-hash` vectors (`web/src/lib/hash.test.ts`). | Chain still resets to genesis at a gateway restart — persistence (WAL op or the `0003_stage7_solvency_audit.sql` tables) is not wired yet. |
+| 15 | Hash-chained audit log | ✅ | Gateway writer appends hash-chained records for fills (kind 1), issuance (kind 2), escrow release (kind 3), escrow refund (kind 4) and admin-published markets (kind 5). Public `GET /api/audit/log?from_seq=` and `/api/audit/head`; `/verify` re-verifies the chain with the shared `dkx-hash` vectors (`web/src/lib/hash.test.ts`). Each record is also written verbatim to the WAL (record kind 3), and recovery rebuilds the chain and re-verifies genesis + every link, so the published head survives restarts. | Deposits, cancels and dispute rulings create no audit records today (spec lists trade events only). With `DX_WAL=0` the chain stays memory-only and resets each boot. |
 | 16 | Per-user/per-IP rate limits | ✅ | `crates/limits` token buckets, applied by `crates/gateway/src/rate.rs`; 429 + `Retry-After`; env-configurable; off for load tests. | Keep numbers under review after the load test. |
 | 17 | Adaptive proof-of-work | ✅ | `crates/pow` (signed single-use challenges, strikes), `GET /api/pow/challenge`, 428 `pow_required`, browser Web Worker solver in `web/src/pow/`. | Tune the difficulty after the load test. |
 | 18 | Bot/scalper simulator + defence switch | 🟡 | `dx-simulator`, `dx-load`, `scripts/load-test.sh`, recorded results. | Add attack/defence scenarios and a UI toggle if the demo needs it. |
@@ -93,7 +93,7 @@ Source: `Darkhold_Work_Distribution.pdf` (8 pages, read 2026-10-27).
 | Owner | Remaining checklist items |
 |---|---|
 | **T1 — Rudransh** | Optional Playwright place/match/cancel smoke test (row 28). |
-| **T2 — Shraddha** | Private per-user WS push (row 7 finish); persist the audit chain across restarts (row 15); PostgreSQL projection wiring (row 21); WAL snapshot compaction (row 22); replay service + UI scrubber (row 19). |
+| **T2 — Shraddha** | Private per-user WS push (row 7 finish) — audit-chain restart persistence (row 15) is done; PostgreSQL projection wiring (row 21); WAL snapshot compaction (row 22); replay service + UI scrubber (row 19). |
 | **T3 — Stuti** | Bot-defence UI / attack-defence scenarios (row 18); k6/Locust thresholds or a documented substitute (row 27); Playwright suite (row 28, with T1); optional push-based escrow timer and Dutch-auction expiry timer/background cancellation. |
 
 The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and the `/verify` page. The speed panel and market charts are **T1 (Rudransh)** work. **T1 landed:** gateway WAL/crash recovery, deterministic replay, `/api/state/hash`, WAL-on benchmarks, and the solvency state-version fix.
@@ -118,9 +118,12 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 - **Escrow settles itself at the deadline:** when the inspection window passes with no buyer complaint, escrow
   auto-releases to the seller (checked lazily on escrow reads, with a countdown in the UI). A pre-deadline refund
   or a dispute is still opened/resolved manually by the parties/admin; there is no push-based background scanner.
-- **The audit chain resets on restart:** it lives in gateway memory and starts from genesis each boot, so the
-  published head before a restart is not carried over. Rows 15/24 stand until the chain is WAL-persisted or
-  written to the `0003_stage7_solvency_audit.sql` tables (which exist but are unused).
+- **The audit chain persists through the WAL:** every audit record is logged verbatim (WAL record kind 3, no
+  post-state hash because it does not change core state) right after the operation that produced it. Recovery
+  rebuilds the chain from the log and refuses to start if the first record does not link from the genesis hash
+  or any hash/link fails re-verification. A log written by a build older than this change replays fine (it has
+  no audit records, so the chain starts empty); the reverse is not true — an old build cannot replay a log that
+  contains audit records.
 - **Escrow seller keys in the browser demo live in `localStorage`:** the public key is registered in
   core/WAL, but the private key is browser-local and is not a production key-management story.
 - **Dutch auctions expire manually:** after the deadline the seller must call expire to recover
@@ -143,7 +146,7 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 
 1. **Bot defence UI (T3 — Stuti, row 18):** attack/defence scenarios in `dx-simulator` and a demo toggle.
 2. **Private per-user WS push (T2 — Shraddha):** own order/fill/balance updates on a token-checked connection.
-3. **Audit persistence (T2 — Shraddha, row 15):** WAL op or the `0003` Postgres tables so the published head survives a restart.
+3. **Audit persistence (T2 — Shraddha, row 15):** ~~WAL op or the `0003` Postgres tables so the published head survives a restart~~ **Done:** audit records are persisted verbatim in the WAL and re-verified on recovery.
 4. **Replay service + UI scrubber (T2/T1, row 19).**
 5. **PostgreSQL projection wiring (T2 — Shraddha, row 21).**
 6. **Verification (T1/T3):** Playwright E2E suite; k6/Locust thresholds or a documented equivalent (rows 27/28).
@@ -154,8 +157,8 @@ The trust work landed in **T2 (Shraddha)** territory: Merkle-sum solvency and th
 The PDF abstract names a Dutch-auction engine, frequent batch auction, escrow, and a cryptographic
 proof of solvency. All four are now real: Dutch auction, batch auction with commit-reveal, escrow
 with receipts/disputes/auto-release, and Merkle-sum solvency with browser verification. The honest
-gaps are the audit chain's restart persistence, the bot-defence UI, the unused Postgres projection
-and `dkx-wal` snapshot path, and public replay/scrubber. Say so explicitly in the README/demo script.
+gaps are the bot-defence UI, the unused Postgres projection, the `dkx-wal` snapshot path, and public
+replay/scrubber. (The audit chain now also persists across restarts via the WAL.) Say so explicitly in the README/demo script.
 
 ## Verification commands
 

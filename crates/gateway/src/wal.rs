@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use dkx_hash::AuditRecord;
 use dkx_wal::{LogRecord, Wal};
 use dx_core::Core;
 use dx_types::{
@@ -17,6 +18,9 @@ use serde::{Deserialize, Serialize};
 
 const KIND_OP: u8 = 1;
 const KIND_STATE: u8 = 2;
+/// Observational audit records. They do not change core state, so no
+/// post-state hash follows them; recovery still verifies their own hash chain.
+const KIND_AUDIT: u8 = 3;
 // Tests force a checkpoint after every operation; production amortizes the full-state hash.
 #[cfg(test)]
 const CHECKPOINT_EVERY: usize = 1;
@@ -109,6 +113,51 @@ pub(crate) struct WalSession {
     ops_since_state: usize,
 }
 
+/// The audit entry as it is persisted to the log: the exact fields of
+/// `dkx_hash::AuditRecord`, plus the terminal hash, so recovery can rebuild and
+/// re-verify the published chain instead of re-deriving it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AuditLogEntry {
+    pub seq: u64,
+    pub ts_micros: u64,
+    pub prev: [u8; 32],
+    pub kind: u8,
+    pub market: u32,
+    pub qty: u32,
+    pub price: i64,
+    pub hash: [u8; 32],
+}
+
+impl From<&AuditRecord> for AuditLogEntry {
+    fn from(record: &AuditRecord) -> Self {
+        Self {
+            seq: record.seq,
+            ts_micros: record.ts_micros,
+            prev: record.prev,
+            kind: record.kind,
+            market: record.market,
+            qty: record.qty,
+            price: record.price,
+            hash: record.hash,
+        }
+    }
+}
+
+impl From<AuditLogEntry> for AuditRecord {
+    fn from(entry: AuditLogEntry) -> Self {
+        Self {
+            seq: entry.seq,
+            ts_micros: entry.ts_micros,
+            prev: entry.prev,
+            kind: entry.kind,
+            market: entry.market,
+            qty: entry.qty,
+            price: entry.price,
+            hash: entry.hash,
+        }
+    }
+}
+
 impl WalSession {
     pub(crate) fn open(
         base_dir: impl AsRef<Path>,
@@ -163,12 +212,32 @@ impl WalSession {
             .map(|_| ())
             .map_err(|error| format!("append WAL: {error}"))
     }
+
+    /// Append one audit record as its own log entry. It carries no post-state
+    /// hash because it does not change core state; recovery re-verifies the
+    /// audit record's own hash chain instead.
+    pub(crate) fn append_audit(&mut self, record: &AuditRecord) -> Result<(), String> {
+        let entry = AuditLogEntry::from(record);
+        let payload = rmp_serde::to_vec_named(&entry)
+            .map_err(|error| format!("encode audit log entry: {error}"))?;
+        self.wal
+            .append_batch(&[(KIND_AUDIT, payload)])
+            .map(|_| ())
+            .map_err(|error| format!("append audit record: {error}"))
+    }
 }
 
-/// Rebuild a core from WAL records, verifying every post-state checkpoint.
-pub(crate) fn replay(records: &[LogRecord], core: &mut Core) -> Result<Vec<Fill>, String> {
+/// Rebuild a core from WAL records, verifying every post-state checkpoint, and
+/// collect the persisted audit chain so a restart can continue the published
+/// log instead of starting from genesis.
+pub(crate) fn replay_with_audit(
+    records: &[LogRecord],
+    core: &mut Core,
+    audit: &mut Vec<AuditRecord>,
+) -> Result<Vec<Fill>, String> {
     let mut recent_trades = Vec::new();
     let mut ops_since_state = 0usize;
+    audit.clear();
 
     for record in records {
         match record.kind {
@@ -196,9 +265,21 @@ pub(crate) fn replay(records: &[LogRecord], core: &mut Core) -> Result<Vec<Fill>
                 }
                 ops_since_state = 0;
             }
+            KIND_AUDIT => {
+                let entry: AuditLogEntry = rmp_serde::from_slice(&record.payload)
+                    .map_err(|error| format!("decode audit record {}: {error}", record.seq))?;
+                audit.push(AuditRecord::from(entry));
+            }
             other => return Err(format!("unknown WAL record kind {other}")),
         }
     }
+
+    if let Some(first) = audit.first()
+        && first.prev != dkx_hash::GENESIS_PREV_HASH
+    {
+        return Err("WAL audit chain does not start from the genesis hash".into());
+    }
+    dkx_hash::verify_audit_chain(audit).map_err(|error| format!("WAL audit chain: {error}"))?;
 
     // A crash can tear the final state-hash record after the operation records were
     // fully written. Those operations were never acknowledged, so replaying them is
@@ -430,7 +511,8 @@ mod tests {
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let mut restored = Core::new(seed_markets()).unwrap();
-        let fills = replay(&recovered.replayed_records, &mut restored).unwrap();
+        let fills =
+            replay_with_audit(&recovered.replayed_records, &mut restored, &mut Vec::new()).unwrap();
 
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(restored.snapshot(100, 10).unwrap(), expected_snapshot);
@@ -448,7 +530,12 @@ mod tests {
             dkx_wal::LogRecord::new(1, 1, dkx_wal::GENESIS_PREV_HASH, KIND_STATE, vec![0; 32])
                 .unwrap();
 
-        let error = replay(&[record], &mut Core::new(seed_markets()).unwrap()).unwrap_err();
+        let error = replay_with_audit(
+            &[record],
+            &mut Core::new(seed_markets()).unwrap(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(error.contains("without any operation"), "{error}");
     }
 
@@ -464,8 +551,12 @@ mod tests {
             dkx_wal::LogRecord::new(1, 1, dkx_wal::GENESIS_PREV_HASH, KIND_OP, payload).unwrap();
         let state = dkx_wal::LogRecord::new(2, 2, operation.hash, KIND_STATE, vec![0; 32]).unwrap();
 
-        let error =
-            replay(&[operation, state], &mut Core::new(seed_markets()).unwrap()).unwrap_err();
+        let error = replay_with_audit(
+            &[operation, state],
+            &mut Core::new(seed_markets()).unwrap(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
         assert!(error.contains("state hash mismatch"), "{error}");
     }
 
@@ -497,7 +588,7 @@ mod tests {
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let mut restored = Core::new(seed_markets()).unwrap();
-        replay(&recovered.replayed_records, &mut restored).unwrap();
+        replay_with_audit(&recovered.replayed_records, &mut restored, &mut Vec::new()).unwrap();
 
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(
@@ -518,7 +609,7 @@ mod tests {
             dkx_wal::LogRecord::new(1, 1, dkx_wal::GENESIS_PREV_HASH, KIND_OP, payload).unwrap();
         let mut core = Core::new(seed_markets()).unwrap();
 
-        replay(&[record], &mut core).unwrap();
+        replay_with_audit(&[record], &mut core, &mut Vec::new()).unwrap();
         assert_eq!(core.balance(1, dx_types::Asset::Cash).available, 1_000_000);
     }
     #[test]
@@ -618,7 +709,7 @@ mod tests {
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let mut restored = Core::new(seed_markets()).unwrap();
-        replay(&recovered.replayed_records, &mut restored).unwrap();
+        replay_with_audit(&recovered.replayed_records, &mut restored, &mut Vec::new()).unwrap();
 
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(
@@ -709,7 +800,7 @@ mod tests {
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let mut restored = Core::new(seed_markets()).unwrap();
-        replay(&recovered.replayed_records, &mut restored).unwrap();
+        replay_with_audit(&recovered.replayed_records, &mut restored, &mut Vec::new()).unwrap();
 
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(restored.dutch_auction(1).unwrap(), &settled);
@@ -731,5 +822,123 @@ mod tests {
                 held: 0,
             }
         );
+    }
+
+    /// Build a self-consistent audit record the way the writer does.
+    fn audit_record(
+        seq: u64,
+        prev: &[u8; 32],
+        kind: u8,
+        market: u32,
+        qty: u32,
+        price: i64,
+    ) -> AuditRecord {
+        let ts_micros = seq * 1_000_000;
+        let hash = dkx_hash::hash_audit_entry(seq, ts_micros, prev, kind, market, qty, price);
+        AuditRecord {
+            seq,
+            ts_micros,
+            prev: *prev,
+            kind,
+            market,
+            qty,
+            price,
+            hash,
+        }
+    }
+
+    #[test]
+    fn replay_carries_the_persisted_audit_chain() {
+        let dir = tempdir().unwrap();
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut wal =
+            WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let mut core = Core::new(seed_markets()).unwrap();
+
+        // The writer logs each audit record right after the operation that
+        // produced it, so replay sees the same interleaving.
+        apply_and_log(
+            &mut core,
+            &mut wal,
+            WalOp::Deposit {
+                user_id: 1,
+                amount: 2_000_000,
+                client_request_id: 1,
+            },
+        );
+        let issue_op = WalOp::Issue {
+            user_id: 1,
+            market_id: 1,
+            qty: 2,
+            client_request_id: 2,
+        };
+        let mut fills = Vec::new();
+        apply_op(&mut core, &issue_op, &mut fills).unwrap();
+        wal.append(&issue_op, core.state_hash()).unwrap();
+        let issued = audit_record(1, &dkx_hash::GENESIS_PREV_HASH, 2, 1, 2, 0);
+        wal.append_audit(&issued).unwrap();
+
+        let expected = vec![issued];
+        drop(wal);
+
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut restored = Core::new(seed_markets()).unwrap();
+        let mut replayed_audit = Vec::new();
+        replay_with_audit(
+            &recovered.replayed_records,
+            &mut restored,
+            &mut replayed_audit,
+        )
+        .unwrap();
+        assert_eq!(replayed_audit, expected);
+
+        // A restarted writer continues the chain from the recovered head.
+        let next = audit_record(2, &replayed_audit[0].hash, 1, 1, 2, 10_000);
+        assert_eq!(next.prev, expected[0].hash);
+    }
+
+    #[test]
+    fn replay_rejects_a_forged_audit_hash() {
+        let entry = AuditLogEntry {
+            seq: 1,
+            ts_micros: 1_000_000,
+            prev: dkx_hash::GENESIS_PREV_HASH,
+            kind: 2,
+            market: 1,
+            qty: 2,
+            price: 0,
+            // Does not match the record's fields.
+            hash: [7; 32],
+        };
+        let payload = rmp_serde::to_vec_named(&entry).unwrap();
+        let record =
+            dkx_wal::LogRecord::new(1, 1, dkx_wal::GENESIS_PREV_HASH, KIND_AUDIT, payload).unwrap();
+
+        let error = replay_with_audit(
+            &[record],
+            &mut Core::new(seed_markets()).unwrap(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("audit chain"), "{error}");
+    }
+
+    #[test]
+    fn replay_rejects_an_audit_chain_that_skips_genesis() {
+        // The hash is self-consistent, but the first record of the chain must
+        // link to the genesis hash, not to a hash of nothing.
+        let record = audit_record(1, &[9; 32], 2, 1, 2, 0);
+        assert_ne!(record.prev, dkx_hash::GENESIS_PREV_HASH);
+        let payload = rmp_serde::to_vec_named(&AuditLogEntry::from(&record)).unwrap();
+        let log_record =
+            dkx_wal::LogRecord::new(1, 1, dkx_wal::GENESIS_PREV_HASH, KIND_AUDIT, payload).unwrap();
+
+        let error = replay_with_audit(
+            &[log_record],
+            &mut Core::new(seed_markets()).unwrap(),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(error.contains("genesis hash"), "{error}");
     }
 }

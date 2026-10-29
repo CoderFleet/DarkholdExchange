@@ -22,6 +22,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use dkx_hash::AuditRecord;
 use dx_core::Core;
 use dx_solvency::{PathDirection, SolvencyProof, SolvencyRoot, SolvencySnapshot};
 use dx_types::{
@@ -265,18 +266,22 @@ fn seeded_core() -> (Core, Vec<Fill>) {
     (core, seed_fills)
 }
 
-fn open_state(wal_dir: &str) -> Result<(Core, Vec<Fill>, wal::WalSession), String> {
+fn open_state(
+    wal_dir: &str,
+) -> Result<(Core, Vec<Fill>, Vec<AuditRecord>, wal::WalSession), String> {
     let (mut core, mut recent_trades) = seeded_core();
     let recovered = dkx_wal::recover(wal_dir).map_err(|error| format!("WAL recovery: {error}"))?;
     if recovered.snapshot.is_some() {
         return Err("WAL snapshots are not supported yet".into());
     }
 
-    let replayed = wal::replay(&recovered.replayed_records, &mut core)?;
-    recent_trades.extend(replayed);
+    let mut replayed_audit = Vec::new();
+    let replayed_fills =
+        wal::replay_with_audit(&recovered.replayed_records, &mut core, &mut replayed_audit)?;
+    recent_trades.extend(replayed_fills);
     core.check_invariants()?;
     let session = wal::WalSession::open(wal_dir, recovered.last_seq, recovered.last_hash)?;
-    Ok((core, recent_trades, session))
+    Ok((core, recent_trades, replayed_audit, session))
 }
 
 #[tokio::main]
@@ -287,17 +292,18 @@ async fn main() {
         .unwrap_or(true);
     let wal_dir = std::env::var("DX_WAL_DIR").unwrap_or_else(|_| ".".into());
 
-    let (core, seed_fills, wal) = if wal_enabled {
-        let (core, fills, wal) = open_state(&wal_dir).expect("WAL recovery");
-        (core, fills, Some(wal))
+    let (core, seed_fills, audit_backfill, wal) = if wal_enabled {
+        let (core, fills, audits, wal) = open_state(&wal_dir).expect("WAL recovery");
+        (core, fills, audits, Some(wal))
     } else {
         let (core, fills) = seeded_core();
-        (core, fills, None)
+        (core, fills, Vec::new(), None)
     };
     println!("core state hash: {}", hex::encode(core.state_hash()));
 
     let (tx, _) = broadcast::channel(512);
-    let (writer, metrics) = spawn_writer_with_wal(core, tx, seed_fills, queue_capacity(), wal);
+    let (writer, metrics) =
+        spawn_writer_with_wal(core, tx, seed_fills, queue_capacity(), wal, audit_backfill);
     // Events and tiers for the admin console. Publishing creates a live market
     // through the same single-writer queue as every other core change.
     let admin = admin_state(writer.clone());
@@ -2489,7 +2495,8 @@ mod tests {
         let (core, seed_fills) = seeded_core();
         let seed_fill_count = seed_fills.len();
         let (tx, _rx) = broadcast::channel(16);
-        let (writer, _metrics) = spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal));
+        let (writer, _metrics) =
+            spawn_writer_with_wal(core, tx, seed_fills, 16, Some(wal), Vec::new());
 
         let response = writer
             .command(1, limit(900001, Side::Sell, 5_200, 1))
@@ -2500,9 +2507,12 @@ mod tests {
         writer.shutdown().await.unwrap();
         drop(writer);
 
-        let (restored, recent_trades, _session) = open_state(dir.path().to_str().unwrap()).unwrap();
+        let (restored, recent_trades, replayed_audit, _session) =
+            open_state(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(recent_trades.len(), seed_fill_count);
+        // A rest is not part of the audit chain (no fills), so nothing was logged.
+        assert!(replayed_audit.is_empty());
     }
 
     fn limit(client_order_id: ClientOrderId, side: Side, price_ticks: Ticks, qty: Qty) -> Command {

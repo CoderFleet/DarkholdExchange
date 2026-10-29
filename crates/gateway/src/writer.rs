@@ -919,7 +919,7 @@ pub(crate) fn spawn_writer(
     recent_trades: Vec<Fill>,
     capacity: usize,
 ) -> (WriterHandle, Arc<MetricsState>) {
-    spawn_writer_with_wal(core, tx, recent_trades, capacity, None)
+    spawn_writer_with_wal(core, tx, recent_trades, capacity, None, Vec::new())
 }
 
 pub(crate) fn spawn_writer_with_wal(
@@ -928,6 +928,7 @@ pub(crate) fn spawn_writer_with_wal(
     mut recent_trades: Vec<Fill>,
     capacity: usize,
     wal: Option<WalSession>,
+    audit_backfill: Vec<AuditRecord>,
 ) -> (WriterHandle, Arc<MetricsState>) {
     let metrics = Arc::new(MetricsState::new(core.last_seq()));
     let (job_tx, job_rx) = std::sync::mpsc::sync_channel(capacity.max(1));
@@ -939,7 +940,17 @@ pub(crate) fn spawn_writer_with_wal(
 
     std::thread::Builder::new()
         .name("dx-core-writer".into())
-        .spawn(move || writer_loop(core, tx, recent_trades, writer_metrics, job_rx, wal))
+        .spawn(move || {
+            writer_loop(
+                core,
+                tx,
+                recent_trades,
+                writer_metrics,
+                job_rx,
+                wal,
+                audit_backfill,
+            )
+        })
         .expect("spawn core writer");
 
     let handle = WriterHandle {
@@ -954,6 +965,18 @@ fn append_wal(wal: &mut Option<WalSession>, op: &WalOp, state_hash: [u8; 32]) {
         && let Err(error) = wal.append(op, state_hash)
     {
         panic!("WAL append failed: {error}");
+    }
+}
+
+/// Persist one audit record to the log. The audit chain does not change core
+/// state, so no post-state hash follows it; recovery re-verifies the chain
+/// itself. Without a WAL (`DX_WAL=0`) the chain stays memory-only, which starts
+/// from genesis on every restart.
+fn persist_audit(wal: &mut Option<WalSession>, record: &AuditRecord) {
+    if let Some(wal) = wal
+        && let Err(error) = wal.append_audit(record)
+    {
+        panic!("audit log append failed: {error}");
     }
 }
 
@@ -1135,14 +1158,20 @@ fn writer_loop(
     metrics: Arc<MetricsState>,
     jobs: Receiver<WriterJob>,
     mut wal: Option<WalSession>,
+    audit_backfill: Vec<AuditRecord>,
 ) {
     let mut snapshot_cache = SnapshotCache::default();
     let mut stashed_job: Option<WriterJob> = None;
 
-    // Stage 7 Audit chain and solvency state
-    let mut audit_chain: Vec<AuditRecord> = Vec::new();
-    let mut next_audit_seq: u64 = 1;
-    let mut last_audit_hash: [u8; 32] = GENESIS_PREV_HASH;
+    // Stage 7 Audit chain and solvency state. A restart seeds the chain from the
+    // persisted audit records so the published head continues to grow instead of
+    // restarting at sequence 1.
+    let mut audit_chain = audit_backfill;
+    let mut next_audit_seq: u64 = audit_chain.last().map(|record| record.seq + 1).unwrap_or(1);
+    let mut last_audit_hash: [u8; 32] = audit_chain
+        .last()
+        .map(|record| record.hash)
+        .unwrap_or(GENESIS_PREV_HASH);
     let mut user_salts: HashMap<UserId, [u8; 16]> = HashMap::new();
     let mut current_solvency_tree: Option<SolvencyTreeData> = None;
     let mut last_tree_build_time = Instant::now() - Duration::from_secs(40); // Force initial build on start
@@ -1245,7 +1274,7 @@ fn writer_loop(
                             .map(|c| c.tick_size_minor)
                             .unwrap_or(100);
                         let price_paise = (fill.price_ticks as i64).saturating_mul(tick_size);
-                        record_audit(
+                        let record = record_audit(
                             &mut audit_chain,
                             &mut next_audit_seq,
                             &mut last_audit_hash,
@@ -1254,6 +1283,7 @@ fn writer_loop(
                             fill.qty as u32,
                             price_paise,
                         );
+                        persist_audit(&mut wal, &record);
                     }
                 }
                 // Populate escrow store from any newly escrowed fills
@@ -1387,7 +1417,7 @@ fn writer_loop(
                 let result = core.issue_passes(user_id, market_id, qty, client_request_id);
                 if result.is_ok() {
                     append_wal(&mut wal, &wal_op, core.state_hash());
-                    record_audit(
+                    let record = record_audit(
                         &mut audit_chain,
                         &mut next_audit_seq,
                         &mut last_audit_hash,
@@ -1396,6 +1426,7 @@ fn writer_loop(
                         qty as u32,
                         0,
                     );
+                    persist_audit(&mut wal, &record);
                 }
                 let _ = reply.send(result);
             }
@@ -1449,7 +1480,7 @@ fn writer_loop(
                     } else {
                         0
                     };
-                    record_audit(
+                    let audit_record = record_audit(
                         &mut audit_chain,
                         &mut next_audit_seq,
                         &mut last_audit_hash,
@@ -1458,6 +1489,7 @@ fn writer_loop(
                         record.qty as u32,
                         price_paise,
                     );
+                    persist_audit(&mut wal, &audit_record);
                 }
                 let _ = reply.send(result);
             }
@@ -1480,7 +1512,7 @@ fn writer_loop(
                     } else {
                         0
                     };
-                    record_audit(
+                    let audit_record = record_audit(
                         &mut audit_chain,
                         &mut next_audit_seq,
                         &mut last_audit_hash,
@@ -1489,6 +1521,7 @@ fn writer_loop(
                         record.qty as u32,
                         price_paise,
                     );
+                    persist_audit(&mut wal, &audit_record);
                 }
                 let _ = reply.send(result);
             }
@@ -1778,7 +1811,7 @@ fn writer_loop(
                 price_paise,
                 reply,
             } => {
-                let record = record_audit(
+                let audit_record = record_audit(
                     &mut audit_chain,
                     &mut next_audit_seq,
                     &mut last_audit_hash,
@@ -1787,7 +1820,8 @@ fn writer_loop(
                     qty,
                     price_paise,
                 );
-                let _ = reply.send(record);
+                persist_audit(&mut wal, &audit_record);
+                let _ = reply.send(audit_record);
             }
             WriterRequest::ProofSolvency { reply } => {
                 let root_data = if let Some(ref tree) = current_solvency_tree {
@@ -2432,7 +2466,7 @@ mod tests {
         let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
         let (tx, _rx) = broadcast::channel(16);
         let (writer, _metrics) =
-            spawn_writer_with_wal(funded_core(), tx, Vec::new(), 16, Some(wal));
+            spawn_writer_with_wal(funded_core(), tx, Vec::new(), 16, Some(wal), Vec::new());
 
         writer.deposit(3, 1_000_000, 7).await.unwrap().unwrap();
         let mut config = seed_markets().into_iter().next().unwrap();
@@ -2472,12 +2506,20 @@ mod tests {
 
         let expected_hash = writer.state_hash().await.unwrap();
         let expected_solvency_seq = writer.solvency(vec![]).await.unwrap().seq;
+        // Two audit records so far: the issuance (kind 2) and the trade (kind 1).
+        let expected_audit = writer.audit_log(None, 200).await.unwrap();
         writer.shutdown().await.unwrap();
         drop(writer);
 
         let recovered = dkx_wal::recover(dir.path()).unwrap();
         let mut restored = funded_core();
-        let fills = crate::wal::replay(&recovered.replayed_records, &mut restored).unwrap();
+        let mut replayed_audit = Vec::new();
+        let fills = crate::wal::replay_with_audit(
+            &recovered.replayed_records,
+            &mut restored,
+            &mut replayed_audit,
+        )
+        .unwrap();
         assert_eq!(restored.state_hash(), expected_hash);
         assert_eq!(
             build_solvency_snapshot(&restored, &[]).unwrap().seq,
@@ -2485,6 +2527,58 @@ mod tests {
         );
         assert_eq!(fills.len(), 1);
         assert_eq!(restored.balance(3, Asset::Cash).available, 1_000_000);
+        // The persisted chain reproduces exactly the chain that was served
+        // before the shutdown, so a restart does not reset the published log.
+        assert_eq!(replayed_audit, expected_audit);
+        assert_eq!(
+            replayed_audit.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            [2, 1]
+        );
+        assert_eq!(replayed_audit.first().unwrap().prev, GENESIS_PREV_HASH);
+    }
+
+    #[tokio::test]
+    async fn audit_chain_continues_across_a_writer_restart() {
+        let dir = tempdir().unwrap();
+        let initial_recovered = dkx_wal::recover(dir.path()).unwrap();
+        let wal = WalSession::open(
+            dir.path(),
+            initial_recovered.last_seq,
+            initial_recovered.last_hash,
+        )
+        .unwrap();
+        let (tx1, _rx1) = broadcast::channel(16);
+        let (writer, _metrics) =
+            spawn_writer_with_wal(funded_core(), tx1, Vec::new(), 16, Some(wal), Vec::new());
+
+        writer.issue(2, MARKET, 2, 7).await.unwrap().unwrap();
+        let expected_head = writer.audit_head().await.unwrap().unwrap();
+        assert_eq!(expected_head.seq, 1);
+        writer.shutdown().await.unwrap();
+        drop(writer);
+
+        // Restart: rebuild the core and the audit chain from the log.
+        let recovered = dkx_wal::recover(dir.path()).unwrap();
+        let mut restored = funded_core();
+        let mut audit = Vec::new();
+        let fills =
+            crate::wal::replay_with_audit(&recovered.replayed_records, &mut restored, &mut audit)
+                .unwrap();
+        assert_eq!(audit.last().unwrap().hash, expected_head.hash);
+
+        let wal = WalSession::open(dir.path(), recovered.last_seq, recovered.last_hash).unwrap();
+        let (tx2, _rx2) = broadcast::channel(16);
+        let (writer, _metrics) = spawn_writer_with_wal(restored, tx2, fills, 16, Some(wal), audit);
+
+        // New records continue the previous head, not a fresh sequence.
+        writer.issue(2, MARKET, 1, 77).await.unwrap().unwrap();
+        let next_head = writer.audit_head().await.unwrap().unwrap();
+        assert_eq!(next_head.seq, expected_head.seq + 1);
+        assert_eq!(next_head.prev, expected_head.hash);
+        let log = writer.audit_log(None, 200).await.unwrap();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.first().unwrap().hash, expected_head.hash);
+        writer.shutdown().await.unwrap();
     }
 
     #[tokio::test]
