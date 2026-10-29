@@ -11,6 +11,15 @@ import {
   refundEscrow,
 } from '../api'
 import { generateSellerKey, signDeliveryReceipt } from '../lib/escrowReceipt'
+import { getAuthToken } from '../authToken'
+import { applyPrivateFrame, isPrivateFrame } from '../feed/walletFeed'
+import { createWalletFeedClient } from '../feed/walletFeedClient'
+import { useMarketFeedStore } from './useMarketFeedStore'
+
+/** @type {ReturnType<typeof createWalletFeedClient> | null} */
+let privateFeedClient = null
+/** The user id + token identity the current socket was opened with. */
+let privateFeedKey = ''
 
 export const useWalletStore = create((set, get) => ({
   userId: null,
@@ -29,20 +38,28 @@ export const useWalletStore = create((set, get) => ({
   error: null,
   historyCursor: null,
   statementCursor: null,
+  /** @type {import('../feed/walletFeedClient').PrivateFeedStatus} */
+  privateFeedStatus: 'idle',
+  privateFeedError: null,
+  /** The user's most recent own fill, straight from the private feed. */
+  lastSelfFill: null,
 
-  setUserId: (userId) => {
+  setUserId: (/** @type {number | null} */ userId) => {
     set({
       userId,
       historyItems: [],
       statementItems: [],
       escrowItems: [],
       escrowPublicKey: null,
+      lastSelfFill: null,
     })
     get().fetchWallet()
     get().fetchEscrow()
+    get().connectPrivateFeed()
   },
 
   resetAccount: () => {
+    get().disconnectPrivateFeed()
     set({
       userId: null,
       cashAvail: 0,
@@ -60,7 +77,65 @@ export const useWalletStore = create((set, get) => ({
       error: null,
       historyCursor: null,
       statementCursor: null,
+      privateFeedStatus: 'idle',
+      privateFeedError: null,
+      lastSelfFill: null,
     })
+  },
+
+  /**
+   * Open the per-user private stream. One socket identity = user id + token;
+   * logging in or out reconnects it as the new identity.
+   */
+  connectPrivateFeed: () => {
+    const { userId } = get()
+    if (userId == null) return
+    // The server only opens private state for a token-checked socket. Without
+    // a token there is no private feed, not even a dev-mode one, so stay idle.
+    const token = getAuthToken()
+    if (!token) return
+    if (privateFeedClient && privateFeedKey === `${userId}:${token}`) return
+
+    privateFeedKey = `${userId}:${token}`
+    set({ privateFeedStatus: 'connecting', privateFeedError: null })
+    ensurePrivateFeedClient().connect({ userId, token })
+  },
+
+  disconnectPrivateFeed: () => {
+    privateFeedKey = ''
+    if (privateFeedClient) {
+      privateFeedClient.disconnect()
+      privateFeedClient = null
+    }
+    set({ privateFeedStatus: 'idle', privateFeedError: null })
+  },
+
+  /** One private frame from the wallet feed worker.
+   *
+   * @param {import('../protocol/generated/WsServerMessage').WsServerMessage} message
+   */
+  applyPrivateMessage: (message) => {
+    const { userId } = get()
+    if (userId == null || !isPrivateFrame(message)) return
+
+    const markets = useMarketFeedStore.getState().markets
+    const next = applyPrivateFrame(
+      message,
+      privateFragment(get()),
+      { userId, markets },
+    )
+    set(next.fragment)
+    if (next.needsEscrowRefresh && !get().escrowLoading) {
+      // A fill settled into escrow mints a brand-new record that has no push
+      // of its own; pick it up over REST once per fill.
+      get().fetchEscrow()
+    }
+  },
+
+  /** Force the wallet fragment back onto the REST truth (dev rescue hatch). */
+  rebaselinePrivateFeed: async () => {
+    await get().fetchWallet()
+    await get().fetchEscrow()
   },
 
   fetchWallet: async () => {
@@ -77,11 +152,11 @@ export const useWalletStore = create((set, get) => ({
         loading: false,
       })
     } catch (err) {
-      set({ error: err.message, loading: false })
+      set({ error: errorMessage(err), loading: false })
     }
   },
 
-  topup: async (amountRupees) => {
+  topup: async (/** @type {number} */ amountRupees) => {
     const { userId } = get()
     if (userId == null) throw new Error('Log in to top up your wallet')
     const amountPaise = Math.round(Number(amountRupees) * 100)
@@ -94,7 +169,7 @@ export const useWalletStore = create((set, get) => ({
       await get().fetchWallet()
       set({ topupLoading: false })
     } catch (err) {
-      set({ error: err.message, topupLoading: false })
+      set({ error: errorMessage(err), topupLoading: false })
       throw err
     }
   },
@@ -115,7 +190,7 @@ export const useWalletStore = create((set, get) => ({
         escrowLoading: false,
       })
     } catch (err) {
-      set({ error: err.message, escrowLoading: false })
+      set({ error: errorMessage(err), escrowLoading: false })
     }
   },
 
@@ -132,14 +207,21 @@ export const useWalletStore = create((set, get) => ({
       })
       return publicKey
     } catch (err) {
-      set({ error: err.message, escrowLoading: false })
+      set({ error: errorMessage(err), escrowLoading: false })
       throw err
     }
   },
 
+  /**
+   * Sign and release one pending delivery.
+   *
+   * @param {number} tradeId
+   */
   deliverEscrow: async (tradeId) => {
     const { userId, escrowItems } = get()
-    const record = escrowItems.find((item) => item.trade_id === tradeId)
+    const record = escrowItems.find(
+      (/** @type {{ trade_id: number }} */ item) => item.trade_id === tradeId,
+    )
     if (!record) throw new Error('Escrow record not found')
     const deliveredAtMs = Date.now()
     if (deliveredAtMs > record.deadline_ms) {
@@ -158,18 +240,23 @@ export const useWalletStore = create((set, get) => ({
       await releaseEscrow(tradeId, deliveredAtMs, signature)
       await Promise.all([get().fetchEscrow(), get().fetchWallet()])
     } catch (err) {
-      set({ error: err.message, escrowLoading: false })
+      set({ error: errorMessage(err), escrowLoading: false })
       throw err
     }
   },
 
+  /**
+   * Give up on one pending delivery and take the refund path.
+   *
+   * @param {number} tradeId
+   */
   refundEscrowAction: async (tradeId) => {
     set({ escrowLoading: true, error: null })
     try {
       await refundEscrow(tradeId)
       await Promise.all([get().fetchEscrow(), get().fetchWallet()])
     } catch (err) {
-      set({ error: err.message, escrowLoading: false })
+      set({ error: errorMessage(err), escrowLoading: false })
       throw err
     }
   },
@@ -184,7 +271,7 @@ export const useWalletStore = create((set, get) => ({
         historyCursor: res.next_cursor ?? null,
       })
     } catch (err) {
-      set({ error: err.message })
+      set({ error: errorMessage(err) })
     }
   },
 
@@ -198,10 +285,17 @@ export const useWalletStore = create((set, get) => ({
         statementCursor: res.next_cursor ?? null,
       })
     } catch (err) {
-      set({ error: err.message })
+      set({ error: errorMessage(err) })
     }
   },
 
+  /**
+   * Project a REST `/api/balances` snapshot into the wallet. Used before the
+   * feed was wired; kept for the App boot path.
+   *
+   * @param {import('../protocol/generated/Balance').Balance[]} balances
+   * @param {import('../protocol/generated/MarketConfig').MarketConfig[]} [markets]
+   */
   updateFromBalances: (balances, markets = []) => {
     const marketMap = Object.fromEntries((markets || []).map((m) => [m.id, m]))
     const cash = balances.find((b) => b.asset.kind === 'cash')
@@ -227,3 +321,39 @@ export const useWalletStore = create((set, get) => ({
     })
   },
 }))
+
+/**
+ * @param {unknown} err
+ * @returns {string}
+ */
+const errorMessage = (err) => (err instanceof Error ? err.message : String(err))
+
+/**
+ * Lazily create the single wallet-feed worker. Its handlers run for the
+ * lifetime of the page and always address the store's latest state.
+ */
+const ensurePrivateFeedClient = () => {
+  if (privateFeedClient) return privateFeedClient
+
+  privateFeedClient = createWalletFeedClient({
+    onStatus: (status) => useWalletStore.setState({ privateFeedStatus: status }),
+    onMessage: (message) => useWalletStore.getState().applyPrivateMessage(message),
+    onError: (message) => useWalletStore.setState({ privateFeedError: message }),
+  })
+  return privateFeedClient
+}
+
+/**
+ * The slice of wallet state the private reducer owns; everything else in the
+ * store (history, statements, loading flags) stays where it is.
+ *
+ * @param {ReturnType<typeof useWalletStore.getState>} wallet
+ */
+const privateFragment = (wallet) => ({
+  cashAvail: wallet.cashAvail,
+  cashLocked: wallet.cashLocked,
+  passes: wallet.passes,
+  escrowItems: wallet.escrowItems,
+  escrowCash: wallet.escrowCash,
+  lastSelfFill: wallet.lastSelfFill,
+})

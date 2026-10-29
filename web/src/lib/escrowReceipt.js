@@ -4,8 +4,10 @@
 // the domain string, then six unsigned big-endian u64 values.
 
 const DOMAIN = new TextEncoder().encode('darkhold-escrow-receipt-v1')
+/** @param {number} userId */
 const keyStorage = (userId) => `darkhold.escrow.sellerKey.${userId}`
 
+/** @param {Uint8Array} bytes */
 export const bytesToHex = (bytes) =>
   Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
 
@@ -100,6 +102,13 @@ export const signDeliveryReceipt = async (receipt, userId) => {
   } catch {
     throw new Error('The stored delivery signing key is invalid. Generate a new one.')
   }
-  const signature = await crypto.sign({ name: 'Ed25519' }, privateKey, receiptMessage(receipt))
+  const receiptBytes = receiptMessage(receipt)
+  // crypto.sign wants a transferable plain-ArrayBuffer view (not a
+  // SharedArrayBuffer-backed one), so copy the canonical bytes once.
+  const signedBytes = /** @type {Uint8Array<ArrayBuffer>} */ (
+    new Uint8Array(receiptBytes.byteLength)
+  )
+  signedBytes.set(receiptBytes)
+  const signature = await crypto.sign({ name: 'Ed25519' }, privateKey, signedBytes)
   return bytesToHex(new Uint8Array(signature))
 }

@@ -17,9 +17,13 @@
     "src/charts/chartData.js",
     "src/feed/marketFeed.js",
     "src/feed/marketFeedClient.js",
+    "src/feed/walletFeed.js",
+    "src/feed/walletFeedClient.js",
     "src/lib/latency.js",
+    "src/lib/escrowReceipt.js",
     "src/protocol/index.js",
     "src/protocol/generated/**/*.ts",
-    "src/stores/useMarketFeedStore.js"
+    "src/stores/useMarketFeedStore.js",
+    "src/stores/useWalletStore.js"
   ]
 }
